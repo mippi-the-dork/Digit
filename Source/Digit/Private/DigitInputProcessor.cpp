@@ -1,3 +1,5 @@
+﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
+
 #include "DigitInputProcessor.h"
 
 #include "Fonts/FontMeasure.h"
@@ -30,6 +32,73 @@ namespace DigitPrivate
             || Character == TEXT(',')
             || Character == TEXT('+')
             || Character == TEXT('-');
+    }
+
+    static double GetDefaultInputEventMultiplier(const FInputEvent& InputEvent)
+    {
+        if (InputEvent.IsShiftDown())
+        {
+            return InputEvent.IsAltDown() ? 100.0 : 10.0;
+        }
+
+        if (InputEvent.IsControlDown())
+        {
+            return InputEvent.IsAltDown() ? 0.01 : 0.1;
+        }
+
+        return 1.0;
+    }
+
+    static double ApplySliderExponent(double Fraction, double SliderExponent)
+    {
+        Fraction = FMath::Clamp(Fraction, 0.0, 1.0);
+        if (FMath::IsNearlyEqual(SliderExponent, 1.0))
+        {
+            return Fraction;
+        }
+
+        return 1.0 - FMath::Pow(1.0 - Fraction, SliderExponent);
+    }
+
+    static bool FindCharacterHitBounds(
+        const TSharedRef<FSlateFontMeasure>& FontMeasure,
+        const FText& DisplayText,
+        const FSlateFontInfo& Font,
+        int32 CharacterIndex,
+        float& OutStartX,
+        float& OutWidth)
+    {
+        const float FullTextWidth = FontMeasure->Measure(DisplayText, Font).X;
+        const int32 MaxOffset = FMath::Max(1, FMath::CeilToInt(FullTextWidth));
+
+        int32 FirstOffset = INDEX_NONE;
+        int32 LastOffset = INDEX_NONE;
+
+        for (int32 Offset = 0; Offset <= MaxOffset; ++Offset)
+        {
+            const int32 HitIndex = FontMeasure->FindCharacterIndexAtOffset(DisplayText, Font, Offset);
+            if (HitIndex == CharacterIndex)
+            {
+                if (FirstOffset == INDEX_NONE)
+                {
+                    FirstOffset = Offset;
+                }
+                LastOffset = Offset;
+            }
+            else if (FirstOffset != INDEX_NONE && HitIndex > CharacterIndex)
+            {
+                break;
+            }
+        }
+
+        if (FirstOffset == INDEX_NONE || LastOffset == INDEX_NONE)
+        {
+            return false;
+        }
+
+        OutStartX = static_cast<float>(FirstOffset);
+        OutWidth = FMath::Max(1.0f, static_cast<float>(LastOffset - FirstOffset + 1));
+        return true;
     }
 
     template<typename NumericType>
@@ -655,26 +724,18 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         && MaxSliderValue != NumericMax
         && MaxSliderValue > MinSliderValue;
 
+    const double SliderRange = bBoundedSliderRange
+        ? static_cast<double>(MaxSliderValue) - static_cast<double>(MinSliderValue)
+        : 0.0;
+    const double NativeBaseStep = bBoundedSliderRange && SliderRange <= 10.0 ? 0.1 : 1.0;
+
     double MovementScale = 1.0;
     if (bBoundedSliderRange)
     {
-        const double SliderRange = static_cast<double>(MaxSliderValue) - static_cast<double>(MinSliderValue);
-        const double SliderWidth = FMath::Max(static_cast<double>(SpinBox->GetTickSpaceGeometry().GetDrawSize().X), 100.0);
-
-        // Match SSpinBox::GetDefaultStepSize before modifier keys are applied.
-        // Keeping Shift/Ctrl on the routed event means Unreal still applies its native
-        // x10 / x0.1 multipliers after this compensation.
-        const double NativeBaseStep = SliderRange <= 10.0 ? 0.1 : 1.0;
-
-        if (!FMath::IsFinite(SliderRange)
-            || SliderRange <= 0.0
-            || !FMath::IsFinite(SliderWidth)
-            || SliderWidth <= 0.0)
+        if (!FMath::IsFinite(SliderRange) || SliderRange <= 0.0)
         {
             return false;
         }
-
-        MovementScale = (static_cast<double>(DesiredStep) * SliderWidth) / (SliderRange * NativeBaseStep);
     }
     else
     {
@@ -689,11 +750,10 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         }
 
         MovementScale = DesiredInfluence / WorkingInfluence;
-    }
-
-    if (!FMath::IsFinite(MovementScale) || MovementScale <= 0.0)
-    {
-        return false;
+        if (!FMath::IsFinite(MovementScale) || MovementScale <= 0.0)
+        {
+            return false;
+        }
     }
 
     const TWeakPtr<SSpinBox<NumericType>> WeakSpinBox = SpinBox;
@@ -716,7 +776,26 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         }
     };
 
-    RouteActiveMoveFunction = [WeakSpinBox, MovementScale](const FPointerEvent& MouseEvent, bool bScaleMovement) -> bool
+    const double InitialDigitValue = static_cast<double>(SpinBox->GetValue());
+    const double DesiredStepAsDouble = static_cast<double>(DesiredStep);
+    const double MinSliderAsDouble = static_cast<double>(MinSliderValue);
+    const double MaxSliderAsDouble = static_cast<double>(MaxSliderValue);
+    const double MinValueAsDouble = static_cast<double>(SpinBox->GetMinValue());
+    const double MaxValueAsDouble = static_cast<double>(SpinBox->GetMaxValue());
+
+    RouteActiveMoveFunction = [
+        WeakSpinBox,
+        MovementScale,
+        bBoundedSliderRange,
+        SliderRange,
+        NativeBaseStep,
+        SliderExponent,
+        DesiredStepAsDouble,
+        MinSliderAsDouble,
+        MaxSliderAsDouble,
+        MinValueAsDouble,
+        MaxValueAsDouble,
+        DigitValue = InitialDigitValue](const FPointerEvent& MouseEvent, bool bScaleMovement) mutable -> bool
     {
         const TSharedPtr<SSpinBox<NumericType>> PinnedSpinBox = WeakSpinBox.Pin();
         if (!PinnedSpinBox.IsValid() || !PinnedSpinBox->HasMouseCapture())
@@ -727,7 +806,40 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         FVector2D RoutedDelta = MouseEvent.GetCursorDelta();
         if (bScaleMovement)
         {
-            RoutedDelta.X *= MovementScale;
+            if (bBoundedSliderRange)
+            {
+                const double PhysicalDeltaX = static_cast<double>(MouseEvent.GetCursorDelta().X);
+                const double InputMultiplier = DigitPrivate::GetDefaultInputEventMultiplier(MouseEvent);
+                const double NativeStep = NativeBaseStep * InputMultiplier;
+                const double SliderWidth = FMath::Max(static_cast<double>(PinnedSpinBox->GetTickSpaceGeometry().GetDrawSize().X), 100.0);
+
+                if (FMath::IsFinite(PhysicalDeltaX)
+                    && FMath::IsFinite(NativeStep)
+                    && !FMath::IsNearlyZero(NativeStep)
+                    && FMath::IsFinite(SliderWidth)
+                    && SliderWidth > 0.0)
+                {
+                    double TargetValue = DigitValue + (PhysicalDeltaX * DesiredStepAsDouble * InputMultiplier);
+                    TargetValue = FMath::Clamp(TargetValue, MinSliderAsDouble, MaxSliderAsDouble);
+                    TargetValue = FMath::Clamp(TargetValue, MinValueAsDouble, MaxValueAsDouble);
+
+                    const double CurrentFraction = FMath::Clamp((DigitValue - MinSliderAsDouble) / SliderRange, 0.0, 1.0);
+                    const double TargetFraction = FMath::Clamp((TargetValue - MinSliderAsDouble) / SliderRange, 0.0, 1.0);
+                    const double CurrentFilled = DigitPrivate::ApplySliderExponent(CurrentFraction, SliderExponent);
+                    const double TargetFilled = DigitPrivate::ApplySliderExponent(TargetFraction, SliderExponent);
+
+                    RoutedDelta.X = (TargetFilled - CurrentFilled) * SliderWidth / NativeStep;
+                    DigitValue = TargetValue;
+                }
+                else
+                {
+                    RoutedDelta.X = 0.0;
+                }
+            }
+            else
+            {
+                RoutedDelta.X *= MovementScale;
+            }
         }
 
         const FPointerEvent RoutedEvent(
@@ -749,7 +861,7 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         static_cast<double>(DesiredStep),
         static_cast<double>(WorkingDelta),
         static_cast<double>(OriginalDelta),
-        MovementScale,
+        bBoundedSliderRange ? 0.0 : MovementScale,
         bBoundedSliderRange ? TEXT("true") : TEXT("false"),
         static_cast<double>(MinSliderValue),
         static_cast<double>(MaxSliderValue),
@@ -852,16 +964,19 @@ void FDigitInputProcessor::ShowHighlight(FSlateApplication& SlateApp, const FWid
     const FSlateFontInfo Font = Hit.TextWidget->GetFont();
     const TSharedRef<FSlateFontMeasure> FontMeasure = SlateApp.GetRenderer()->GetFontMeasureService();
 
-    const FString Prefix = Hit.DisplayString.Left(Hit.CharacterIndex);
-    const FString PrefixWithCharacter = Hit.DisplayString.Left(Hit.CharacterIndex + 1);
+    const FText DisplayText = FText::FromString(Hit.DisplayString);
+    float CharacterStartX = 0.0f;
+    float CharacterWidth = 0.0f;
+    if (!DigitPrivate::FindCharacterHitBounds(FontMeasure, DisplayText, Font, Hit.CharacterIndex, CharacterStartX, CharacterWidth))
+    {
+        ClearHighlight();
+        return;
+    }
 
-    const float PrefixWidth = FontMeasure->Measure(FText::FromString(Prefix), Font).X;
-    const float PrefixWithCharacterWidth = FontMeasure->Measure(FText::FromString(PrefixWithCharacter), Font).X;
-    const float CharacterWidth = FMath::Max(1.0f, PrefixWithCharacterWidth - PrefixWidth);
-    const float TextHeight = FMath::Max(1.0f, FontMeasure->Measure(FText::FromString(Hit.DisplayString), Font).Y);
+    const float TextHeight = FMath::Max(1.0f, FontMeasure->Measure(DisplayText, Font).Y);
 
     const float CharacterLocalY = FMath::Max(0.0f, (Hit.TextGeometry.GetLocalSize().Y - TextHeight) * 0.5f);
-    const FVector2D CharacterAbsolutePosition = Hit.TextGeometry.LocalToAbsolute(FVector2D(PrefixWidth, CharacterLocalY));
+    const FVector2D CharacterAbsolutePosition = Hit.TextGeometry.LocalToAbsolute(FVector2D(CharacterStartX, CharacterLocalY));
 
     const FGeometry& WindowGeometry = Path.Widgets[0].Geometry;
     const FVector2D CharacterWindowLocal = WindowGeometry.AbsoluteToLocal(CharacterAbsolutePosition);

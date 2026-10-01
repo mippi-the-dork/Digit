@@ -1,7 +1,7 @@
 {
     "FileVersion": 3,
-    "Version": 10,
-    "VersionName": "0.1.10",
+    "Version": 11,
+    "VersionName": "0.1.11",
     "FriendlyName": "Digit",
     "Description": "Adds digit-aware numeric scrubbing to Unreal Editor number fields.",
     "Category": "Editor",

@@ -81,11 +81,10 @@ namespace DigitPrivate
     template<typename NumericType>
     bool IsWidgetClass(const TSharedRef<SWidget>& Widget)
     {
-        if (Widget->GetType() != FName(TEXT("SSpinBox")))
-        {
-            return false;
-        }
-
+        // UE 5.8 reports templated spin boxes through Slate as
+        // "SSpinBox<NumericType>", not the literal "SSpinBox".
+        // Do not gate the real typed class check on GetType()/GetTypeAsString().
+        // The runtime class-data identity is the actual specialization test.
         return &Widget->GetWidgetClass() == &GetRuntimeSpinBoxClass<NumericType>();
     }
 }

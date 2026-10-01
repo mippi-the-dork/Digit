@@ -8,7 +8,6 @@ class STextBlock;
 class SWidget;
 class SWindow;
 class FWidgetPath;
-struct FGeometry;
 
 class FDigitInputProcessor final : public IInputProcessor
 {
@@ -36,13 +35,16 @@ private:
 
     bool FindNumericHit(FSlateApplication& SlateApp, const FPointerEvent& MouseEvent, FNumericHit& OutHit) const;
     bool ResolveDigitPlace(const FString& DisplayString, int32 CharacterIndex, int32& OutDigitPlace) const;
+    bool FindCharacterIndexForDigitPlace(const FString& DisplayString, int32 DigitPlace, int32& OutCharacterIndex) const;
+    int32 CountFractionalDigits(const FString& DisplayString, int32 CharacterIndex) const;
 
     bool ArmSpinBox(const FNumericHit& Hit, int32 PointerIndex);
 
     template<typename NumericType>
-    bool TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget, int32 DigitPlace);
+    bool TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget, const FNumericHit& Hit);
 
     void UpdateHoverHighlight(FSlateApplication& SlateApp, const FPointerEvent& MouseEvent);
+    void RefreshActiveHighlight(FSlateApplication& SlateApp);
     void ShowHighlight(FSlateApplication& SlateApp, const FWidgetPath& Path, const FNumericHit& Hit);
     void ClearHighlight();
 
@@ -53,9 +55,14 @@ private:
 
 private:
     TWeakPtr<SWidget> ActiveSpinBox;
+    TWeakPtr<STextBlock> ActiveTextWidget;
     TFunction<void()> ApplySelectedDeltaFunction;
     TFunction<void()> RestoreDeltaFunction;
+    TFunction<bool(const FPointerEvent&, bool)> RouteActiveMoveFunction;
     int32 ActivePointerIndex = INDEX_NONE;
+    int32 ActiveDigitPlace = 0;
+    float PhysicalDragDistance = 0.0f;
+    bool bDigitDragStarted = false;
     bool bRestorePending = false;
     bool bAwaitingNativeCapture = false;
 

@@ -6,7 +6,6 @@
 #include "InputCoreTypes.h"
 #include "Rendering/SlateRenderer.h"
 #include "Styling/CoreStyle.h"
-#include "Widgets/Input/SNumericEntryBox.h"
 #include "Widgets/Input/SSpinBox.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Layout/SBox.h"
@@ -67,11 +66,6 @@ namespace DigitPrivate
     template<typename NumericType>
     const FSlateWidgetClassData& GetRuntimeSpinBoxClass()
     {
-        // Do not compare against SSpinBox<NumericType>::StaticWidgetClass() directly here.
-        // That accessor contains a function-local static and Digit lives in a different DLL
-        // from Slate, so the address of the class-data object is not a reliable cross-module
-        // identity test. A real SSpinBox probe dispatches GetWidgetClass() through the same
-        // engine-side virtual implementation used by editor-created spin boxes.
         static const TSharedRef<SSpinBox<NumericType>> ProbeSpinBox =
             SNew(SSpinBox<NumericType>);
 
@@ -81,10 +75,6 @@ namespace DigitPrivate
     template<typename NumericType>
     bool IsWidgetClass(const TSharedRef<SWidget>& Widget)
     {
-        // UE 5.8 reports templated spin boxes through Slate as
-        // "SSpinBox<NumericType>", not the literal "SSpinBox".
-        // Do not gate the real typed class check on GetType()/GetTypeAsString().
-        // The runtime class-data identity is the actual specialization test.
         return &Widget->GetWidgetClass() == &GetRuntimeSpinBoxClass<NumericType>();
     }
 }
@@ -100,9 +90,6 @@ void FDigitInputProcessor::Tick(const float DeltaTime, FSlateApplication& SlateA
             return;
         }
 
-        // Input preprocessors see mouse-down before the native SSpinBox handles it.
-        // Do not interpret the brief pre-capture window as lost capture. Wait until
-        // the SSpinBox has captured the mouse at least once for this interaction.
         if (bAwaitingNativeCapture)
         {
             if (PinnedSpinBox->HasMouseCapture())
@@ -133,23 +120,55 @@ bool FDigitInputProcessor::HandleMouseMoveEvent(FSlateApplication& SlateApp, con
 {
     if (ActiveSpinBox.IsValid() && !bRestorePending)
     {
-        // Reapply immediately before native Slate routing. This guarantees the
-        // existing SSpinBox reads Digit's selected place value for this move,
-        // while Unreal still owns direction, sensitivity, clamping and commits.
+        const TSharedPtr<SWidget> PinnedSpinBox = ActiveSpinBox.Pin();
+        if (!PinnedSpinBox.IsValid())
+        {
+            QueueRestore();
+            return false;
+        }
+
+        if (!PinnedSpinBox->HasMouseCapture())
+        {
+            // Mouse-down is preprocessed before SSpinBox receives it. If capture has not
+            // happened yet, allow normal Slate routing for this event instead of consuming it.
+            return false;
+        }
+
+        bAwaitingNativeCapture = false;
+
         if (ApplySelectedDeltaFunction)
         {
             ApplySelectedDeltaFunction();
         }
 
-        if (const TSharedPtr<SWidget> PinnedSpinBox = ActiveSpinBox.Pin())
+        if (!RouteActiveMoveFunction)
         {
-            if (PinnedSpinBox->HasMouseCapture())
-            {
-                bAwaitingNativeCapture = false;
-            }
+            return false;
         }
+
+        // Preserve Unreal's native physical drag threshold. Until that threshold is crossed,
+        // pass the real cursor delta into SSpinBox. The crossing move only transitions the
+        // native widget into drag mode; actual value changes begin on the following move.
+        bool bScaleMovement = bDigitDragStarted;
+        if (!bDigitDragStarted)
+        {
+            PhysicalDragDistance += FMath::Abs(static_cast<float>(MouseEvent.GetCursorDelta().X));
+        }
+
+        const bool bRouted = RouteActiveMoveFunction(MouseEvent, bScaleMovement);
+
+        if (!bDigitDragStarted
+            && PhysicalDragDistance > SlateApp.GetDragTriggerDistance())
+        {
+            bDigitDragStarted = true;
+        }
+
+        // We directly routed the move to the captured SSpinBox. Returning true prevents
+        // the original, unscaled mouse event from reaching it a second time.
+        return bRouted;
     }
-    else if (!bRestorePending)
+
+    if (!bRestorePending)
     {
         UpdateHoverHighlight(SlateApp, MouseEvent);
     }
@@ -167,6 +186,8 @@ bool FDigitInputProcessor::HandleMouseButtonDownEvent(FSlateApplication& SlateAp
     FNumericHit Hit;
     if (!FindNumericHit(SlateApp, MouseEvent, Hit))
     {
+        // Only emit diagnostics when the failed path actually contains a spin box. This keeps
+        // ordinary editor clicks from flooding the Output Log while retaining useful failure data.
         FWidgetPath DebugPath = SlateApp.LocateWindowUnderMouse(
             MouseEvent.GetScreenSpacePosition(),
             SlateApp.GetInteractiveTopLevelWindows(),
@@ -174,17 +195,24 @@ bool FDigitInputProcessor::HandleMouseButtonDownEvent(FSlateApplication& SlateAp
             MouseEvent.GetUserIndex());
 
         FString PathTypes;
+        bool bContainsSpinBox = false;
         for (int32 WidgetIndex = 0; WidgetIndex < DebugPath.Widgets.Num(); ++WidgetIndex)
         {
             const FArrangedWidget& ArrangedWidget = DebugPath.Widgets[WidgetIndex];
+            const FString TypeString = ArrangedWidget.Widget->GetTypeAsString();
             if (!PathTypes.IsEmpty())
             {
                 PathTypes += TEXT(" > ");
             }
-            PathTypes += ArrangedWidget.Widget->GetTypeAsString();
+            PathTypes += TypeString;
+            bContainsSpinBox |= TypeString.StartsWith(TEXT("SSpinBox"));
         }
 
-        UE_LOG(LogDigit, Warning, TEXT("Mouse-down did not resolve a numeric digit. Widget path: %s"), *PathTypes);
+        if (bContainsSpinBox)
+        {
+            UE_LOG(LogDigit, Warning, TEXT("Mouse-down did not resolve a numeric digit. Widget path: %s"), *PathTypes);
+        }
+
         ClearHighlight();
         return false;
     }
@@ -212,9 +240,8 @@ bool FDigitInputProcessor::HandleMouseButtonUpEvent(FSlateApplication& SlateApp,
         && ActiveSpinBox.IsValid()
         && MouseEvent.GetPointerIndex() == ActivePointerIndex)
     {
-        // Mouse-up is also preprocessed before the native SSpinBox receives it.
-        // Reapply once more so the native final GridSnap/commit sees Digit's Delta,
-        // then restore on Slate post-tick after routing has completed.
+        // Keep the small working Delta in place for the native final commit. It preserves
+        // lower-order digits instead of snapping the whole value to the selected digit step.
         if (ApplySelectedDeltaFunction)
         {
             ApplySelectedDeltaFunction();
@@ -231,6 +258,12 @@ void FDigitInputProcessor::HandlePostSlateTick()
     {
         RestoreActiveDelta();
         ClearHighlight();
+        return;
+    }
+
+    if (ActiveSpinBox.IsValid() && ActiveTextWidget.IsValid() && FSlateApplication::IsInitialized())
+    {
+        RefreshActiveHighlight(FSlateApplication::Get());
     }
 }
 
@@ -260,9 +293,6 @@ bool FDigitInputProcessor::FindNumericHit(FSlateApplication& SlateApp, const FPo
     {
         const TSharedRef<SWidget>& Widget = Path.Widgets[Index].Widget;
 
-        // Do not compare Slate class-data addresses across module boundaries.
-        // GetType() is derived from the widget's engine-side runtime class data
-        // and is stable for non-templated widgets like STextBlock.
         if (TextPathIndex == INDEX_NONE
             && Widget->GetType() == FName(TEXT("STextBlock")))
         {
@@ -280,7 +310,6 @@ bool FDigitInputProcessor::FindNumericHit(FSlateApplication& SlateApp, const FPo
         return false;
     }
 
-    // The text block must be inside the spin box, not an axis label or another nearby label.
     if (TextPathIndex <= SpinBoxPathIndex)
     {
         return false;
@@ -310,8 +339,6 @@ bool FDigitInputProcessor::FindNumericHit(FSlateApplication& SlateApp, const FPo
     const FSlateFontInfo Font = TextWidget->GetFont();
     const FVector2D FullTextSize = FontMeasure->Measure(DisplayText, Font);
 
-    // Standard SNumericEntryBox / SSpinBox values are left-justified. Keep the first
-    // prototype deliberately scoped to that native path instead of guessing custom layout.
     const float TextStartX = 0.0f;
     const float TextEndX = TextStartX + FullTextSize.X;
     if (LocalMouse.X < TextStartX || LocalMouse.X > TextEndX)
@@ -365,17 +392,6 @@ bool FDigitInputProcessor::ResolveDigitPlace(const FString& DisplayString, int32
         ++TokenEnd;
     }
 
-    // Scientific notation is intentionally deferred for the first prototype.
-    for (int32 Index = TokenStart; Index <= TokenEnd; ++Index)
-    {
-        if (DisplayString[Index] == TEXT('e') || DisplayString[Index] == TEXT('E'))
-        {
-            return false;
-        }
-    }
-
-    // v0.1.0 uses Unreal's common en-US style: '.' is decimal and ',' is grouping.
-    // This is deliberately isolated here so locale-aware decimal detection can replace it later.
     int32 DecimalIndex = INDEX_NONE;
     for (int32 Index = TokenStart; Index <= TokenEnd; ++Index)
     {
@@ -425,6 +441,115 @@ bool FDigitInputProcessor::ResolveDigitPlace(const FString& DisplayString, int32
     return false;
 }
 
+bool FDigitInputProcessor::FindCharacterIndexForDigitPlace(const FString& DisplayString, int32 DigitPlace, int32& OutCharacterIndex) const
+{
+    OutCharacterIndex = INDEX_NONE;
+
+    int32 DecimalIndex = INDEX_NONE;
+    for (int32 Index = 0; Index < DisplayString.Len(); ++Index)
+    {
+        if (DisplayString[Index] == TEXT('.'))
+        {
+            DecimalIndex = Index;
+            break;
+        }
+    }
+
+    if (DigitPlace >= 0)
+    {
+        const int32 RightBoundary = (DecimalIndex == INDEX_NONE) ? DisplayString.Len() - 1 : DecimalIndex - 1;
+        int32 Place = 0;
+        for (int32 Index = RightBoundary; Index >= 0; --Index)
+        {
+            if (!DigitPrivate::IsDigitCharacter(DisplayString[Index]))
+            {
+                continue;
+            }
+
+            if (Place == DigitPlace)
+            {
+                OutCharacterIndex = Index;
+                return true;
+            }
+
+            ++Place;
+        }
+
+        return false;
+    }
+
+    if (DecimalIndex == INDEX_NONE)
+    {
+        return false;
+    }
+
+    const int32 TargetOrdinal = -DigitPlace;
+    int32 FractionalOrdinal = 0;
+    for (int32 Index = DecimalIndex + 1; Index < DisplayString.Len(); ++Index)
+    {
+        if (!DigitPrivate::IsDigitCharacter(DisplayString[Index]))
+        {
+            // Stop once the numeric token ends. Grouping is not valid after the radix point.
+            break;
+        }
+
+        ++FractionalOrdinal;
+        if (FractionalOrdinal == TargetOrdinal)
+        {
+            OutCharacterIndex = Index;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+int32 FDigitInputProcessor::CountFractionalDigits(const FString& DisplayString, int32 CharacterIndex) const
+{
+    if (!DisplayString.IsValidIndex(CharacterIndex))
+    {
+        return 0;
+    }
+
+    int32 TokenStart = CharacterIndex;
+    while (TokenStart > 0 && DigitPrivate::IsNumericTokenCharacter(DisplayString[TokenStart - 1]))
+    {
+        --TokenStart;
+    }
+
+    int32 TokenEnd = CharacterIndex;
+    while (TokenEnd + 1 < DisplayString.Len() && DigitPrivate::IsNumericTokenCharacter(DisplayString[TokenEnd + 1]))
+    {
+        ++TokenEnd;
+    }
+
+    int32 DecimalIndex = INDEX_NONE;
+    for (int32 Index = TokenStart; Index <= TokenEnd; ++Index)
+    {
+        if (DisplayString[Index] == TEXT('.'))
+        {
+            DecimalIndex = Index;
+            break;
+        }
+    }
+
+    if (DecimalIndex == INDEX_NONE)
+    {
+        return 0;
+    }
+
+    int32 FractionalDigits = 0;
+    for (int32 Index = DecimalIndex + 1; Index <= TokenEnd; ++Index)
+    {
+        if (DigitPrivate::IsDigitCharacter(DisplayString[Index]))
+        {
+            ++FractionalDigits;
+        }
+    }
+
+    return FractionalDigits;
+}
+
 bool FDigitInputProcessor::ArmSpinBox(const FNumericHit& Hit, int32 PointerIndex)
 {
     if (!Hit.SpinBoxWidget.IsValid())
@@ -432,24 +557,26 @@ bool FDigitInputProcessor::ArmSpinBox(const FNumericHit& Hit, int32 PointerIndex
         return false;
     }
 
-    const TSharedRef<SWidget> Widget = Hit.SpinBoxWidget.ToSharedRef();
-
     bool bArmed = false;
-    bArmed = bArmed || TryArmTypedSpinBox<double>(Hit.SpinBoxWidget, Hit.DigitPlace);
-    bArmed = bArmed || TryArmTypedSpinBox<float>(Hit.SpinBoxWidget, Hit.DigitPlace);
-    bArmed = bArmed || TryArmTypedSpinBox<uint64>(Hit.SpinBoxWidget, Hit.DigitPlace);
-    bArmed = bArmed || TryArmTypedSpinBox<uint32>(Hit.SpinBoxWidget, Hit.DigitPlace);
-    bArmed = bArmed || TryArmTypedSpinBox<uint16>(Hit.SpinBoxWidget, Hit.DigitPlace);
-    bArmed = bArmed || TryArmTypedSpinBox<uint8>(Hit.SpinBoxWidget, Hit.DigitPlace);
-    bArmed = bArmed || TryArmTypedSpinBox<int64>(Hit.SpinBoxWidget, Hit.DigitPlace);
-    bArmed = bArmed || TryArmTypedSpinBox<int32>(Hit.SpinBoxWidget, Hit.DigitPlace);
-    bArmed = bArmed || TryArmTypedSpinBox<int16>(Hit.SpinBoxWidget, Hit.DigitPlace);
-    bArmed = bArmed || TryArmTypedSpinBox<int8>(Hit.SpinBoxWidget, Hit.DigitPlace);
+    bArmed = bArmed || TryArmTypedSpinBox<double>(Hit.SpinBoxWidget, Hit);
+    bArmed = bArmed || TryArmTypedSpinBox<float>(Hit.SpinBoxWidget, Hit);
+    bArmed = bArmed || TryArmTypedSpinBox<uint64>(Hit.SpinBoxWidget, Hit);
+    bArmed = bArmed || TryArmTypedSpinBox<uint32>(Hit.SpinBoxWidget, Hit);
+    bArmed = bArmed || TryArmTypedSpinBox<uint16>(Hit.SpinBoxWidget, Hit);
+    bArmed = bArmed || TryArmTypedSpinBox<uint8>(Hit.SpinBoxWidget, Hit);
+    bArmed = bArmed || TryArmTypedSpinBox<int64>(Hit.SpinBoxWidget, Hit);
+    bArmed = bArmed || TryArmTypedSpinBox<int32>(Hit.SpinBoxWidget, Hit);
+    bArmed = bArmed || TryArmTypedSpinBox<int16>(Hit.SpinBoxWidget, Hit);
+    bArmed = bArmed || TryArmTypedSpinBox<int8>(Hit.SpinBoxWidget, Hit);
 
     if (bArmed)
     {
         ActiveSpinBox = Hit.SpinBoxWidget;
+        ActiveTextWidget = Hit.TextWidget;
         ActivePointerIndex = PointerIndex;
+        ActiveDigitPlace = Hit.DigitPlace;
+        PhysicalDragDistance = 0.0f;
+        bDigitDragStarted = false;
         bRestorePending = false;
         bAwaitingNativeCapture = true;
     }
@@ -458,7 +585,7 @@ bool FDigitInputProcessor::ArmSpinBox(const FNumericHit& Hit, int32 PointerIndex
 }
 
 template<typename NumericType>
-bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget, int32 DigitPlace)
+bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget, const FNumericHit& Hit)
 {
     if (!Widget.IsValid())
     {
@@ -471,8 +598,8 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         return false;
     }
 
-    NumericType NewDelta = NumericType(0);
-    if (!DigitPrivate::MakeStepForPlace<NumericType>(DigitPlace, NewDelta))
+    NumericType DesiredStep = NumericType(0);
+    if (!DigitPrivate::MakeStepForPlace<NumericType>(Hit.DigitPlace, DesiredStep))
     {
         return false;
     }
@@ -484,15 +611,100 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
     }
 
     const NumericType OriginalDelta = SpinBox->GetDelta();
+
+    // Delta controls both scrub magnitude and grid snapping in SSpinBox. Digit needs those
+    // responsibilities separated: selected digit place controls magnitude, while the working
+    // Delta is only a fine quantization grid that preserves lower-order digits.
+    NumericType WorkingDelta = NumericType(1);
+    if constexpr (!TIsIntegral<NumericType>::Value)
+    {
+        const int32 FractionalDigits = CountFractionalDigits(Hit.DisplayString, Hit.CharacterIndex);
+        const double WorkingDeltaAsDouble = FMath::Pow(10.0, -static_cast<double>(FractionalDigits));
+        if (!FMath::IsFinite(WorkingDeltaAsDouble) || WorkingDeltaAsDouble <= 0.0)
+        {
+            return false;
+        }
+
+        WorkingDelta = static_cast<NumericType>(WorkingDeltaAsDouble);
+        if (WorkingDelta <= NumericType(0))
+        {
+            return false;
+        }
+    }
+
+    const double SliderExponent = static_cast<double>(SpinBox->GetSliderExponent());
+
+    // SSpinBox has two fundamentally different scrub paths.
+    //
+    // Unlimited ranges use Delta directly as part of the numeric movement calculation,
+    // so Digit can preserve a fine WorkingDelta and compensate by scaling the routed
+    // mouse movement by DesiredInfluence / WorkingInfluence.
+    //
+    // Bounded slider ranges ignore Delta for movement. They convert horizontal mouse
+    // pixels into a fraction of the entire min/max range instead. Feeding the unlimited
+    // scale into that path can produce enormous synthetic cursor deltas and immediately
+    // clamp the value to the slider minimum or maximum. Detect that case and scale in
+    // slider-space instead.
+    const NumericType MinSliderValue = SpinBox->GetMinSliderValue();
+    const NumericType MaxSliderValue = SpinBox->GetMaxSliderValue();
+    const NumericType NumericLowest = std::numeric_limits<NumericType>::lowest();
+    const NumericType NumericMax = std::numeric_limits<NumericType>::max();
+
+    const bool bBoundedSliderRange =
+        MinSliderValue != NumericLowest
+        && MaxSliderValue != NumericMax
+        && MaxSliderValue > MinSliderValue;
+
+    double MovementScale = 1.0;
+    if (bBoundedSliderRange)
+    {
+        const double SliderRange = static_cast<double>(MaxSliderValue) - static_cast<double>(MinSliderValue);
+        const double SliderWidth = FMath::Max(static_cast<double>(SpinBox->GetTickSpaceGeometry().GetDrawSize().X), 100.0);
+
+        // Match SSpinBox::GetDefaultStepSize before modifier keys are applied.
+        // Keeping Shift/Ctrl on the routed event means Unreal still applies its native
+        // x10 / x0.1 multipliers after this compensation.
+        const double NativeBaseStep = SliderRange <= 10.0 ? 0.1 : 1.0;
+
+        if (!FMath::IsFinite(SliderRange)
+            || SliderRange <= 0.0
+            || !FMath::IsFinite(SliderWidth)
+            || SliderWidth <= 0.0)
+        {
+            return false;
+        }
+
+        MovementScale = (static_cast<double>(DesiredStep) * SliderWidth) / (SliderRange * NativeBaseStep);
+    }
+    else
+    {
+        const double DesiredInfluence = FMath::Pow(static_cast<double>(DesiredStep), SliderExponent);
+        const double WorkingInfluence = FMath::Pow(static_cast<double>(WorkingDelta), SliderExponent);
+        if (!FMath::IsFinite(DesiredInfluence)
+            || !FMath::IsFinite(WorkingInfluence)
+            || DesiredInfluence <= 0.0
+            || WorkingInfluence <= 0.0)
+        {
+            return false;
+        }
+
+        MovementScale = DesiredInfluence / WorkingInfluence;
+    }
+
+    if (!FMath::IsFinite(MovementScale) || MovementScale <= 0.0)
+    {
+        return false;
+    }
+
     const TWeakPtr<SSpinBox<NumericType>> WeakSpinBox = SpinBox;
 
-    SpinBox->SetDelta(NewDelta);
+    SpinBox->SetDelta(WorkingDelta);
 
-    ApplySelectedDeltaFunction = [WeakSpinBox, NewDelta]()
+    ApplySelectedDeltaFunction = [WeakSpinBox, WorkingDelta]()
     {
         if (const TSharedPtr<SSpinBox<NumericType>> PinnedSpinBox = WeakSpinBox.Pin())
         {
-            PinnedSpinBox->SetDelta(NewDelta);
+            PinnedSpinBox->SetDelta(WorkingDelta);
         }
     };
 
@@ -504,8 +716,44 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         }
     };
 
-    UE_LOG(LogDigit, Log, TEXT("Armed digit place %d: Delta %.9g -> %.9g"),
-        DigitPlace, static_cast<double>(OriginalDelta), static_cast<double>(NewDelta));
+    RouteActiveMoveFunction = [WeakSpinBox, MovementScale](const FPointerEvent& MouseEvent, bool bScaleMovement) -> bool
+    {
+        const TSharedPtr<SSpinBox<NumericType>> PinnedSpinBox = WeakSpinBox.Pin();
+        if (!PinnedSpinBox.IsValid() || !PinnedSpinBox->HasMouseCapture())
+        {
+            return false;
+        }
+
+        FVector2D RoutedDelta = MouseEvent.GetCursorDelta();
+        if (bScaleMovement)
+        {
+            RoutedDelta.X *= MovementScale;
+        }
+
+        const FPointerEvent RoutedEvent(
+            MouseEvent.GetUserIndex(),
+            MouseEvent.GetPointerIndex(),
+            MouseEvent.GetScreenSpacePosition(),
+            MouseEvent.GetLastScreenSpacePosition(),
+            RoutedDelta,
+            MouseEvent.GetPressedButtons(),
+            MouseEvent.GetModifierKeys());
+
+        PinnedSpinBox->OnMouseMove(PinnedSpinBox->GetTickSpaceGeometry(), RoutedEvent);
+        return true;
+    };
+
+    UE_LOG(LogDigit, Log,
+        TEXT("Armed digit place %d: desired step %.9g, working Delta %.9g, original Delta %.9g, move scale %.9g, bounded %s, slider [%.9g, %.9g], exponent %.9g"),
+        Hit.DigitPlace,
+        static_cast<double>(DesiredStep),
+        static_cast<double>(WorkingDelta),
+        static_cast<double>(OriginalDelta),
+        MovementScale,
+        bBoundedSliderRange ? TEXT("true") : TEXT("false"),
+        static_cast<double>(MinSliderValue),
+        static_cast<double>(MaxSliderValue),
+        SliderExponent);
 
     return true;
 }
@@ -541,6 +789,51 @@ void FDigitInputProcessor::UpdateHoverHighlight(FSlateApplication& SlateApp, con
     ShowHighlight(SlateApp, Path, Hit);
 }
 
+void FDigitInputProcessor::RefreshActiveHighlight(FSlateApplication& SlateApp)
+{
+    const TSharedPtr<STextBlock> TextWidget = ActiveTextWidget.Pin();
+    const TSharedPtr<SWidget> SpinBoxWidget = ActiveSpinBox.Pin();
+    if (!TextWidget.IsValid() || !SpinBoxWidget.IsValid())
+    {
+        ClearHighlight();
+        return;
+    }
+
+    const FString DisplayString = TextWidget->GetText().ToString();
+    int32 CharacterIndex = INDEX_NONE;
+    if (!FindCharacterIndexForDigitPlace(DisplayString, ActiveDigitPlace, CharacterIndex))
+    {
+        // The selected place can temporarily disappear, for example the hundreds place
+        // when scrubbing 123 down below 100. Keep the place locked and hide only the marker.
+        ClearHighlight();
+        return;
+    }
+
+    if (HighlightTextWidget.Pin() == TextWidget
+        && HighlightCharacterIndex == CharacterIndex
+        && HighlightDisplayString == DisplayString)
+    {
+        return;
+    }
+
+    FWidgetPath Path;
+    if (!SlateApp.GeneratePathToWidgetUnchecked(TextWidget.ToSharedRef(), Path))
+    {
+        ClearHighlight();
+        return;
+    }
+
+    FNumericHit Hit;
+    Hit.SpinBoxWidget = SpinBoxWidget;
+    Hit.TextWidget = TextWidget;
+    Hit.TextGeometry = TextWidget->GetTickSpaceGeometry();
+    Hit.CharacterIndex = CharacterIndex;
+    Hit.DigitPlace = ActiveDigitPlace;
+    Hit.DisplayString = DisplayString;
+
+    ShowHighlight(SlateApp, Path, Hit);
+}
+
 void FDigitInputProcessor::ShowHighlight(FSlateApplication& SlateApp, const FWidgetPath& Path, const FNumericHit& Hit)
 {
     if (!Hit.SpinBoxWidget.IsValid() || !Hit.TextWidget.IsValid() || !Hit.DisplayString.IsValidIndex(Hit.CharacterIndex))
@@ -570,8 +863,6 @@ void FDigitInputProcessor::ShowHighlight(FSlateApplication& SlateApp, const FWid
     const float CharacterLocalY = FMath::Max(0.0f, (Hit.TextGeometry.GetLocalSize().Y - TextHeight) * 0.5f);
     const FVector2D CharacterAbsolutePosition = Hit.TextGeometry.LocalToAbsolute(FVector2D(PrefixWidth, CharacterLocalY));
 
-    // The first arranged widget in a normal FWidgetPath is the top-level window.
-    // Convert through its geometry instead of manually compensating for DPI or window borders.
     const FGeometry& WindowGeometry = Path.Widgets[0].Geometry;
     const FVector2D CharacterWindowLocal = WindowGeometry.AbsoluteToLocal(CharacterAbsolutePosition);
 
@@ -639,8 +930,13 @@ void FDigitInputProcessor::RestoreActiveDelta()
 
     ApplySelectedDeltaFunction = nullptr;
     RestoreDeltaFunction = nullptr;
+    RouteActiveMoveFunction = nullptr;
     ActiveSpinBox.Reset();
+    ActiveTextWidget.Reset();
     ActivePointerIndex = INDEX_NONE;
+    ActiveDigitPlace = 0;
+    PhysicalDragDistance = 0.0f;
+    bDigitDragStarted = false;
     bRestorePending = false;
     bAwaitingNativeCapture = false;
 }

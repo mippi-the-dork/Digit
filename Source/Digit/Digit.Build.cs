@@ -1,5 +1,3 @@
-﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
-
 using UnrealBuildTool;
 
 public class Digit : ModuleRules
@@ -20,6 +18,8 @@ public class Digit : ModuleRules
             {
                 "ApplicationCore",
                 "CoreUObject",
+                "DeveloperSettings",
+                "Engine",
                 "InputCore",
                 "Slate",
                 "SlateCore"

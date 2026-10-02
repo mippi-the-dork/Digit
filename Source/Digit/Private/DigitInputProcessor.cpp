@@ -1,6 +1,5 @@
-﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
-
 #include "DigitInputProcessor.h"
+#include "DigitSettings.h"
 
 #include "Fonts/FontMeasure.h"
 #include "Framework/Application/SlateApplication.h"
@@ -11,6 +10,8 @@
 #include "Widgets/Input/SSpinBox.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Layout/SBox.h"
+#include "Widgets/SBoxPanel.h"
+#include "Widgets/SOverlay.h"
 #include "Widgets/SWindow.h"
 #include "Widgets/Text/STextBlock.h"
 
@@ -20,6 +21,11 @@ DEFINE_LOG_CATEGORY_STATIC(LogDigit, Log, All);
 
 namespace DigitPrivate
 {
+    // Match Origin's default Parent / Deparent hierarchy feedback colors so
+    // direction communication stays consistent across the Facet tools.
+    static const FLinearColor IncreaseOutlineColor(0.0f, 0.162029f, 0.745404f, 0.700000f);
+    static const FLinearColor DecreaseOutlineColor(0.745404f, 0.228181f, 0.0f, 0.700000f);
+
     static bool IsDigitCharacter(TCHAR Character)
     {
         return Character >= TEXT('0') && Character <= TEXT('9');
@@ -60,45 +66,136 @@ namespace DigitPrivate
         return 1.0 - FMath::Pow(1.0 - Fraction, SliderExponent);
     }
 
-    static bool FindCharacterHitBounds(
+    static bool FindCharacterVisualBounds(
         const TSharedRef<FSlateFontMeasure>& FontMeasure,
-        const FText& DisplayText,
+        const FString& DisplayString,
         const FSlateFontInfo& Font,
         int32 CharacterIndex,
         float& OutStartX,
         float& OutWidth)
     {
-        const float FullTextWidth = FontMeasure->Measure(DisplayText, Font).X;
-        const int32 MaxOffset = FMath::Max(1, FMath::CeilToInt(FullTextWidth));
-
-        int32 FirstOffset = INDEX_NONE;
-        int32 LastOffset = INDEX_NONE;
-
-        for (int32 Offset = 0; Offset <= MaxOffset; ++Offset)
-        {
-            const int32 HitIndex = FontMeasure->FindCharacterIndexAtOffset(DisplayText, Font, Offset);
-            if (HitIndex == CharacterIndex)
-            {
-                if (FirstOffset == INDEX_NONE)
-                {
-                    FirstOffset = Offset;
-                }
-                LastOffset = Offset;
-            }
-            else if (FirstOffset != INDEX_NONE && HitIndex > CharacterIndex)
-            {
-                break;
-            }
-        }
-
-        if (FirstOffset == INDEX_NONE || LastOffset == INDEX_NONE)
+        if (!DisplayString.IsValidIndex(CharacterIndex))
         {
             return false;
         }
 
-        OutStartX = static_cast<float>(FirstOffset);
-        OutWidth = FMath::Max(1.0f, static_cast<float>(LastOffset - FirstOffset + 1));
+        // Use explicit prefix lengths rather than the ranged Measure overload.
+        // The ranged API's character-index semantics do not line up with the insertion-style
+        // index returned by FindCharacterIndexAtOffset for this use case, which produced a
+        // consistent one-character mismatch between the highlighted glyph and DigitPlace.
+        // Prefix measurement gives us unambiguous visual boundaries: [0, Index) and
+        // [0, Index + 1).
+        const FString PrefixBefore = DisplayString.Left(CharacterIndex);
+        const FString PrefixThrough = DisplayString.Left(CharacterIndex + 1);
+
+        const float StartX = CharacterIndex > 0
+            ? FontMeasure->Measure(FStringView(PrefixBefore), Font).X
+            : 0.0f;
+        const float EndX = FontMeasure->Measure(FStringView(PrefixThrough), Font).X;
+
+        if (!FMath::IsFinite(StartX) || !FMath::IsFinite(EndX) || EndX <= StartX)
+        {
+            return false;
+        }
+
+        OutStartX = StartX;
+        OutWidth = FMath::Max(1.0f, EndX - StartX);
         return true;
+    }
+
+    static int32 FindCharacterAtVisualOffset(
+        const TSharedRef<FSlateFontMeasure>& FontMeasure,
+        const FString& DisplayString,
+        const FSlateFontInfo& Font,
+        float LocalX)
+    {
+        if (DisplayString.IsEmpty() || LocalX < 0.0f)
+        {
+            return INDEX_NONE;
+        }
+
+        for (int32 CharacterIndex = 0; CharacterIndex < DisplayString.Len(); ++CharacterIndex)
+        {
+            float CharacterStartX = 0.0f;
+            float CharacterWidth = 0.0f;
+            if (!FindCharacterVisualBounds(FontMeasure, DisplayString, Font, CharacterIndex, CharacterStartX, CharacterWidth))
+            {
+                continue;
+            }
+
+            const float CharacterEndX = CharacterStartX + CharacterWidth;
+            const bool bIsLastCharacter = CharacterIndex == DisplayString.Len() - 1;
+            if (LocalX >= CharacterStartX && (LocalX < CharacterEndX || (bIsLastCharacter && LocalX <= CharacterEndX)))
+            {
+                return CharacterIndex;
+            }
+        }
+
+        return INDEX_NONE;
+    }
+
+    static FString FormatIncrementForTooltip(int32 DigitPlace)
+    {
+        FString Result;
+        if (DigitPlace >= 0)
+        {
+            Result = TEXT("1");
+            for (int32 Index = 0; Index < DigitPlace; ++Index)
+            {
+                Result += TEXT("0");
+            }
+            Result += TEXT(".0");
+            return Result;
+        }
+
+        Result = TEXT("0.");
+        for (int32 Index = 1; Index < -DigitPlace; ++Index)
+        {
+            Result += TEXT("0");
+        }
+        Result += TEXT("1");
+        return Result;
+    }
+
+    static FText MakeDigitToolTip(const FString& CurrentValue, int32 DigitPlace)
+    {
+        const FString BaseIncrement = FormatIncrementForTooltip(DigitPlace);
+        const FString ShiftIncrement = FormatIncrementForTooltip(DigitPlace + 1);
+        const FString CtrlIncrement = FormatIncrementForTooltip(DigitPlace - 1);
+
+        return FText::FromString(FString::Printf(
+            TEXT("%s\nIncrement by %s\nShift: %s    Ctrl: %s\nAlt: Value Ladder"),
+            *CurrentValue,
+            *BaseIncrement,
+            *ShiftIncrement,
+            *CtrlIncrement));
+    }
+
+
+    static FString FormatMagnitudeForLadder(int32 DigitPlace)
+    {
+        if (DigitPlace > 6 || DigitPlace < -6)
+        {
+            return FString::Printf(TEXT("1e%+d"), DigitPlace);
+        }
+
+        if (DigitPlace >= 0)
+        {
+            FString Result(TEXT("1"));
+            for (int32 Index = 0; Index < DigitPlace; ++Index)
+            {
+                Result += TEXT("0");
+            }
+            return Result;
+        }
+
+        FString Result(TEXT("0."));
+        for (int32 Index = 1; Index < -DigitPlace; ++Index)
+        {
+            Result += TEXT("0");
+        }
+        Result += TEXT("1");
+        return Result;
     }
 
     template<typename NumericType>
@@ -148,6 +245,56 @@ namespace DigitPrivate
     }
 }
 
+void FDigitInputProcessor::SetDigitCursorOverride(
+    const TSharedPtr<STextBlock>& TextWidget,
+    EMouseCursor::Type Cursor)
+{
+    if (!TextWidget.IsValid())
+    {
+        return;
+    }
+
+    const TSharedPtr<STextBlock> PreviousTextWidget = CursorOverrideTextWidget.Pin();
+    if (PreviousTextWidget.IsValid() && PreviousTextWidget != TextWidget)
+    {
+        PreviousTextWidget->SetCursor(TOptional<EMouseCursor::Type>());
+    }
+
+    CursorOverrideTextWidget = TextWidget;
+    TextWidget->SetCursor(Cursor);
+}
+
+void FDigitInputProcessor::ClearDigitCursorOverride()
+{
+    if (const TSharedPtr<STextBlock> TextWidget = CursorOverrideTextWidget.Pin())
+    {
+        TextWidget->SetCursor(TOptional<EMouseCursor::Type>());
+    }
+
+    CursorOverrideTextWidget.Reset();
+}
+
+void FDigitInputProcessor::ApplyDigitCursor()
+{
+    // Keep Digit's cursor state on the text widget itself instead of pushing a
+    // ProcessCursorReply every frame. SSpinBox performs its own cursor queries while
+    // scrubbing, so repeatedly forcing a reply here caused the native widget and Digit
+    // to alternate cursor ownership and visibly flicker.
+    //
+    // The override is persistent for the active interaction: normal pointer while the
+    // digit is being targeted, then ResizeLeftRight once the native drag threshold has
+    // been crossed. Highlight rebuilds preserve this same state.
+    const TSharedPtr<STextBlock> TextWidget = ActiveSpinBox.IsValid()
+        ? ActiveTextWidget.Pin()
+        : HighlightTextWidget.Pin();
+
+    SetDigitCursorOverride(
+        TextWidget,
+        ActiveSpinBox.IsValid() && bDigitDragStarted
+            ? EMouseCursor::ResizeLeftRight
+            : EMouseCursor::Default);
+}
+
 void FDigitInputProcessor::Tick(const float DeltaTime, FSlateApplication& SlateApp, TSharedRef<ICursor> Cursor)
 {
     if (ActiveSpinBox.IsValid() && !bRestorePending)
@@ -180,6 +327,25 @@ bool FDigitInputProcessor::HandleKeyDownEvent(FSlateApplication& SlateApp, const
     if (InKeyEvent.GetKey() == EKeys::Escape && ActiveSpinBox.IsValid())
     {
         QueueRestore();
+        return false;
+    }
+
+    if ((InKeyEvent.GetKey() == EKeys::LeftAlt || InKeyEvent.GetKey() == EKeys::RightAlt)
+        && !ActiveSpinBox.IsValid()
+        && !bRestorePending)
+    {
+        ShowLadderFromCurrentHighlight(SlateApp);
+    }
+
+    return false;
+}
+
+bool FDigitInputProcessor::HandleKeyUpEvent(FSlateApplication& SlateApp, const FKeyEvent& InKeyEvent)
+{
+    if ((InKeyEvent.GetKey() == EKeys::LeftAlt || InKeyEvent.GetKey() == EKeys::RightAlt)
+        && !bLadderModeActive)
+    {
+        ClearLadder();
     }
 
     return false;
@@ -215,21 +381,45 @@ bool FDigitInputProcessor::HandleMouseMoveEvent(FSlateApplication& SlateApp, con
             return false;
         }
 
-        // Preserve Unreal's native physical drag threshold. Until that threshold is crossed,
-        // pass the real cursor delta into SSpinBox. The crossing move only transitions the
-        // native widget into drag mode; actual value changes begin on the following move.
-        bool bScaleMovement = bDigitDragStarted;
-        if (!bDigitDragStarted)
+        // Ladder selection is deliberately independent from horizontal value movement.
+        // Crossing into another rung changes the magnitude, and that same mouse event does
+        // not also change the value. The next horizontal motion starts from the current value.
+        const bool bMagnitudeChangedThisMove = bLadderModeActive
+            ? UpdateLadderSelection(MouseEvent)
+            : false;
+
+        // Preserve Unreal's native physical horizontal drag threshold. Until that threshold
+        // is crossed, pass the real cursor delta into SSpinBox. The crossing move only
+        // transitions the native widget into drag mode; actual value changes begin after it.
+        const bool bScaleMovement = bDigitDragStarted;
+        if (!bDigitDragStarted && !bMagnitudeChangedThisMove)
         {
             PhysicalDragDistance += FMath::Abs(static_cast<float>(MouseEvent.GetCursorDelta().X));
         }
 
-        const bool bRouted = RouteActiveMoveFunction(MouseEvent, bScaleMovement);
+        const bool bRouted = RouteActiveMoveFunction(
+            MouseEvent,
+            bScaleMovement,
+            ActiveDigitPlace,
+            bMagnitudeChangedThisMove);
+
+        if (bScaleMovement
+            && bRouted
+            && !bMagnitudeChangedThisMove
+            && !FMath::IsNearlyZero(static_cast<float>(MouseEvent.GetCursorDelta().X)))
+        {
+            UpdateActiveDragOutline(
+                SlateApp,
+                MouseEvent.GetCursorDelta().X > 0.0f
+                    ? EActiveDragDirection::Increasing
+                    : EActiveDragDirection::Decreasing);
+        }
 
         if (!bDigitDragStarted
             && PhysicalDragDistance > SlateApp.GetDragTriggerDistance())
         {
             bDigitDragStarted = true;
+            ApplyDigitCursor();
         }
 
         // We directly routed the move to the captured SSpinBox. Returning true prevents
@@ -240,6 +430,15 @@ bool FDigitInputProcessor::HandleMouseMoveEvent(FSlateApplication& SlateApp, con
     if (!bRestorePending)
     {
         UpdateHoverHighlight(SlateApp, MouseEvent);
+
+        if (MouseEvent.IsAltDown())
+        {
+            ShowLadderFromCurrentHighlight(SlateApp);
+        }
+        else
+        {
+            ClearLadder();
+        }
     }
 
     return false;
@@ -283,10 +482,12 @@ bool FDigitInputProcessor::HandleMouseButtonDownEvent(FSlateApplication& SlateAp
         }
 
         ClearHighlight();
+        ClearLadder();
         return false;
     }
 
-    if (ArmSpinBox(Hit, MouseEvent.GetPointerIndex()))
+    const bool bUseLadder = MouseEvent.IsAltDown();
+    if (ArmSpinBox(Hit, MouseEvent.GetPointerIndex(), bUseLadder))
     {
         FWidgetPath Path = SlateApp.LocateWindowUnderMouse(
             MouseEvent.GetScreenSpacePosition(),
@@ -297,6 +498,15 @@ bool FDigitInputProcessor::HandleMouseButtonDownEvent(FSlateApplication& SlateAp
         if (Path.IsValid())
         {
             ShowHighlight(SlateApp, Path, Hit);
+        }
+
+        if (bUseLadder)
+        {
+            ShowLadder(SlateApp, Hit);
+        }
+        else
+        {
+            ClearLadder();
         }
     }
 
@@ -325,8 +535,11 @@ void FDigitInputProcessor::HandlePostSlateTick()
 {
     if (bRestorePending)
     {
-        RestoreActiveDelta();
+        // Clear the visual/tooltip while the active widget is still known so the cursor
+        // override can remain Default until the next pointer move. That avoids briefly
+        // exposing SSpinBox's native idle resize cursor immediately after mouse-up.
         ClearHighlight();
+        RestoreActiveDelta();
         return;
     }
 
@@ -338,8 +551,11 @@ void FDigitInputProcessor::HandlePostSlateTick()
 
 void FDigitInputProcessor::Shutdown()
 {
+    ClearLadder();
     RestoreActiveDelta();
     ClearHighlight();
+    ClearActiveDragOutline();
+    ClearDigitCursorOverride();
 }
 
 bool FDigitInputProcessor::FindNumericHit(FSlateApplication& SlateApp, const FPointerEvent& MouseEvent, FNumericHit& OutHit) const
@@ -415,10 +631,15 @@ bool FDigitInputProcessor::FindNumericHit(FSlateApplication& SlateApp, const FPo
         return false;
     }
 
-    const int32 CharacterIndex = FontMeasure->FindCharacterIndexAtOffset(
-        DisplayText,
+    // Resolve the hovered glyph from the exact same visual bounds used to paint
+    // the highlight. This keeps the displayed digit, DigitPlace and scrub step
+    // locked to one shared character index. Punctuation such as the decimal point
+    // is therefore never reinterpreted as the following digit.
+    const int32 CharacterIndex = DigitPrivate::FindCharacterAtVisualOffset(
+        FontMeasure,
+        DisplayString,
         Font,
-        FMath::RoundToInt(LocalMouse.X - TextStartX));
+        LocalMouse.X - TextStartX);
 
     if (!DisplayString.IsValidIndex(CharacterIndex)
         || !DigitPrivate::IsDigitCharacter(DisplayString[CharacterIndex]))
@@ -619,7 +840,7 @@ int32 FDigitInputProcessor::CountFractionalDigits(const FString& DisplayString, 
     return FractionalDigits;
 }
 
-bool FDigitInputProcessor::ArmSpinBox(const FNumericHit& Hit, int32 PointerIndex)
+bool FDigitInputProcessor::ArmSpinBox(const FNumericHit& Hit, int32 PointerIndex, bool bUseLadder)
 {
     if (!Hit.SpinBoxWidget.IsValid())
     {
@@ -627,16 +848,16 @@ bool FDigitInputProcessor::ArmSpinBox(const FNumericHit& Hit, int32 PointerIndex
     }
 
     bool bArmed = false;
-    bArmed = bArmed || TryArmTypedSpinBox<double>(Hit.SpinBoxWidget, Hit);
-    bArmed = bArmed || TryArmTypedSpinBox<float>(Hit.SpinBoxWidget, Hit);
-    bArmed = bArmed || TryArmTypedSpinBox<uint64>(Hit.SpinBoxWidget, Hit);
-    bArmed = bArmed || TryArmTypedSpinBox<uint32>(Hit.SpinBoxWidget, Hit);
-    bArmed = bArmed || TryArmTypedSpinBox<uint16>(Hit.SpinBoxWidget, Hit);
-    bArmed = bArmed || TryArmTypedSpinBox<uint8>(Hit.SpinBoxWidget, Hit);
-    bArmed = bArmed || TryArmTypedSpinBox<int64>(Hit.SpinBoxWidget, Hit);
-    bArmed = bArmed || TryArmTypedSpinBox<int32>(Hit.SpinBoxWidget, Hit);
-    bArmed = bArmed || TryArmTypedSpinBox<int16>(Hit.SpinBoxWidget, Hit);
-    bArmed = bArmed || TryArmTypedSpinBox<int8>(Hit.SpinBoxWidget, Hit);
+    bArmed = bArmed || TryArmTypedSpinBox<double>(Hit.SpinBoxWidget, Hit, bUseLadder);
+    bArmed = bArmed || TryArmTypedSpinBox<float>(Hit.SpinBoxWidget, Hit, bUseLadder);
+    bArmed = bArmed || TryArmTypedSpinBox<uint64>(Hit.SpinBoxWidget, Hit, bUseLadder);
+    bArmed = bArmed || TryArmTypedSpinBox<uint32>(Hit.SpinBoxWidget, Hit, bUseLadder);
+    bArmed = bArmed || TryArmTypedSpinBox<uint16>(Hit.SpinBoxWidget, Hit, bUseLadder);
+    bArmed = bArmed || TryArmTypedSpinBox<uint8>(Hit.SpinBoxWidget, Hit, bUseLadder);
+    bArmed = bArmed || TryArmTypedSpinBox<int64>(Hit.SpinBoxWidget, Hit, bUseLadder);
+    bArmed = bArmed || TryArmTypedSpinBox<int32>(Hit.SpinBoxWidget, Hit, bUseLadder);
+    bArmed = bArmed || TryArmTypedSpinBox<int16>(Hit.SpinBoxWidget, Hit, bUseLadder);
+    bArmed = bArmed || TryArmTypedSpinBox<int8>(Hit.SpinBoxWidget, Hit, bUseLadder);
 
     if (bArmed)
     {
@@ -648,13 +869,17 @@ bool FDigitInputProcessor::ArmSpinBox(const FNumericHit& Hit, int32 PointerIndex
         bDigitDragStarted = false;
         bRestorePending = false;
         bAwaitingNativeCapture = true;
+        bLadderModeActive = bUseLadder;
+        LadderOriginDigitPlace = Hit.DigitPlace;
+        LadderSelectedDigitPlace = Hit.DigitPlace;
+        LadderVerticalTravel = 0.0f;
     }
 
     return bArmed;
 }
 
 template<typename NumericType>
-bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget, const FNumericHit& Hit)
+bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget, const FNumericHit& Hit, bool bUseLadder)
 {
     if (!Widget.IsValid())
     {
@@ -667,13 +892,16 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         return false;
     }
 
-    NumericType DesiredStep = NumericType(0);
-    if (!DigitPrivate::MakeStepForPlace<NumericType>(Hit.DigitPlace, DesiredStep))
+    NumericType InitialDesiredStep = NumericType(0);
+    if (!DigitPrivate::MakeStepForPlace<NumericType>(Hit.DigitPlace, InitialDesiredStep))
     {
         return false;
     }
 
     const TSharedRef<SSpinBox<NumericType>> SpinBox = StaticCastSharedRef<SSpinBox<NumericType>>(WidgetRef);
+    bActiveSpinBoxIsIntegral = TIsIntegral<NumericType>::Value;
+    bLadderIntegral = bActiveSpinBoxIsIntegral;
+
     if (!SpinBox->GetEnableSlider())
     {
         return false;
@@ -684,11 +912,19 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
     // Delta controls both scrub magnitude and grid snapping in SSpinBox. Digit needs those
     // responsibilities separated: selected digit place controls magnitude, while the working
     // Delta is only a fine quantization grid that preserves lower-order digits.
+    //
+    // Ladder mode can move four places below the digit that opened it. Give floating-point
+    // fields enough working precision for that lower rung even when those decimals were not
+    // originally visible in the formatted value.
     NumericType WorkingDelta = NumericType(1);
     if constexpr (!TIsIntegral<NumericType>::Value)
     {
-        const int32 FractionalDigits = CountFractionalDigits(Hit.DisplayString, Hit.CharacterIndex);
-        const double WorkingDeltaAsDouble = FMath::Pow(10.0, -static_cast<double>(FractionalDigits));
+        const int32 DisplayFractionalDigits = CountFractionalDigits(Hit.DisplayString, Hit.CharacterIndex);
+        const int32 LowestLadderPlace = bUseLadder ? Hit.DigitPlace - 4 : Hit.DigitPlace;
+        const int32 LadderFractionalDigits = FMath::Max(0, -LowestLadderPlace);
+        const int32 RequiredFractionalDigits = FMath::Max(DisplayFractionalDigits, LadderFractionalDigits);
+
+        const double WorkingDeltaAsDouble = FMath::Pow(10.0, -static_cast<double>(RequiredFractionalDigits));
         if (!FMath::IsFinite(WorkingDeltaAsDouble) || WorkingDeltaAsDouble <= 0.0)
         {
             return false;
@@ -702,18 +938,16 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
     }
 
     const double SliderExponent = static_cast<double>(SpinBox->GetSliderExponent());
+    const double WorkingInfluence = FMath::Pow(static_cast<double>(WorkingDelta), SliderExponent);
+    if (!FMath::IsFinite(WorkingInfluence) || WorkingInfluence <= 0.0)
+    {
+        return false;
+    }
 
     // SSpinBox has two fundamentally different scrub paths.
-    //
-    // Unlimited ranges use Delta directly as part of the numeric movement calculation,
-    // so Digit can preserve a fine WorkingDelta and compensate by scaling the routed
-    // mouse movement by DesiredInfluence / WorkingInfluence.
-    //
-    // Bounded slider ranges ignore Delta for movement. They convert horizontal mouse
-    // pixels into a fraction of the entire min/max range instead. Feeding the unlimited
-    // scale into that path can produce enormous synthetic cursor deltas and immediately
-    // clamp the value to the slider minimum or maximum. Detect that case and scale in
-    // slider-space instead.
+    // Unlimited ranges use Delta as part of the numeric movement calculation. Bounded ranges
+    // instead map horizontal pixels across the min/max slider range. The route function below
+    // supports both paths and recalculates the requested magnitude whenever the ladder rung changes.
     const NumericType MinSliderValue = SpinBox->GetMinSliderValue();
     const NumericType MaxSliderValue = SpinBox->GetMaxSliderValue();
     const NumericType NumericLowest = std::numeric_limits<NumericType>::lowest();
@@ -729,31 +963,9 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         : 0.0;
     const double NativeBaseStep = bBoundedSliderRange && SliderRange <= 10.0 ? 0.1 : 1.0;
 
-    double MovementScale = 1.0;
-    if (bBoundedSliderRange)
+    if (bBoundedSliderRange && (!FMath::IsFinite(SliderRange) || SliderRange <= 0.0))
     {
-        if (!FMath::IsFinite(SliderRange) || SliderRange <= 0.0)
-        {
-            return false;
-        }
-    }
-    else
-    {
-        const double DesiredInfluence = FMath::Pow(static_cast<double>(DesiredStep), SliderExponent);
-        const double WorkingInfluence = FMath::Pow(static_cast<double>(WorkingDelta), SliderExponent);
-        if (!FMath::IsFinite(DesiredInfluence)
-            || !FMath::IsFinite(WorkingInfluence)
-            || DesiredInfluence <= 0.0
-            || WorkingInfluence <= 0.0)
-        {
-            return false;
-        }
-
-        MovementScale = DesiredInfluence / WorkingInfluence;
-        if (!FMath::IsFinite(MovementScale) || MovementScale <= 0.0)
-        {
-            return false;
-        }
+        return false;
     }
 
     const TWeakPtr<SSpinBox<NumericType>> WeakSpinBox = SpinBox;
@@ -777,7 +989,6 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
     };
 
     const double InitialDigitValue = static_cast<double>(SpinBox->GetValue());
-    const double DesiredStepAsDouble = static_cast<double>(DesiredStep);
     const double MinSliderAsDouble = static_cast<double>(MinSliderValue);
     const double MaxSliderAsDouble = static_cast<double>(MaxSliderValue);
     const double MinValueAsDouble = static_cast<double>(SpinBox->GetMinValue());
@@ -785,17 +996,20 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
 
     RouteActiveMoveFunction = [
         WeakSpinBox,
-        MovementScale,
         bBoundedSliderRange,
         SliderRange,
         NativeBaseStep,
         SliderExponent,
-        DesiredStepAsDouble,
+        WorkingInfluence,
         MinSliderAsDouble,
         MaxSliderAsDouble,
         MinValueAsDouble,
         MaxValueAsDouble,
-        DigitValue = InitialDigitValue](const FPointerEvent& MouseEvent, bool bScaleMovement) mutable -> bool
+        DigitValue = InitialDigitValue](
+            const FPointerEvent& MouseEvent,
+            bool bScaleMovement,
+            int32 DigitPlace,
+            bool bSuppressHorizontalMovement) mutable -> bool
     {
         const TSharedPtr<SSpinBox<NumericType>> PinnedSpinBox = WeakSpinBox.Pin();
         if (!PinnedSpinBox.IsValid() || !PinnedSpinBox->HasMouseCapture())
@@ -803,8 +1017,20 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
             return false;
         }
 
+        NumericType DesiredStep = NumericType(0);
+        if (!DigitPrivate::MakeStepForPlace<NumericType>(DigitPlace, DesiredStep))
+        {
+            return false;
+        }
+
+        const double DesiredStepAsDouble = static_cast<double>(DesiredStep);
         FVector2D RoutedDelta = MouseEvent.GetCursorDelta();
-        if (bScaleMovement)
+
+        if (bSuppressHorizontalMovement)
+        {
+            RoutedDelta.X = 0.0f;
+        }
+        else if (bScaleMovement)
         {
             if (bBoundedSliderRange)
             {
@@ -838,7 +1064,16 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
             }
             else
             {
-                RoutedDelta.X *= MovementScale;
+                const double DesiredInfluence = FMath::Pow(DesiredStepAsDouble, SliderExponent);
+                const double MovementScale = DesiredInfluence / WorkingInfluence;
+                if (!FMath::IsFinite(MovementScale) || MovementScale <= 0.0)
+                {
+                    RoutedDelta.X = 0.0;
+                }
+                else
+                {
+                    RoutedDelta.X *= MovementScale;
+                }
             }
         }
 
@@ -855,13 +1090,18 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         return true;
     };
 
+    const double InitialMovementScale = bBoundedSliderRange
+        ? 0.0
+        : FMath::Pow(static_cast<double>(InitialDesiredStep), SliderExponent) / WorkingInfluence;
+
     UE_LOG(LogDigit, Log,
-        TEXT("Armed digit place %d: desired step %.9g, working Delta %.9g, original Delta %.9g, move scale %.9g, bounded %s, slider [%.9g, %.9g], exponent %.9g"),
+        TEXT("Armed digit place %d%s: desired step %.9g, working Delta %.9g, original Delta %.9g, move scale %.9g, bounded %s, slider [%.9g, %.9g], exponent %.9g"),
         Hit.DigitPlace,
-        static_cast<double>(DesiredStep),
+        bUseLadder ? TEXT(" with ladder") : TEXT(""),
+        static_cast<double>(InitialDesiredStep),
         static_cast<double>(WorkingDelta),
         static_cast<double>(OriginalDelta),
-        bBoundedSliderRange ? 0.0 : MovementScale,
+        InitialMovementScale,
         bBoundedSliderRange ? TEXT("true") : TEXT("false"),
         static_cast<double>(MinSliderValue),
         static_cast<double>(MaxSliderValue),
@@ -912,8 +1152,9 @@ void FDigitInputProcessor::RefreshActiveHighlight(FSlateApplication& SlateApp)
     }
 
     const FString DisplayString = TextWidget->GetText().ToString();
+    const int32 HighlightPlace = bLadderModeActive ? LadderOriginDigitPlace : ActiveDigitPlace;
     int32 CharacterIndex = INDEX_NONE;
-    if (!FindCharacterIndexForDigitPlace(DisplayString, ActiveDigitPlace, CharacterIndex))
+    if (!FindCharacterIndexForDigitPlace(DisplayString, HighlightPlace, CharacterIndex))
     {
         // The selected place can temporarily disappear, for example the hundreds place
         // when scrubbing 123 down below 100. Keep the place locked and hide only the marker.
@@ -940,7 +1181,7 @@ void FDigitInputProcessor::RefreshActiveHighlight(FSlateApplication& SlateApp)
     Hit.TextWidget = TextWidget;
     Hit.TextGeometry = TextWidget->GetTickSpaceGeometry();
     Hit.CharacterIndex = CharacterIndex;
-    Hit.DigitPlace = ActiveDigitPlace;
+    Hit.DigitPlace = HighlightPlace;
     Hit.DisplayString = DisplayString;
 
     ShowHighlight(SlateApp, Path, Hit);
@@ -967,7 +1208,7 @@ void FDigitInputProcessor::ShowHighlight(FSlateApplication& SlateApp, const FWid
     const FText DisplayText = FText::FromString(Hit.DisplayString);
     float CharacterStartX = 0.0f;
     float CharacterWidth = 0.0f;
-    if (!DigitPrivate::FindCharacterHitBounds(FontMeasure, DisplayText, Font, Hit.CharacterIndex, CharacterStartX, CharacterWidth))
+    if (!DigitPrivate::FindCharacterVisualBounds(FontMeasure, Hit.DisplayString, Font, Hit.CharacterIndex, CharacterStartX, CharacterWidth))
     {
         ClearHighlight();
         return;
@@ -983,17 +1224,60 @@ void FDigitInputProcessor::ShowHighlight(FSlateApplication& SlateApp, const FWid
 
     ClearHighlight();
 
+    // Put Digit's increment help on the exact text widget only while a digit is
+    // highlighted. Preserve and restore any tooltip the widget already owned.
+    OriginalToolTip = Hit.TextWidget->GetToolTip();
+    DigitToolTipWidget = Hit.TextWidget;
+    Hit.TextWidget->SetToolTipText(DigitPrivate::MakeDigitToolTip(Hit.DisplayString, Hit.DigitPlace));
+
+    // The nested text widget gets first chance to answer the cursor query. Keep its
+    // persistent override synchronized with the current interaction state so rebuilding
+    // the highlight as the value changes cannot flip the cursor back to Default mid-drag.
+    SetDigitCursorOverride(
+        Hit.TextWidget,
+        ActiveSpinBox.IsValid() && bDigitDragStarted
+            ? EMouseCursor::ResizeLeftRight
+            : EMouseCursor::Default);
+
+    const UDigitSettings* Settings = UDigitSettings::Get();
+    const FLinearColor HighlightColor = Settings
+        ? Settings->DigitHighlightColor
+        : FLinearColor(0.0f, 0.162029f, 0.745404f, 0.38f);
+    const FLinearColor HighlightTextColor = Settings
+        ? Settings->HighlightedTextColor
+        : FLinearColor::White;
+
+    FString HighlightedDigit;
+    HighlightedDigit.AppendChar(Hit.DisplayString[Hit.CharacterIndex]);
+
     TSharedRef<SBox> Marker =
         SNew(SBox)
         .Visibility(EVisibility::HitTestInvisible)
         .WidthOverride(CharacterWidth)
         .HeightOverride(TextHeight)
         [
-            SNew(SBorder)
-            .Visibility(EVisibility::HitTestInvisible)
-            .BorderImage(FCoreStyle::Get().GetBrush(TEXT("WhiteBrush")))
-            .BorderBackgroundColor(FLinearColor(0.18f, 0.52f, 1.0f, 0.28f))
-            .Padding(0.0f)
+            SNew(SOverlay)
+
+            + SOverlay::Slot()
+            [
+                SNew(SBorder)
+                .Visibility(EVisibility::HitTestInvisible)
+                .BorderImage(FCoreStyle::Get().GetBrush(TEXT("WhiteBrush")))
+                .BorderBackgroundColor(HighlightColor)
+                .Padding(0.0f)
+            ]
+
+            + SOverlay::Slot()
+            .HAlign(HAlign_Fill)
+            .VAlign(VAlign_Center)
+            [
+                SNew(STextBlock)
+                .Visibility(EVisibility::HitTestInvisible)
+                .Text(FText::FromString(HighlightedDigit))
+                .Font(Font)
+                .ColorAndOpacity(HighlightTextColor)
+                .Justification(ETextJustify::Center)
+            ]
         ];
 
     Window->AddOverlaySlot(10000)
@@ -1006,13 +1290,172 @@ void FDigitInputProcessor::ShowHighlight(FSlateApplication& SlateApp, const FWid
 
     HighlightWindow = Window;
     HighlightWidget = Marker;
+    HighlightSpinBoxWidget = Hit.SpinBoxWidget;
     HighlightTextWidget = Hit.TextWidget;
     HighlightCharacterIndex = Hit.CharacterIndex;
+    HighlightDigitPlace = Hit.DigitPlace;
     HighlightDisplayString = Hit.DisplayString;
+}
+
+void FDigitInputProcessor::UpdateActiveDragOutline(FSlateApplication& SlateApp, EActiveDragDirection Direction)
+{
+    if (Direction == EActiveDragDirection::None)
+    {
+        ClearActiveDragOutline();
+        return;
+    }
+
+    const TSharedPtr<SWidget> SpinBoxWidget = ActiveSpinBox.Pin();
+    if (!SpinBoxWidget.IsValid())
+    {
+        ClearActiveDragOutline();
+        return;
+    }
+
+    // If only the value is changing, the field geometry remains stable. Keep the existing
+    // overlay until the drag direction flips so we do not churn Slate widgets every mouse move.
+    if (ActiveDragOutlineWidget.IsValid() && ActiveDragDirection == Direction)
+    {
+        return;
+    }
+
+    const TSharedPtr<SWindow> Window = SlateApp.FindWidgetWindow(SpinBoxWidget.ToSharedRef());
+    if (!Window.IsValid())
+    {
+        ClearActiveDragOutline();
+        return;
+    }
+
+    FWidgetPath Path;
+    if (!SlateApp.GeneratePathToWidgetUnchecked(SpinBoxWidget.ToSharedRef(), Path) || Path.Widgets.Num() == 0)
+    {
+        ClearActiveDragOutline();
+        return;
+    }
+
+    const FGeometry& FieldGeometry = SpinBoxWidget->GetTickSpaceGeometry();
+    const FVector2D FieldSize = FieldGeometry.GetLocalSize();
+    if (FieldSize.X <= 0.0f || FieldSize.Y <= 0.0f)
+    {
+        ClearActiveDragOutline();
+        return;
+    }
+
+    const FVector2D FieldAbsolutePosition = FieldGeometry.LocalToAbsolute(FVector2D::ZeroVector);
+    const FGeometry& WindowGeometry = Path.Widgets[0].Geometry;
+    const FVector2D FieldWindowLocal = WindowGeometry.AbsoluteToLocal(FieldAbsolutePosition);
+
+    const FLinearColor OutlineColor = Direction == EActiveDragDirection::Increasing
+        ? DigitPrivate::IncreaseOutlineColor
+        : DigitPrivate::DecreaseOutlineColor;
+
+    ClearActiveDragOutline();
+
+    constexpr float OutlineThickness = 1.0f;
+    const FSlateBrush* WhiteBrush = FCoreStyle::Get().GetBrush(TEXT("WhiteBrush"));
+
+    TSharedRef<SBox> OutlineRoot =
+        SNew(SBox)
+        .Visibility(EVisibility::HitTestInvisible)
+        .WidthOverride(FieldSize.X)
+        .HeightOverride(FieldSize.Y)
+        [
+            SNew(SOverlay)
+
+            + SOverlay::Slot()
+            .HAlign(HAlign_Fill)
+            .VAlign(VAlign_Top)
+            [
+                SNew(SBox)
+                .HeightOverride(OutlineThickness)
+                [
+                    SNew(SBorder)
+                    .BorderImage(WhiteBrush)
+                    .BorderBackgroundColor(OutlineColor)
+                    .Padding(0.0f)
+                ]
+            ]
+
+            + SOverlay::Slot()
+            .HAlign(HAlign_Fill)
+            .VAlign(VAlign_Bottom)
+            [
+                SNew(SBox)
+                .HeightOverride(OutlineThickness)
+                [
+                    SNew(SBorder)
+                    .BorderImage(WhiteBrush)
+                    .BorderBackgroundColor(OutlineColor)
+                    .Padding(0.0f)
+                ]
+            ]
+
+            + SOverlay::Slot()
+            .HAlign(HAlign_Left)
+            .VAlign(VAlign_Fill)
+            [
+                SNew(SBox)
+                .WidthOverride(OutlineThickness)
+                [
+                    SNew(SBorder)
+                    .BorderImage(WhiteBrush)
+                    .BorderBackgroundColor(OutlineColor)
+                    .Padding(0.0f)
+                ]
+            ]
+
+            + SOverlay::Slot()
+            .HAlign(HAlign_Right)
+            .VAlign(VAlign_Fill)
+            [
+                SNew(SBox)
+                .WidthOverride(OutlineThickness)
+                [
+                    SNew(SBorder)
+                    .BorderImage(WhiteBrush)
+                    .BorderBackgroundColor(OutlineColor)
+                    .Padding(0.0f)
+                ]
+            ]
+        ];
+
+    Window->AddOverlaySlot(10001)
+        .HAlign(HAlign_Left)
+        .VAlign(VAlign_Top)
+        .Padding(FMargin(FieldWindowLocal.X, FieldWindowLocal.Y, 0.0f, 0.0f))
+        [
+            OutlineRoot
+        ];
+
+    ActiveDragOutlineWindow = Window;
+    ActiveDragOutlineWidget = OutlineRoot;
+    ActiveDragDirection = Direction;
+}
+
+void FDigitInputProcessor::ClearActiveDragOutline()
+{
+    if (ActiveDragOutlineWidget.IsValid())
+    {
+        if (const TSharedPtr<SWindow> Window = ActiveDragOutlineWindow.Pin())
+        {
+            Window->RemoveOverlaySlot(ActiveDragOutlineWidget.ToSharedRef());
+        }
+    }
+
+    ActiveDragOutlineWindow.Reset();
+    ActiveDragOutlineWidget.Reset();
+    ActiveDragDirection = EActiveDragDirection::None;
 }
 
 void FDigitInputProcessor::ClearHighlight()
 {
+    if (const TSharedPtr<SWidget> ToolTipWidget = DigitToolTipWidget.Pin())
+    {
+        ToolTipWidget->SetToolTip(TAttribute<TSharedPtr<IToolTip>>(OriginalToolTip));
+    }
+    DigitToolTipWidget.Reset();
+    OriginalToolTip.Reset();
+
     if (HighlightWidget.IsValid())
     {
         if (const TSharedPtr<SWindow> Window = HighlightWindow.Pin())
@@ -1023,13 +1466,360 @@ void FDigitInputProcessor::ClearHighlight()
 
     HighlightWindow.Reset();
     HighlightWidget.Reset();
+    HighlightSpinBoxWidget.Reset();
     HighlightTextWidget.Reset();
     HighlightCharacterIndex = INDEX_NONE;
+    HighlightDigitPlace = 0;
     HighlightDisplayString.Reset();
+
+    if (!ActiveSpinBox.IsValid())
+    {
+        ClearDigitCursorOverride();
+    }
+}
+
+void FDigitInputProcessor::ShowLadderFromCurrentHighlight(FSlateApplication& SlateApp)
+{
+    if (bLadderModeActive)
+    {
+        return;
+    }
+
+    const TSharedPtr<SWidget> SpinBoxWidget = HighlightSpinBoxWidget.Pin();
+    const TSharedPtr<STextBlock> TextWidget = HighlightTextWidget.Pin();
+    if (!SpinBoxWidget.IsValid()
+        || !TextWidget.IsValid()
+        || !HighlightDisplayString.IsValidIndex(HighlightCharacterIndex))
+    {
+        ClearLadder();
+        return;
+    }
+
+    FNumericHit Hit;
+    Hit.SpinBoxWidget = SpinBoxWidget;
+    Hit.TextWidget = TextWidget;
+    Hit.TextGeometry = TextWidget->GetTickSpaceGeometry();
+    Hit.CharacterIndex = HighlightCharacterIndex;
+    Hit.DigitPlace = HighlightDigitPlace;
+    Hit.DisplayString = HighlightDisplayString;
+    ShowLadder(SlateApp, Hit);
+}
+
+void FDigitInputProcessor::ShowLadder(FSlateApplication& SlateApp, const FNumericHit& Hit)
+{
+    if (!Hit.SpinBoxWidget.IsValid() || !Hit.TextWidget.IsValid())
+    {
+        ClearLadder();
+        return;
+    }
+
+    const TSharedPtr<SWindow> Window = SlateApp.FindWidgetWindow(Hit.SpinBoxWidget.ToSharedRef());
+    if (!Window.IsValid())
+    {
+        ClearLadder();
+        return;
+    }
+
+    if (!bLadderModeActive
+        && LadderWidget.IsValid()
+        && LadderSpinBoxWidget.Pin() == Hit.SpinBoxWidget
+        && LadderOriginDigitPlace == Hit.DigitPlace)
+    {
+        return;
+    }
+
+    FWidgetPath Path;
+    if (!SlateApp.GeneratePathToWidgetUnchecked(Hit.SpinBoxWidget.ToSharedRef(), Path)
+        || Path.Widgets.Num() == 0)
+    {
+        ClearLadder();
+        return;
+    }
+
+    const FGeometry& FieldGeometry = Hit.SpinBoxWidget->GetTickSpaceGeometry();
+    const FVector2D FieldSize = FieldGeometry.GetLocalSize();
+    if (FieldSize.X <= 0.0f || FieldSize.Y <= 0.0f)
+    {
+        ClearLadder();
+        return;
+    }
+
+    constexpr float LadderWidth = 72.0f;
+    constexpr float LadderRowHeight = 17.0f;
+    constexpr float LadderOuterPadding = 6.0f;
+    constexpr float LadderGap = 6.0f;
+    constexpr float WindowMargin = 4.0f;
+    constexpr float LadderHeight = (LadderRowHeight * 9.0f) + LadderOuterPadding;
+
+    const FGeometry& WindowGeometry = Path.Widgets[0].Geometry;
+    const FVector2D WindowSize = WindowGeometry.GetLocalSize();
+    const FVector2D FieldAbsolutePosition = FieldGeometry.LocalToAbsolute(FVector2D::ZeroVector);
+    const FVector2D FieldWindowLocal = WindowGeometry.AbsoluteToLocal(FieldAbsolutePosition);
+
+    // Prefer the left side of the field so the ladder stays clear of Slate's standard
+    // tooltip placement, which typically occupies the cursor's lower-right quadrant.
+    // Only fall back to the right when the left side does not have enough room.
+    const float LeftLadderX = FieldWindowLocal.X - LadderWidth - LadderGap;
+    const float RightLadderX = FieldWindowLocal.X + FieldSize.X + LadderGap;
+
+    float LadderX = LeftLadderX;
+    if (LeftLadderX < WindowMargin)
+    {
+        LadderX = RightLadderX;
+    }
+    LadderX = FMath::Clamp(LadderX, WindowMargin, FMath::Max(WindowMargin, WindowSize.X - LadderWidth - WindowMargin));
+
+    const float FieldCenterY = FieldWindowLocal.Y + (FieldSize.Y * 0.5f);
+    float LadderY = FieldCenterY - (LadderHeight * 0.5f);
+    LadderY = FMath::Clamp(LadderY, WindowMargin, FMath::Max(WindowMargin, WindowSize.Y - LadderHeight - WindowMargin));
+
+    if (!bLadderModeActive)
+    {
+        LadderOriginDigitPlace = Hit.DigitPlace;
+        LadderSelectedDigitPlace = Hit.DigitPlace;
+        LadderVerticalTravel = 0.0f;
+        bLadderIntegral = IsIntegralSpinBox(Hit.SpinBoxWidget);
+    }
+
+    LadderWindow = Window;
+    LadderSpinBoxWidget = Hit.SpinBoxWidget;
+    LadderWindowPosition = FVector2D(LadderX, LadderY);
+    RebuildLadderVisual();
+}
+
+void FDigitInputProcessor::RebuildLadderVisual()
+{
+    const TSharedPtr<SWindow> Window = LadderWindow.Pin();
+    if (!Window.IsValid())
+    {
+        ClearLadder();
+        return;
+    }
+
+    if (LadderWidget.IsValid())
+    {
+        Window->RemoveOverlaySlot(LadderWidget.ToSharedRef());
+        LadderWidget.Reset();
+    }
+
+    const UDigitSettings* Settings = UDigitSettings::Get();
+    FLinearColor AccentColor = Settings
+        ? Settings->DigitHighlightColor
+        : FLinearColor(0.0f, 0.162029f, 0.745404f, 0.38f);
+    AccentColor.A = FMath::Max(AccentColor.A, 0.62f);
+
+    FLinearColor OriginColor = AccentColor;
+    OriginColor.A = 1.0f;
+
+    const FLinearColor PanelEdgeColor(0.13f, 0.13f, 0.13f, 1.0f);
+    const FLinearColor PanelColor(0.025f, 0.025f, 0.025f, 0.98f);
+    const FLinearColor NormalTextColor(0.78f, 0.78f, 0.78f, 1.0f);
+    const FLinearColor DisabledTextColor(0.34f, 0.34f, 0.34f, 1.0f);
+    const FSlateBrush* WhiteBrush = FCoreStyle::Get().GetBrush(TEXT("WhiteBrush"));
+
+    const TSharedPtr<STextBlock> SourceText = ActiveTextWidget.IsValid()
+        ? ActiveTextWidget.Pin()
+        : HighlightTextWidget.Pin();
+    const FSlateFontInfo LadderFont = SourceText.IsValid()
+        ? SourceText->GetFont()
+        : FCoreStyle::GetDefaultFontStyle(TEXT("Regular"), 9);
+
+    TSharedRef<SVerticalBox> Rows = SNew(SVerticalBox);
+
+    for (int32 RowIndex = 0; RowIndex < 9; ++RowIndex)
+    {
+        const int32 DigitPlace = LadderOriginDigitPlace + 4 - RowIndex;
+        const bool bValidPlace = !bLadderIntegral || DigitPlace >= 0;
+        const bool bSelected = DigitPlace == LadderSelectedDigitPlace;
+        const bool bOrigin = DigitPlace == LadderOriginDigitPlace;
+
+        const FLinearColor RowBackground = bSelected && bValidPlace
+            ? AccentColor
+            : FLinearColor::Transparent;
+        const FLinearColor TextColor = bValidPlace
+            ? (bSelected ? FLinearColor::White : NormalTextColor)
+            : DisabledTextColor;
+        const FLinearColor MarkerColor = bOrigin ? OriginColor : FLinearColor::Transparent;
+
+        Rows->AddSlot()
+        .AutoHeight()
+        [
+            SNew(SBox)
+            .HeightOverride(17.0f)
+            [
+                SNew(SBorder)
+                .BorderImage(WhiteBrush)
+                .BorderBackgroundColor(RowBackground)
+                .Padding(FMargin(4.0f, 0.0f, 5.0f, 0.0f))
+                [
+                    SNew(SHorizontalBox)
+
+                    + SHorizontalBox::Slot()
+                    .AutoWidth()
+                    .VAlign(VAlign_Center)
+                    [
+                        SNew(SBox)
+                        .WidthOverride(2.0f)
+                        .HeightOverride(9.0f)
+                        [
+                            SNew(SBorder)
+                            .BorderImage(WhiteBrush)
+                            .BorderBackgroundColor(MarkerColor)
+                            .Padding(0.0f)
+                        ]
+                    ]
+
+                    + SHorizontalBox::Slot()
+                    .FillWidth(1.0f)
+                    .HAlign(HAlign_Right)
+                    .VAlign(VAlign_Center)
+                    .Padding(FMargin(5.0f, 0.0f, 0.0f, 0.0f))
+                    [
+                        SNew(STextBlock)
+                        .Text(FText::FromString(DigitPrivate::FormatMagnitudeForLadder(DigitPlace)))
+                        .Font(LadderFont)
+                        .ColorAndOpacity(TextColor)
+                        .Justification(ETextJustify::Right)
+                    ]
+                ]
+            ]
+        ];
+    }
+
+    TSharedRef<SBox> LadderRoot =
+        SNew(SBox)
+        .Visibility(EVisibility::HitTestInvisible)
+        .WidthOverride(72.0f)
+        [
+            SNew(SBorder)
+            .BorderImage(WhiteBrush)
+            .BorderBackgroundColor(PanelEdgeColor)
+            .Padding(1.0f)
+            [
+                SNew(SBorder)
+                .BorderImage(WhiteBrush)
+                .BorderBackgroundColor(PanelColor)
+                .Padding(2.0f)
+                [
+                    Rows
+                ]
+            ]
+        ];
+
+    Window->AddOverlaySlot(10002)
+        .HAlign(HAlign_Left)
+        .VAlign(VAlign_Top)
+        .Padding(FMargin(LadderWindowPosition.X, LadderWindowPosition.Y, 0.0f, 0.0f))
+        [
+            LadderRoot
+        ];
+
+    LadderWidget = LadderRoot;
+}
+
+void FDigitInputProcessor::ClearLadder()
+{
+    if (LadderWidget.IsValid())
+    {
+        if (const TSharedPtr<SWindow> Window = LadderWindow.Pin())
+        {
+            Window->RemoveOverlaySlot(LadderWidget.ToSharedRef());
+        }
+    }
+
+    LadderWindow.Reset();
+    LadderWidget.Reset();
+    LadderSpinBoxWidget.Reset();
+    LadderWindowPosition = FVector2D::ZeroVector;
+
+    if (!bLadderModeActive)
+    {
+        LadderOriginDigitPlace = 0;
+        LadderSelectedDigitPlace = 0;
+        LadderVerticalTravel = 0.0f;
+        bLadderIntegral = false;
+    }
+}
+
+bool FDigitInputProcessor::UpdateLadderSelection(const FPointerEvent& MouseEvent)
+{
+    if (!bLadderModeActive)
+    {
+        return false;
+    }
+
+    constexpr float LadderRowHeight = 17.0f;
+    constexpr float RungThreshold = LadderRowHeight * 0.5f;
+
+    LadderVerticalTravel += static_cast<float>(MouseEvent.GetCursorDelta().Y);
+
+    const int32 MaxPlace = LadderOriginDigitPlace + 4;
+    const int32 MinPlace = bLadderIntegral
+        ? FMath::Max(0, LadderOriginDigitPlace - 4)
+        : LadderOriginDigitPlace - 4;
+
+    bool bChanged = false;
+
+    while (LadderVerticalTravel <= -RungThreshold && LadderSelectedDigitPlace < MaxPlace)
+    {
+        ++LadderSelectedDigitPlace;
+        LadderVerticalTravel += LadderRowHeight;
+        bChanged = true;
+    }
+
+    while (LadderVerticalTravel >= RungThreshold && LadderSelectedDigitPlace > MinPlace)
+    {
+        --LadderSelectedDigitPlace;
+        LadderVerticalTravel -= LadderRowHeight;
+        bChanged = true;
+    }
+
+    if (LadderSelectedDigitPlace >= MaxPlace)
+    {
+        LadderVerticalTravel = FMath::Max(LadderVerticalTravel, -RungThreshold);
+    }
+    if (LadderSelectedDigitPlace <= MinPlace)
+    {
+        LadderVerticalTravel = FMath::Min(LadderVerticalTravel, RungThreshold);
+    }
+
+    if (bChanged)
+    {
+        ActiveDigitPlace = LadderSelectedDigitPlace;
+        ClearActiveDragOutline();
+        RebuildLadderVisual();
+    }
+
+    return bChanged;
+}
+
+bool FDigitInputProcessor::IsIntegralSpinBox(const TSharedPtr<SWidget>& Widget) const
+{
+    if (!Widget.IsValid())
+    {
+        return false;
+    }
+
+    const TSharedRef<SWidget> WidgetRef = Widget.ToSharedRef();
+    return DigitPrivate::IsWidgetClass<uint64>(WidgetRef)
+        || DigitPrivate::IsWidgetClass<uint32>(WidgetRef)
+        || DigitPrivate::IsWidgetClass<uint16>(WidgetRef)
+        || DigitPrivate::IsWidgetClass<uint8>(WidgetRef)
+        || DigitPrivate::IsWidgetClass<int64>(WidgetRef)
+        || DigitPrivate::IsWidgetClass<int32>(WidgetRef)
+        || DigitPrivate::IsWidgetClass<int16>(WidgetRef)
+        || DigitPrivate::IsWidgetClass<int8>(WidgetRef);
 }
 
 void FDigitInputProcessor::QueueRestore()
 {
+    // Any path that ends an active interaction, including lost mouse capture, must
+    // transition the persistent cursor override out of the drag state before cleanup.
+    bDigitDragStarted = false;
+    ApplyDigitCursor();
+    ClearActiveDragOutline();
+    ClearLadder();
+
     if (ActiveSpinBox.IsValid() && RestoreDeltaFunction)
     {
         bRestorePending = true;
@@ -1038,6 +1828,8 @@ void FDigitInputProcessor::QueueRestore()
 
 void FDigitInputProcessor::RestoreActiveDelta()
 {
+    ClearActiveDragOutline();
+
     if (RestoreDeltaFunction)
     {
         RestoreDeltaFunction();
@@ -1054,6 +1846,12 @@ void FDigitInputProcessor::RestoreActiveDelta()
     bDigitDragStarted = false;
     bRestorePending = false;
     bAwaitingNativeCapture = false;
+    bActiveSpinBoxIsIntegral = false;
+    bLadderModeActive = false;
+    bLadderIntegral = false;
+    LadderOriginDigitPlace = 0;
+    LadderSelectedDigitPlace = 0;
+    LadderVerticalTravel = 0.0f;
 }
 
 bool FDigitInputProcessor::IsSupportedSpinBox(const TSharedRef<SWidget>& Widget) const

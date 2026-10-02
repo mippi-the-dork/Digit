@@ -17,6 +17,9 @@ public:
     virtual FName GetSectionName() const override { return TEXT("Digit"); }
     virtual FName GetCategoryName() const override { return TEXT("Plugins"); }
 
+    UPROPERTY(EditAnywhere, Config, Category = "Scrubbing", meta = (DisplayName = "Scrub Sensitivity", ClampMin = "0.1", ClampMax = "10.0", UIMin = "0.25", UIMax = "4.0", ToolTip = "Scales horizontal Digit scrubbing. 1.0 is the default speed. Lower values require more mouse movement; higher values require less. Does not affect the drag threshold or Value Ladder rung selection."))
+    float ScrubSensitivity;
+
     UPROPERTY(EditAnywhere, Config, Category = "Appearance|Digit Highlight", meta = (DisplayName = "Highlight Color", ToolTip = "Background color drawn behind the numeric digit currently targeted by Digit scrubbing."))
     FLinearColor DigitHighlightColor;
 

@@ -939,6 +939,11 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         }
     }
 
+    const UDigitSettings* DigitSettings = UDigitSettings::Get();
+    const double ScrubSensitivity = DigitSettings && FMath::IsFinite(DigitSettings->ScrubSensitivity)
+        ? FMath::Clamp(static_cast<double>(DigitSettings->ScrubSensitivity), 0.1, 10.0)
+        : 1.0;
+
     const double SliderExponent = static_cast<double>(SpinBox->GetSliderExponent());
     const double WorkingInfluence = FMath::Pow(static_cast<double>(WorkingDelta), SliderExponent);
     if (!FMath::IsFinite(WorkingInfluence) || WorkingInfluence <= 0.0)
@@ -1003,6 +1008,7 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         NativeBaseStep,
         SliderExponent,
         WorkingInfluence,
+        ScrubSensitivity,
         MinSliderAsDouble,
         MaxSliderAsDouble,
         MinValueAsDouble,
@@ -1047,7 +1053,7 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
                     && FMath::IsFinite(SliderWidth)
                     && SliderWidth > 0.0)
                 {
-                    double TargetValue = DigitValue + (PhysicalDeltaX * DesiredStepAsDouble * InputMultiplier);
+                    double TargetValue = DigitValue + (PhysicalDeltaX * DesiredStepAsDouble * InputMultiplier * ScrubSensitivity);
                     TargetValue = FMath::Clamp(TargetValue, MinSliderAsDouble, MaxSliderAsDouble);
                     TargetValue = FMath::Clamp(TargetValue, MinValueAsDouble, MaxValueAsDouble);
 
@@ -1074,7 +1080,7 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
                 }
                 else
                 {
-                    RoutedDelta.X *= MovementScale;
+                    RoutedDelta.X *= MovementScale * ScrubSensitivity;
                 }
             }
         }
@@ -1097,13 +1103,14 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         : FMath::Pow(static_cast<double>(InitialDesiredStep), SliderExponent) / WorkingInfluence;
 
     UE_LOG(LogDigit, Log,
-        TEXT("Armed digit place %d%s: desired step %.9g, working Delta %.9g, original Delta %.9g, move scale %.9g, bounded %s, slider [%.9g, %.9g], exponent %.9g"),
+        TEXT("Armed digit place %d%s: desired step %.9g, working Delta %.9g, original Delta %.9g, move scale %.9g, sensitivity %.3g, bounded %s, slider [%.9g, %.9g], exponent %.9g"),
         Hit.DigitPlace,
         bUseLadder ? TEXT(" with ladder") : TEXT(""),
         static_cast<double>(InitialDesiredStep),
         static_cast<double>(WorkingDelta),
         static_cast<double>(OriginalDelta),
         InitialMovementScale,
+        ScrubSensitivity,
         bBoundedSliderRange ? TEXT("true") : TEXT("false"),
         static_cast<double>(MinSliderValue),
         static_cast<double>(MaxSliderValue),

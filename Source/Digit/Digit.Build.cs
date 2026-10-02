@@ -11,7 +11,9 @@ public class Digit : ModuleRules
         PublicDependencyModuleNames.AddRange(
             new string[]
             {
-                "Core"
+                "Core",
+                "CoreUObject",
+                "DeveloperSettings"
             }
         );
 
@@ -19,8 +21,6 @@ public class Digit : ModuleRules
             new string[]
             {
                 "ApplicationCore",
-                "CoreUObject",
-                "DeveloperSettings",
                 "Engine",
                 "InputCore",
                 "Slate",

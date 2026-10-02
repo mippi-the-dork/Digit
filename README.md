@@ -12,37 +12,7 @@ Hover the hundreds place to work in hundreds. Hover the tenths place to make fin
 ![Version](https://img.shields.io/badge/Version-1.0.0-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
-> [!IMPORTANT]
-> **ATTENTION - README AUTHOR**
->
-> Capture the primary hero image for Digit here.
->
-> **Recommended visual:** Screenshot
->
-> Show an Unreal Engine Details panel containing a numeric field with:
->
-> - One digit clearly highlighted by Digit
-> - The mouse cursor positioned over that digit
-> - Digit's tooltip visible
-> - Enough surrounding Unreal UI to make it immediately recognizable as the Editor
->
-> Use a value with several place values and decimals, such as:
->
-> `1234.567`
->
-> Hover something visually obvious, such as the `2` in the hundreds place.
->
-> The tooltip should clearly show the current increment and modifier options.
->
-> **Suggested file:**
->
-> `Doc/Images/Digit-Hero.png`
->
-> Once captured, replace this callout with:
->
-> ```markdown
-> ![Digit targeting a numeric place value in Unreal Engine](Doc/Images/Digit-Hero.png)
-> ```
+![Digit targeting a numeric place value in Unreal Engine](Doc/Images/Digit-Hero.png)
 
 ---
 
@@ -185,7 +155,7 @@ Digit works with supported scrub-enabled Unreal Editor numeric spin boxes rather
 Digit adds no runtime gameplay systems and has no impact on packaged game behavior.
 
 ---
-
+<!--
 > [!IMPORTANT]
 > **ATTENTION - README AUTHOR**
 >
@@ -219,7 +189,7 @@ Digit adds no runtime gameplay systems and has no impact on packaged game behavi
 > ```markdown
 > ![Digit-aware numeric scrubbing in Unreal Engine](Doc/Images/Digit-Scrubbing.gif)
 > ```
-
+-->
 ---
 
 # Using Digit
@@ -434,7 +404,7 @@ Alt: Value Ladder
 The tooltip updates according to the digit beneath the cursor.
 
 When Digit is no longer targeting that field, its original tooltip is restored.
-
+<!--
 > [!IMPORTANT]
 > **ATTENTION - README AUTHOR**
 >
@@ -463,7 +433,7 @@ When Digit is no longer targeting that field, its original tooltip is restored.
 > ```markdown
 > ![Digit place-value tooltip](Doc/Images/Digit-Tooltip.png)
 > ```
-
+-->
 ---
 
 # Shift and Ctrl
@@ -547,7 +517,7 @@ For example, targeting the ones place can produce:
 ```
 
 The original magnitude is marked so you can always see where the interaction began.
-
+<!--
 > [!IMPORTANT]
 > **ATTENTION - README AUTHOR**
 >
@@ -580,7 +550,7 @@ The original magnitude is marked so you can always see where the interaction beg
 > ```markdown
 > ![Changing scrub magnitude with the Digit Value Ladder](Doc/Images/Digit-Value-Ladder.gif)
 > ```
-
+-->
 ---
 
 # Using the Value Ladder
@@ -696,7 +666,7 @@ The outline communicates the direction of the current horizontal movement:
 The outline changes when drag direction changes and disappears when the interaction ends.
 
 This gives you feedback at the field level while the individual digit highlight continues to show the magnitude that started the interaction.
-
+<!--
 > [!IMPORTANT]
 > **ATTENTION - README AUTHOR**
 >
@@ -724,7 +694,7 @@ This gives you feedback at the field level while the individual digit highlight 
 > |---|---|
 > | ![Digit increasing value feedback](Doc/Images/Digit-Increase.png) | ![Digit decreasing value feedback](Doc/Images/Digit-Decrease.png) |
 > ```
-
+-->
 ---
 
 # Native Numeric Behavior
@@ -811,7 +781,7 @@ The current settings are:
 | **Highlighted Text Color** | Text color used for the targeted digit. |
 
 Digit's default highlight uses a translucent Unreal-style blue with white highlighted text.
-
+<!--
 > [!IMPORTANT]
 > **ATTENTION - README AUTHOR**
 >
@@ -839,7 +809,7 @@ Digit's default highlight uses a translucent Unreal-style blue with white highli
 > ```markdown
 > ![Digit Project Settings](Doc/Images/Digit-Settings.png)
 > ```
-
+-->
 ---
 
 # Example Workflow

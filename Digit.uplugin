@@ -1,22 +1,27 @@
 {
-    "FileVersion": 3,
-    "Version": 20,
-    "VersionName": "1.0.0",
-    "FriendlyName": "Digit",
-    "Description": "Adds digit-aware numeric scrubbing to Unreal Editor number fields.",
-    "Category": "Editor",
-    "CreatedBy": "Mippithedork",
-    "CanContainContent": false,
-    "IsBetaVersion": false,
-    "Installed": false,
-    "SupportedTargetPlatforms": [
-        "Win64"
-    ],
-    "Modules": [
-        {
-            "Name": "Digit",
-            "Type": "Editor",
-            "LoadingPhase": "PostEngineInit"
-        }
-    ]
+	"FileVersion": 3,
+	"Version": 20,
+	"VersionName": "1.0.0",
+	"FriendlyName": "Digit",
+	"Description": "Adds digit-aware numeric scrubbing to Unreal Editor number fields.",
+	"Category": "Editor",
+	"CreatedBy": "Mippithedork",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"Installed": false,
+	"SupportedTargetPlatforms": [
+		"Win64"
+	],
+	"Modules": [
+		{
+			"Name": "Digit",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit"
+		}
+	],
+	"CreatedByURL": "https://github.com/mippi-the-dork",
+	"DocsURL": "https://github.com/mippi-the-dork/Digit",
+	"MarketplaceURL": "",
+	"SupportURL": "https://github.com/mippi-the-dork/Digit/issues",
+	"IsExperimentalVersion": false
 }

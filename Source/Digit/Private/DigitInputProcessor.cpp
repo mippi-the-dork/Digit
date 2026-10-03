@@ -875,6 +875,17 @@ bool FDigitInputProcessor::ArmSpinBox(const FNumericHit& Hit, int32 PointerIndex
         LadderOriginDigitPlace = Hit.DigitPlace;
         LadderSelectedDigitPlace = Hit.DigitPlace;
         LadderVerticalTravel = 0.0f;
+
+        const UDigitSettings* DigitSettings = UDigitSettings::Get();
+        const float ConfiguredLadderSensitivity =
+            DigitSettings && FMath::IsFinite(DigitSettings->LadderMagnitudeSensitivity)
+                ? FMath::Clamp(DigitSettings->LadderMagnitudeSensitivity, 0.1f, 10.0f)
+                : 1.0f;
+
+        // The public setting uses 1.0 as the new default, but that default intentionally
+        // represents half of Digit's original vertical ladder sensitivity. A setting of
+        // 2.0 therefore reproduces the pre-setting ladder behavior.
+        ActiveLadderMagnitudeSensitivity = ConfiguredLadderSensitivity * 0.5f;
     }
 
     return bArmed;
@@ -1760,7 +1771,8 @@ bool FDigitInputProcessor::UpdateLadderSelection(const FPointerEvent& MouseEvent
     constexpr float LadderRowHeight = 17.0f;
     constexpr float RungThreshold = LadderRowHeight * 0.5f;
 
-    LadderVerticalTravel += static_cast<float>(MouseEvent.GetCursorDelta().Y);
+    LadderVerticalTravel +=
+        static_cast<float>(MouseEvent.GetCursorDelta().Y) * ActiveLadderMagnitudeSensitivity;
 
     const int32 MaxPlace = LadderOriginDigitPlace + 4;
     const int32 MinPlace = bLadderIntegral
@@ -1861,6 +1873,7 @@ void FDigitInputProcessor::RestoreActiveDelta()
     LadderOriginDigitPlace = 0;
     LadderSelectedDigitPlace = 0;
     LadderVerticalTravel = 0.0f;
+    ActiveLadderMagnitudeSensitivity = 0.5f;
 }
 
 bool FDigitInputProcessor::IsSupportedSpinBox(const TSharedRef<SWidget>& Widget) const

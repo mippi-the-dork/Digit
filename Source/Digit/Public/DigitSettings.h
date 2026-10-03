@@ -20,6 +20,9 @@ public:
     UPROPERTY(EditAnywhere, Config, Category = "Scrubbing", meta = (DisplayName = "Scrub Sensitivity", ClampMin = "0.1", ClampMax = "10.0", UIMin = "0.25", UIMax = "4.0", ToolTip = "Scales horizontal Digit scrubbing. 1.0 is the default speed. Lower values require more mouse movement; higher values require less. Does not affect the drag threshold or Value Ladder rung selection."))
     float ScrubSensitivity;
 
+    UPROPERTY(EditAnywhere, Config, Category = "Scrubbing", meta = (DisplayName = "Ladder Magnitude Sensitivity", ClampMin = "0.1", ClampMax = "10.0", UIMin = "0.25", UIMax = "4.0", ToolTip = "Scales vertical Value Ladder magnitude selection. 1.0 is the default and is 50% less sensitive than Digit's original ladder behavior. Lower values require more vertical movement to change magnitude; higher values require less. 2.0 matches the original ladder sensitivity. Does not affect horizontal scrubbing."))
+    float LadderMagnitudeSensitivity;
+
     UPROPERTY(EditAnywhere, Config, Category = "Appearance|Digit Highlight", meta = (DisplayName = "Highlight Color", ToolTip = "Background color drawn behind the numeric digit currently targeted by Digit scrubbing."))
     FLinearColor DigitHighlightColor;
 

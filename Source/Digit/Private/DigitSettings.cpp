@@ -4,6 +4,7 @@
 
 UDigitSettings::UDigitSettings()
     : ScrubSensitivity(1.0f)
+    , LadderMagnitudeSensitivity(1.0f)
     , DigitHighlightColor(FLinearColor(0.0f, 0.162029f, 0.745404f, 0.38f))
     , HighlightedTextColor(FLinearColor::White)
 {

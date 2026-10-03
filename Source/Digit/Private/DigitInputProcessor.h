@@ -115,6 +115,7 @@ private:
     int32 LadderOriginDigitPlace = 0;
     int32 LadderSelectedDigitPlace = 0;
     float LadderVerticalTravel = 0.0f;
+    float ActiveLadderMagnitudeSensitivity = 0.5f;
     bool bLadderModeActive = false;
     bool bLadderIntegral = false;
 };

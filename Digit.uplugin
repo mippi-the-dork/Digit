@@ -8,6 +8,7 @@
 	"CreatedBy": "Mippithedork",
 	"CanContainContent": false,
 	"IsBetaVersion": false,
+	"EngineVersion": "5.8.0",
 	"Installed": false,
 	"SupportedTargetPlatforms": [
 		"Win64"

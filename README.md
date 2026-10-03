@@ -138,9 +138,23 @@ Digit continues to use Unreal Engine's numeric spin box behavior, including supp
 
 While actively scrubbing, Digit outlines the numeric field to show whether the current movement is increasing or decreasing the value.
 
-### Native Cursor Feedback
+### Scrub Sensitivity
 
-Once a scrub begins, Digit uses the familiar horizontal resize cursor associated with numeric dragging.
+Adjust horizontal scrub sensitivity from Project Settings to match your preferred mouse movement.
+
+A value of `1.0` is the default. Lower values require more horizontal movement, while higher values require less.
+
+### Ladder Magnitude Sensitivity
+
+Adjust how much vertical mouse movement is required to change Value Ladder magnitudes.
+
+A value of `1.0` is the default and is tuned for more deliberate rung changes. Lower values require more vertical movement, while higher values switch magnitudes more quickly.
+
+### Native Mouse Capture
+
+Digit preserves Unreal Engine's normal mouse capture behavior during numeric scrubbing.
+
+Depending on the field and editor context, the cursor may be hidden while the drag is active. Digit relies on the targeted-digit highlight and increase/decrease outline to keep the interaction readable.
 
 ### Customizable Highlight
 
@@ -270,7 +284,27 @@ Digit preserves Unreal Engine's normal physical drag threshold.
 
 The value does not immediately change simply because the mouse button was pressed.
 
-Once the threshold is crossed, the cursor switches to the horizontal resize cursor and numeric scrubbing begins.
+Once the threshold is crossed, numeric scrubbing begins.
+
+During active mouse capture, Unreal Engine may hide the cursor until the drag ends. Digit's digit highlight and increase/decrease outline continue to provide visual feedback during the interaction.
+
+## Scrub Sensitivity
+
+Horizontal scrubbing can be tuned from:
+
+**Project Settings > Plugins > Digit**
+
+The **Scrub Sensitivity** setting scales horizontal mouse movement without changing the selected digit magnitude.
+
+| Value | Behavior |
+|---|---|
+| `1.0` | Default scrub sensitivity |
+| Below `1.0` | Requires more horizontal mouse movement |
+| Above `1.0` | Requires less horizontal mouse movement |
+
+Scrub Sensitivity applies to both normal digit scrubbing and horizontal movement while using the Value Ladder.
+
+It does not change Unreal Engine's native drag threshold.
 
 ---
 
@@ -582,6 +616,33 @@ For example:
 
 You do not need to end the drag and target another digit.
 
+## Ladder Magnitude Sensitivity
+
+Vertical ladder movement can be tuned independently from horizontal scrubbing.
+
+Open:
+
+**Project Settings > Plugins > Digit**
+
+and adjust **Ladder Magnitude Sensitivity**.
+
+| Value | Behavior |
+|---|---|
+| `1.0` | Default ladder magnitude sensitivity |
+| Below `1.0` | Requires more vertical movement to change magnitude |
+| Above `1.0` | Requires less vertical movement to change magnitude |
+
+This setting affects only vertical movement between Value Ladder magnitudes.
+
+It does not change:
+
+- Horizontal scrub sensitivity
+- The selected digit's magnitude
+- Shift or Ctrl behavior
+- Unreal Engine's native drag threshold
+
+The setting is applied when a ladder drag begins, so a sensitivity change affects the next interaction rather than changing an active drag midway through it.
+
 ---
 
 # Ladder Range
@@ -771,14 +832,18 @@ Open:
 
 **Project Settings > Plugins > Digit**
 
-to customize Digit's appearance.
+to customize Digit's interaction and appearance.
 
 The current settings are:
 
 | Setting | Purpose |
 |---|---|
+| **Scrub Sensitivity** | Scales horizontal scrubbing. `1.0` is the default. Lower values require more mouse movement; higher values require less. |
+| **Ladder Magnitude Sensitivity** | Scales vertical Value Ladder magnitude selection. `1.0` is the default. Lower values require more deliberate vertical movement; higher values switch magnitudes more quickly. |
 | **Highlight Color** | Background color displayed behind the targeted digit. |
 | **Highlighted Text Color** | Text color used for the targeted digit. |
+| **Increase Outline Color** | Outline color shown while the value is increasing. |
+| **Decrease Outline Color** | Outline color shown while the value is decreasing. |
 
 Digit's default highlight uses a translucent Unreal-style blue with white highlighted text.
 <!--
@@ -855,7 +920,7 @@ Digit does not store anything on:
 - Assets
 - Numeric properties
 
-Its appearance settings are stored through the project's Digit configuration.
+Its settings are stored through the project's Digit configuration.
 
 Using Digit does not add metadata to the property you edit.
 
@@ -1084,12 +1149,12 @@ When a drag begins:
 
 1. Unreal Engine receives the normal mouse-down interaction.
 2. Digit preserves Unreal's native drag threshold.
-3. Once normal scrubbing begins, Digit scales the horizontal movement according to the selected place value.
+3. Once normal scrubbing begins, Digit scales horizontal movement according to the selected place value and configured Scrub Sensitivity.
 4. The modified movement is routed through the existing numeric spin box.
 5. The field continues to enforce its normal numeric range and behavior.
 6. Digit restores the field's original scrub configuration when the interaction ends.
 
-When the Value Ladder is active, vertical movement changes the selected magnitude while horizontal movement continues to control the value.
+When the Value Ladder is active, vertical movement changes the selected magnitude using the configured Ladder Magnitude Sensitivity while horizontal movement continues to control the value using Scrub Sensitivity.
 
 Digit therefore does not replace Unreal Engine's numeric editing system.
 
@@ -1219,6 +1284,34 @@ Integer fields cannot accept fractional values, so Digit disables ladder positio
 
 ---
 
+## Scrubbing Feels Too Fast or Too Slow
+
+Open:
+
+**Project Settings > Plugins > Digit**
+
+and adjust **Scrub Sensitivity**.
+
+Use a value below `1.0` for slower, more deliberate horizontal scrubbing.
+
+Use a value above `1.0` for faster scrubbing with less mouse movement.
+
+---
+
+## The Value Ladder Changes Magnitude Too Easily
+
+Open:
+
+**Project Settings > Plugins > Digit**
+
+and reduce **Ladder Magnitude Sensitivity**.
+
+Lower values require more vertical mouse movement before the active ladder magnitude changes.
+
+This setting is independent from horizontal Scrub Sensitivity.
+
+---
+
 ## The Highlight Disappears While Scrubbing
 
 The originally targeted place value can temporarily disappear from the displayed number.
@@ -1274,6 +1367,8 @@ When reporting a bug, include:
 - Which digit was targeted
 - Whether Shift, Ctrl, or Alt was being used
 - Whether the Value Ladder was active
+- Scrub Sensitivity value when relevant
+- Ladder Magnitude Sensitivity value when relevant
 - Steps to reproduce the problem
 - Screenshots or video when relevant
 - Any relevant Unreal Editor log output

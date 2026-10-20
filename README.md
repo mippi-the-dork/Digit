@@ -1,4 +1,4 @@
-# Digit
+﻿# Digit
 
 **Digit-aware numeric scrubbing for Unreal Engine.**
 
@@ -9,7 +9,7 @@ Hover the hundreds place to work in hundreds. Hover the tenths place to make fin
 ![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.8.x-black?logo=unrealengine)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2064--bit-blue)
 ![Type](https://img.shields.io/badge/Plugin-Editor%20Only-green)
-![Version](https://img.shields.io/badge/Version-1.0.0-blue)
+![Version](https://img.shields.io/badge/Version-1.0.5-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 ![Digit targeting a numeric place value in Unreal Engine](Doc/Images/Digit-Hero.png)
@@ -70,7 +70,7 @@ Digit gives precision control without adding another editing mode or replacing U
 
 ---
 
-# Features
+## Features
 
 ### Digit-Aware Scrubbing
 
@@ -92,7 +92,11 @@ Hover a digit to see:
 
 ### Integer and Decimal Support
 
-Work with whole-number and floating-point fields using the place values appropriate to each.
+Work with whole-number and floating-point fields using the place values appropriate to each. Integer spin boxes use direct whole-number changes so targeting tens, hundreds, or larger places is not reduced to one-unit increments by the native slider fraction. The displayed numeric type is never changed.
+
+### Continuous Rotation Scrubbing
+
+Transform Rotation components use continuous angle scrubbing. Dragging through +180° or -180° wraps around, and reversing direction works immediately, even after several complete revolutions. Digit recognizes rotator components from the surrounding Slate widget hierarchy so other angle-valued scalar fields continue to observe their actual bounds.
 
 ### Shift for Coarser Control
 
@@ -126,17 +130,11 @@ A click still behaves like a click instead of immediately changing the value.
 
 ### Native Numeric Constraints
 
-Digit continues to use Unreal Engine's numeric spin box behavior, including supported:
-
-- Minimum values
-- Maximum values
-- Slider ranges
-- Slider exponents
-- Numeric types
+Digit works through Unreal Engine's supported numeric spin boxes, respecting their hard numeric limits, numeric types, native mouse capture, and editing callbacks. Floating-point linear/unbounded fields use digit-scaled native drag behavior. Integer fields, rotator components, and nonlinear bounded fields use direct numeric targets where native mouse-fraction calculations cannot express the intended change reliably. Rotator components wrap through the normalized angle range continuously in either direction. Precision remains limited by the stored numeric type.
 
 ### Direction Feedback
 
-While actively scrubbing, Digit outlines the numeric field to show whether the current movement is increasing or decreasing the value.
+While actively scrubbing, Digit outlines the numeric field to show whether the current movement is increasing or decreasing the value. The blue increase and orange decrease outlines use fixed colors.
 
 ### Scrub Sensitivity
 
@@ -162,51 +160,23 @@ Configure the digit highlight background and highlighted text color from Project
 
 ### Editor-Wide Integration
 
-Digit works with supported scrub-enabled Unreal Editor numeric spin boxes rather than being tied to one specific Details panel.
+Digit works with supported scrub-enabled Unreal Editor numeric spin boxes rather than being tied to one specific Details panel. This can include compatible scalar fields in Material Instances and Material Parameter Collections.
+
+### International Number Formats
+
+Digit uses Unreal Editor's numeric locale when interpreting decimal and thousands separators, including comma-decimal formats and localized digit glyphs. The Editor's interface language and number-formatting locale can differ.
+
+### Optional Diagnostics
+
+A project setting enables targeted `LogDigit` widget-path diagnostics for numeric fields Digit cannot recognize. This is disabled by default.
 
 ### Editor Only
 
 Digit adds no runtime gameplay systems and has no impact on packaged game behavior.
 
 ---
-<!--
-> [!IMPORTANT]
-> **ATTENTION - README AUTHOR**
->
-> This should be the main demonstration of Digit.
->
-> **Recommended visual:** GIF
->
-> Use a numeric field with a value such as:
->
-> `1234.567`
->
-> Demonstrate:
->
-> 1. Move the cursor across several digits and show the highlight following the exact digit.
-> 2. Hover the hundreds digit and drag horizontally.
-> 3. Hover the ones digit and drag.
-> 4. Hover a decimal digit and drag.
->
-> Keep the mouse movement slow enough that viewers can clearly see which digit is targeted before each scrub.
->
-> If possible, use a property where the numeric changes also produce a visible viewport result, such as Location or another transform value.
->
-> Around 8 to 12 seconds is ideal.
->
-> **Suggested file:**
->
-> `Doc/Images/Digit-Scrubbing.gif`
->
-> Once captured, replace this callout with:
->
-> ```markdown
-> ![Digit-aware numeric scrubbing in Unreal Engine](Doc/Images/Digit-Scrubbing.gif)
-> ```
--->
----
 
-# Using Digit
+## Using Digit
 
 Digit does not add a separate editor window or toolbar.
 
@@ -236,7 +206,7 @@ Click and drag horizontally to scrub using that magnitude.
 
 ---
 
-# Targeting a Digit
+## Targeting a Digit
 
 Digit only activates when the cursor is directly over a numeric digit.
 
@@ -269,9 +239,25 @@ Digit still understands the numeric place values:
 
 The formatting characters do not change the meaning of the digits.
 
+## Regional Number Formats
+
+Digit interprets the value using Unreal Editor's active **numeric locale**, which is controlled independently of the Editor interface language under **Editor Preferences > General > Region & Language**.
+
+| Example display | Number format | Digit `5` position |
+|---|---|---|
+| `123.45` | Period decimal | Hundredths (`0.01`) |
+| `123,45` | Comma decimal | Hundredths (`0.01`) |
+| `1,234.56` | Comma grouping, period decimal | Tenths (`0.1`) |
+| `1.234,56` | Period grouping, comma decimal | Tenths (`0.1`) |
+| `1 234,56` | Narrow-space grouping, comma decimal | Tenths (`0.1`) |
+
+Localized numeric digits and common grouping spaces are supported. Non-numeric unit labels are ignored when determining place value. Digit does not change the Editor's language or regional preferences.
+
+Scientific-notation values such as `1.25e-04` are not eligible for direct digit-place scrubbing. Special or custom numeric formatting may also prevent Digit from safely interpreting a field.
+
 ---
 
-# Scrubbing
+## Scrubbing
 
 Once a digit is highlighted:
 
@@ -288,7 +274,7 @@ Once the threshold is crossed, numeric scrubbing begins.
 
 During active mouse capture, Unreal Engine may hide the cursor until the drag ends. Digit's digit highlight and increase/decrease outline continue to provide visual feedback during the interaction.
 
-## Scrub Sensitivity
+### Scrub Sensitivity
 
 Horizontal scrubbing can be tuned from:
 
@@ -308,7 +294,7 @@ It does not change Unreal Engine's native drag threshold.
 
 ---
 
-# Scrubbing by Place Value
+## Scrubbing by Place Value
 
 Consider:
 
@@ -422,7 +408,7 @@ Target the magnitude you want directly.
 
 ---
 
-# Hover Tooltip
+## Hover Tooltip
 
 When Digit highlights a number, it temporarily adds an informational tooltip to that numeric field.
 
@@ -438,43 +424,13 @@ Alt: Value Ladder
 The tooltip updates according to the digit beneath the cursor.
 
 When Digit is no longer targeting that field, its original tooltip is restored.
-<!--
-> [!IMPORTANT]
-> **ATTENTION - README AUTHOR**
->
-> Capture the tooltip behavior here if the hero image does not already show it clearly.
->
-> **Recommended visual:** Screenshot
->
-> Use a value with both whole and fractional digits.
->
-> Hover one digit and make sure the tooltip clearly shows:
->
-> - Current value
-> - Increment
-> - Shift
-> - Ctrl
-> - Alt: Value Ladder
->
-> Crop tightly enough that the text remains readable on GitHub.
->
-> **Suggested file:**
->
-> `Doc/Images/Digit-Tooltip.png`
->
-> Once captured, replace this callout with:
->
-> ```markdown
-> ![Digit place-value tooltip](Doc/Images/Digit-Tooltip.png)
-> ```
--->
 ---
 
-# Shift and Ctrl
+## Shift and Ctrl
 
 Digit preserves quick modifier-based changes to the current editing scale.
 
-## Shift
+### Shift
 
 Hold:
 
@@ -498,7 +454,7 @@ Shift  = 1
 
 ---
 
-## Ctrl
+### Ctrl
 
 Hold:
 
@@ -524,7 +480,7 @@ The hover tooltip shows the current Shift and Ctrl magnitudes before you begin d
 
 ---
 
-# Value Ladder
+## Value Ladder
 
 Sometimes the exact magnitude you need changes during the same adjustment.
 
@@ -551,43 +507,9 @@ For example, targeting the ones place can produce:
 ```
 
 The original magnitude is marked so you can always see where the interaction began.
-<!--
-> [!IMPORTANT]
-> **ATTENTION - README AUTHOR**
->
-> This is an essential Digit visual.
->
-> **Recommended visual:** GIF
->
-> Show:
->
-> 1. Hover a digit in a floating-point numeric field.
-> 2. Hold **Alt**.
-> 3. Show the Value Ladder appear beside the field.
-> 4. Begin dragging.
-> 5. Move vertically upward through several larger magnitudes.
-> 6. Scrub horizontally.
-> 7. Move vertically downward into smaller magnitudes.
-> 8. Scrub horizontally again.
-> 9. Release the mouse.
->
-> Use a field where the resulting value changes are easy to watch.
->
-> The ladder is deliberately placed to the **left of the numeric field when space allows**, helping keep it clear of Unreal's normal lower-right tooltip placement.
->
-> **Suggested file:**
->
-> `Doc/Images/Digit-Value-Ladder.gif`
->
-> Once captured, replace this callout with:
->
-> ```markdown
-> ![Changing scrub magnitude with the Digit Value Ladder](Doc/Images/Digit-Value-Ladder.gif)
-> ```
--->
 ---
 
-# Using the Value Ladder
+## Using the Value Ladder
 
 The Value Ladder combines two directions of mouse movement.
 
@@ -616,7 +538,7 @@ For example:
 
 You do not need to end the drag and target another digit.
 
-## Ladder Magnitude Sensitivity
+### Ladder Magnitude Sensitivity
 
 Vertical ladder movement can be tuned independently from horizontal scrubbing.
 
@@ -645,7 +567,7 @@ The setting is applied when a ladder drag begins, so a sensitivity change affect
 
 ---
 
-# Ladder Range
+## Ladder Range
 
 The Value Ladder displays nine positions centered on the digit that opened it:
 
@@ -677,7 +599,7 @@ or:
 
 ---
 
-# Integer Fields
+## Integer Fields
 
 Integer fields cannot contain fractional values.
 
@@ -703,7 +625,7 @@ Digit therefore does not turn an integer property into a floating-point property
 
 ---
 
-# Ladder Placement
+## Ladder Placement
 
 Digit attempts to place the Value Ladder to the **left of the numeric field**.
 
@@ -715,7 +637,7 @@ The ladder is also clamped to the current window so it remains visible near scre
 
 ---
 
-# Increase and Decrease Feedback
+## Increase and Decrease Feedback
 
 Once an active numeric drag begins, Digit outlines the complete numeric field.
 
@@ -727,38 +649,9 @@ The outline communicates the direction of the current horizontal movement:
 The outline changes when drag direction changes and disappears when the interaction ends.
 
 This gives you feedback at the field level while the individual digit highlight continues to show the magnitude that started the interaction.
-<!--
-> [!IMPORTANT]
-> **ATTENTION - README AUTHOR**
->
-> Capture Digit's directional feedback here.
->
-> **Recommended visual:** Two screenshots side by side
->
-> Use the same numeric field and targeted digit.
->
-> **Left:** Dragging right so the Increase outline is visible.
->
-> **Right:** Dragging left so the Decrease outline is visible.
->
-> Crop tightly around the field so the outline and highlighted digit remain easy to see.
->
-> **Suggested files:**
->
-> - `Doc/Images/Digit-Increase.png`
-> - `Doc/Images/Digit-Decrease.png`
->
-> Once captured, replace this callout with:
->
-> ```markdown
-> | Increasing | Decreasing |
-> |---|---|
-> | ![Digit increasing value feedback](Doc/Images/Digit-Increase.png) | ![Digit decreasing value feedback](Doc/Images/Digit-Decrease.png) |
-> ```
--->
 ---
 
-# Native Numeric Behavior
+## Native Numeric Behavior
 
 Digit changes the scale of numeric scrubbing rather than replacing Unreal Engine's underlying numeric widget behavior.
 
@@ -772,17 +665,19 @@ Supported fields continue to respect their configured numeric behavior, includin
 - Native mouse capture
 - Native drag threshold
 
-During a Digit interaction, the plugin temporarily configures the numeric field with enough precision to perform the requested scrub.
+Digit calculates the requested numeric change from the highlighted digit and Scrub Sensitivity. For ordinary floating-point linear bounded fields, it translates movement through the control's width and slider range; for unbounded fields, it compensates for native value-dependent sensitivity. For integral spin boxes and nonlinear bounded sliders, it uses the spin box's public numeric-value interface to avoid lossy slider-fraction conversion. Transform Rotation components keep a continuous internal angle that wraps at 180 degrees in either direction, allowing unlimited turns and mid-drag reversals. Standard native min/max constraints still apply to non-rotator numeric fields. When displays use different units, Digit attempts to infer the relationship between displayed and underlying values; this is not always discoverable, especially at zero.
 
-When the interaction ends, the field's original delta setting is restored.
+While Digit calculates the native mouse movement, the spin box's `Delta` is temporarily set to zero so its optional linear sensitivity cannot change the selected place's movement scale. When the value is already aligned to a representable decimal grid, Digit uses that grid for Unreal's subsequent numeric commit to reduce stray lower-order digits. It retains the field's existing visible lower-order digits where possible. The original `Delta` is restored after the interaction and any deferred commit; Digit does not permanently change the field's native step or slider settings.
 
-This keeps Digit focused on **how much the drag means**, while Unreal Engine continues to own the numeric property itself.
+For direct-value scrubbing, Digit temporarily supplies numeric values to the existing spin box and restores its original bound value attribute when the interaction ends. Native property-editing callbacks remain responsible for storing the value, and the editor remains responsible for undo transactions. This binding restoration and transaction behavior must be validated with each specialized Details-panel control.
+
+**Precision is not unlimited:** Floating-point types can represent only certain values, and bounded sliders use limited-resolution fractions internally. Tiny changes relative to a large stored value or wide slider range may be rounded or not represented at all.
 
 ---
 
-# Supported Numeric Types
+## Supported Numeric Types
 
-Digit supports Unreal Engine scrub-enabled numeric spin boxes using:
+Digit recognizes compatible Unreal Engine scrub-enabled numeric spin boxes using:
 
 ### Floating Point
 
@@ -809,7 +704,7 @@ Plain text fields or numeric widgets that do not expose Unreal Engine's standard
 
 ---
 
-# Where Digit Works
+## Where Digit Works
 
 Digit is implemented at the Unreal Editor Slate input level rather than being tied specifically to Actor Details.
 
@@ -817,16 +712,20 @@ This allows it to work anywhere the Editor exposes a compatible scrub-enabled nu
 
 Common examples can include numeric properties in:
 
-- Details panels
+- Actor and component Details panels
 - Transform fields
+- Material Instance scalar parameters
+- Material Parameter Collection scalar values
 - Editor utility interfaces using standard numeric widgets
 - Other native Unreal Editor panels built around compatible spin boxes
+
+These examples depend on each field using a compatible, scrub-enabled `SSpinBox`. Not every material editor field or custom parameter control exposes the same widget. Vector and color parameters are supported only where their individual numeric components use compatible spin boxes.
 
 Individual custom editor interfaces may behave differently if they use their own numeric controls instead of Unreal Engine's standard spin box implementation.
 
 ---
 
-# Project Settings
+## Project Settings
 
 Open:
 
@@ -834,7 +733,7 @@ Open:
 
 to customize Digit's interaction and appearance.
 
-The current settings are:
+Available settings are:
 
 | Setting | Purpose |
 |---|---|
@@ -842,42 +741,12 @@ The current settings are:
 | **Ladder Magnitude Sensitivity** | Scales vertical Value Ladder magnitude selection. `1.0` is the default. Lower values require more deliberate vertical movement; higher values switch magnitudes more quickly. |
 | **Highlight Color** | Background color displayed behind the targeted digit. |
 | **Highlighted Text Color** | Text color used for the targeted digit. |
-| **Increase Outline Color** | Outline color shown while the value is increasing. |
-| **Decrease Outline Color** | Outline color shown while the value is decreasing. |
+| **Log Numeric Widget Diagnostics** | Optional logging for a numeric spin box Digit cannot recognize or arm. Disabled by default. |
 
-Digit's default highlight uses a translucent Unreal-style blue with white highlighted text.
-<!--
-> [!IMPORTANT]
-> **ATTENTION - README AUTHOR**
->
-> Capture the Digit Project Settings here.
->
-> **Recommended visual:** Screenshot
->
-> Show:
->
-> **Project Settings > Plugins > Digit**
->
-> with both settings visible:
->
-> - Highlight Color
-> - Highlighted Text Color
->
-> This image is optional because Digit's configuration is intentionally small.
->
-> **Suggested file:**
->
-> `Doc/Images/Digit-Settings.png`
->
-> Once captured, replace this callout with:
->
-> ```markdown
-> ![Digit Project Settings](Doc/Images/Digit-Settings.png)
-> ```
--->
+Digit's default highlight uses a translucent Unreal-style blue with white highlighted text. Increase and decrease outlines use fixed blue and orange colors and are not separate settings.
 ---
 
-# Example Workflow
+## Example Workflow
 
 Imagine you're adjusting the X position of an Actor:
 
@@ -910,7 +779,7 @@ The number itself becomes the interface for choosing precision.
 
 ---
 
-# Saving Digit Settings
+## Saving Digit Settings
 
 Digit does not store anything on:
 
@@ -928,7 +797,7 @@ The resulting numeric value is simply the value Unreal Engine would normally sav
 
 ---
 
-# Installation
+## Installation
 
 Digit can be installed through **Fab**, from a **precompiled GitHub Release**, or directly from the **GitHub source**.
 
@@ -936,7 +805,7 @@ For most users, the Fab or GitHub Release installation is recommended.
 
 ---
 
-## Fab / Epic Games Launcher
+### Fab / Epic Games Launcher
 
 > **Availability:** Use this installation method once Digit is available through Fab.
 
@@ -955,11 +824,11 @@ Once enabled, Digit automatically works with compatible numeric fields throughou
 
 ---
 
-## GitHub Release
+### GitHub Release
 
-This is the easiest manual GitHub installation method because the release package is already prepared for the supported Unreal Engine version.
+Use a GitHub Release asset that matches the target Unreal Engine version and platform.
 
-### 1. Download Digit
+#### 1. Download Digit
 
 Open the repository's **Releases** page:
 
@@ -967,19 +836,13 @@ https://github.com/mippi-the-dork/Digit/releases
 
 Download the latest packaged plugin matching your Unreal Engine version and platform.
 
-For example:
-
-```text
-Digit-v1.0.0-UE5.8.3-Win64.zip
-```
-
 Do not use GitHub's automatically generated **Source code** ZIP as a precompiled plugin package.
 
-### 2. Close Unreal Editor
+#### 2. Close Unreal Editor
 
 Close the project before installing the plugin.
 
-### 3. Locate Your Project Plugins Folder
+#### 3. Locate Your Project Plugins Folder
 
 Your project should contain a `Plugins` directory beside the `.uproject` file:
 
@@ -993,7 +856,7 @@ YourProject/
 
 If the `Plugins` directory does not exist, create it.
 
-### 4. Extract Digit
+#### 4. Extract Digit
 
 Extract the `Digit` folder into:
 
@@ -1015,7 +878,7 @@ YourProject/
 └── YourProject.uproject
 ```
 
-### 5. Launch the Project
+#### 5. Launch the Project
 
 Open your Unreal Engine project.
 
@@ -1033,11 +896,11 @@ Enable the plugin and restart Unreal Editor if prompted.
 
 ---
 
-## GitHub Source
+### GitHub Source
 
 Developers who want the source or want to modify Digit can clone the repository directly.
 
-### Requirements
+#### Requirements
 
 Building Digit from source requires a working Unreal Engine C++ development environment.
 
@@ -1047,7 +910,7 @@ For Windows this generally means:
 - Visual Studio with the appropriate C++ workloads
 - A project capable of compiling C++ plugins
 
-### Clone the Repository
+#### Clone the Repository
 
 Close Unreal Editor and navigate to your project's `Plugins` directory.
 
@@ -1062,7 +925,7 @@ Your project should now contain:
 YourProject/Plugins/Digit/
 ```
 
-### Generate Project Files
+#### Generate Project Files
 
 If necessary:
 
@@ -1083,22 +946,22 @@ Launch the project after compilation completes.
 
 ---
 
-# Updating Digit
+## Replacing an Existing Installation
 
-## GitHub Release Installation
+### GitHub Release Installation
 
-When updating a manually installed release:
+To replace a manually installed copy:
 
 1. Close Unreal Editor.
 2. Remove the existing `Plugins/Digit` folder.
-3. Extract the new Digit release into the `Plugins` directory.
+3. Extract the desired Digit release into the `Plugins` directory.
 4. Reopen the project.
 
-Replacing the complete plugin folder is recommended rather than copying individual files over an older version.
+Replace the complete plugin folder rather than mixing files from different versions.
 
 ---
 
-## Git Source Installation
+### Git Source Installation
 
 If you cloned the repository using Git:
 
@@ -1111,13 +974,13 @@ Rebuild the project if the source has changed.
 
 ---
 
-# Compatibility
+## Compatibility
 
-The current Digit release targets:
+Digit is configured for:
 
 | | |
 |---|---|
-| **Digit Version** | 1.0.0 |
+| **Digit Version** | 1.0.5 |
 | **Unreal Engine** | 5.8.x |
 | **Platform** | Windows 64-bit |
 | **Plugin Type** | Editor |
@@ -1126,13 +989,13 @@ The current Digit release targets:
 | **Runtime Components** | None |
 | **Packaged Game Impact** | None |
 
-Digit is currently configured as a Win64 Editor plugin.
+Digit is a Win64 Editor plugin.
 
-Compatibility with additional Unreal Engine versions or platforms should not be assumed unless explicitly listed in a release.
+Unlisted Unreal Engine versions and platforms are not covered by the documented compatibility range.
 
 ---
 
-# How Digit Works
+## How Digit Works
 
 Digit integrates with Unreal Engine's Slate input system.
 
@@ -1150,8 +1013,8 @@ When a drag begins:
 1. Unreal Engine receives the normal mouse-down interaction.
 2. Digit preserves Unreal's native drag threshold.
 3. Once normal scrubbing begins, Digit scales horizontal movement according to the selected place value and configured Scrub Sensitivity.
-4. The modified movement is routed through the existing numeric spin box.
-5. The field continues to enforce its normal numeric range and behavior.
+4. Digit routes adjusted movement through the native spin box, or sets explicit numeric targets when slider-fraction math would lose integer magnitude, fine nonlinear precision, or repeated rotation wrapping.
+5. Regular scalar fields retain their numeric constraints; Transform Rotation components wrap cyclically.
 6. Digit restores the field's original scrub configuration when the interaction ends.
 
 When the Value Ladder is active, vertical movement changes the selected magnitude using the configured Ladder Magnitude Sensitivity while horizontal movement continues to control the value using Scrub Sensitivity.
@@ -1162,7 +1025,7 @@ It changes the meaning of the scrub based on the digit the user deliberately tar
 
 ---
 
-# What Digit Does Not Do
+## What Digit Does Not Do
 
 Digit is an **editor numeric-input utility**.
 
@@ -1186,7 +1049,7 @@ Digit works with existing compatible numeric controls rather than replacing them
 
 ---
 
-# Limitations
+## Limitations
 
 ### Supported Numeric Widgets
 
@@ -1206,15 +1069,21 @@ A digit must be present in the formatted value before it can be directly targete
 
 ### Integer Precision
 
-Integer fields cannot use fractional ladder magnitudes.
-
-Fractional ladder positions are disabled automatically.
+Integer fields cannot use fractional ladder magnitudes. Fractional ladder positions are disabled automatically. Integer values beyond the exact range of Digit's double-precision accumulator (approximately 2^53) are intentionally left to Unreal's native handling, rather than risk a lossy 64-bit integer rewrite.
 
 ### Number Formatting
 
-Digit is designed around normal Unreal numeric formatting using digits, decimal points, grouping commas, and positive or negative signs.
+Digit follows Unreal's current numeric locale for ordinary localized decimal and grouping conventions, including common space-grouping formats. If both period and comma occur in one value, the last separator is interpreted as decimal; a single ambiguous separator uses the locale's grouping convention. Some custom formatting and bidirectional text layouts may not map reliably to a numeric place.
 
-Specialized custom formatting may not provide enough information for Digit to determine the intended place value.
+Scientific-notation displays are excluded from digit-place scrubbing because exponent digits do not represent ordinary decimal places.
+
+### Floating-Point and Slider Precision
+
+`float` and `double` values cannot represent every decimal exactly. A requested adjustment such as `0.01` may round to a nearby representable value. At large magnitudes, a very small change may be too small to affect a `float` at all. Digit avoids routing sub-resolution steps where it can determine that a native numeric value cannot represent them.
+
+Unreal's bounded slider calculations use single-precision fractions internally. Digit routes nonlinear bounded sliders and integral spin boxes through the public numeric value interface to avoid losing precision in that fraction. Linear bounded floating-point sliders still use the native slider fraction, and all fields remain limited by the actual numeric type, snapping rules, clamping, and the widget's editing callbacks. A precision smaller than the float or double's representable spacing cannot be guaranteed.
+
+Some specialized spin boxes implement a nonlinear slider with a private exponent-neutral value that Digit cannot inspect through the public `SSpinBox` interface. Those controls may not follow the usual drag-scaling relationship.
 
 ### Editor Only
 
@@ -1224,9 +1093,9 @@ It does not alter numeric input behavior in the packaged game.
 
 ---
 
-# Troubleshooting
+## Troubleshooting
 
-## Digit Does Not Highlight a Number
+### Digit Does Not Highlight a Number
 
 Check:
 
@@ -1246,9 +1115,11 @@ Also make sure the cursor is directly over a **digit**, not the decimal point, c
 
 ---
 
-## A Numeric Field Does Not Respond to Digit
+### A Numeric Field Does Not Respond to Digit
 
-The field may not use a supported scrub-enabled Unreal Engine numeric spin box.
+The field may not use a supported scrub-enabled Unreal Engine numeric spin box. Digit can search within a compatible spin box for numeric text nested under other Slate widgets, but custom control implementations may still be unsupported.
+
+For a field that still fails, enable **Project Settings > Plugins > Digit > Diagnostics > Log Numeric Widget Diagnostics**, click that field once, and copy the `LogDigit` entry from the Output Log. The entry includes the widget path and numeric locale when relevant. Turn diagnostics off again during normal editing.
 
 Try dragging the field normally.
 
@@ -1256,7 +1127,7 @@ If Unreal Engine itself does not allow horizontal numeric scrubbing on that fiel
 
 ---
 
-## The Value Ladder Does Not Appear
+### The Value Ladder Does Not Appear
 
 Hover directly over a highlighted digit, then hold:
 
@@ -1268,7 +1139,7 @@ To change ladder magnitude during editing, continue holding Alt while click-drag
 
 ---
 
-## The Ladder Appears on the Right Side
+### The Ladder Appears on the Right Side
 
 Digit prefers to place the Value Ladder on the left side of the field.
 
@@ -1276,7 +1147,7 @@ If there is not enough room, it automatically moves the ladder to the right so i
 
 ---
 
-## Fractional Ladder Values Are Disabled
+### Fractional Ladder Values Are Disabled
 
 Check whether the numeric field is an integer.
 
@@ -1284,7 +1155,7 @@ Integer fields cannot accept fractional values, so Digit disables ladder positio
 
 ---
 
-## Scrubbing Feels Too Fast or Too Slow
+### Scrubbing Feels Too Fast or Too Slow
 
 Open:
 
@@ -1298,7 +1169,7 @@ Use a value above `1.0` for faster scrubbing with less mouse movement.
 
 ---
 
-## The Value Ladder Changes Magnitude Too Easily
+### The Value Ladder Changes Magnitude Too Easily
 
 Open:
 
@@ -1312,7 +1183,7 @@ This setting is independent from horizontal Scrub Sensitivity.
 
 ---
 
-## The Highlight Disappears While Scrubbing
+### The Highlight Disappears While Scrubbing
 
 The originally targeted place value can temporarily disappear from the displayed number.
 
@@ -1334,7 +1205,7 @@ Digit keeps the active magnitude internally and temporarily hides only the visua
 
 ---
 
-## Shift or Ctrl Does Not Produce a Fractional Integer Value
+### Shift or Ctrl Does Not Produce a Fractional Integer Value
 
 Integer properties remain integer properties.
 
@@ -1342,7 +1213,7 @@ Digit can change the scrub behavior, but it does not alter the property's underl
 
 ---
 
-## A Value Stops at a Minimum or Maximum
+### A Value Stops at a Minimum or Maximum
 
 Digit respects the numeric field's existing limits.
 
@@ -1350,7 +1221,7 @@ It does not bypass hard or slider ranges configured by the field.
 
 ---
 
-# Reporting Bugs
+## Reporting Bugs
 
 If you encounter a problem, please open an issue:
 
@@ -1362,7 +1233,8 @@ When reporting a bug, include:
 - Unreal Engine version
 - Windows version
 - Whether Digit was installed from Fab, a GitHub Release, or source
-- The numeric field or property being edited
+- The numeric field or property being edited (for example a Material Instance Scalar Parameter)
+- The Editor's numeric locale / number-formatting preference
 - The displayed value
 - Which digit was targeted
 - Whether Shift, Ctrl, or Alt was being used
@@ -1371,13 +1243,13 @@ When reporting a bug, include:
 - Ladder Magnitude Sensitivity value when relevant
 - Steps to reproduce the problem
 - Screenshots or video when relevant
-- Any relevant Unreal Editor log output
+- Any relevant Unreal Editor log output (enable **Log Numeric Widget Diagnostics** when a compatible field cannot be recognized)
 
 For place-value issues, include the exact displayed number and the digit you expected Digit to target.
 
 ---
 
-# Feature Requests
+## Feature Requests
 
 Suggestions and feature requests are welcome through GitHub Issues.
 
@@ -1387,17 +1259,17 @@ This helps keep Digit focused on faster and more precise numeric editing inside 
 
 ---
 
-# Contributions
+## Contributions
 
 Pull requests are welcome.
 
 If you're considering a significant change, opening an Issue first is recommended so the intended behavior can be discussed before substantial work is done.
 
-Digit is intended to remain focused on digit-aware numeric input and scrubbing.
+Digit focuses on digit-aware numeric input and scrubbing.
 
 ---
 
-# License
+## License
 
 Digit is distributed under the **MIT License**.
 
@@ -1405,7 +1277,7 @@ See [`LICENSE`](LICENSE) for details.
 
 ---
 
-# About
+## About
 
 Digit is an Unreal Engine editor utility created by **Mippi the Dork**.
 

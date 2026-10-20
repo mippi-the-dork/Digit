@@ -43,6 +43,7 @@ private:
         FGeometry TextGeometry;
         int32 CharacterIndex = INDEX_NONE;
         int32 DigitPlace = 0;
+        bool bRotatorComponent = false;
         FString DisplayString;
     };
 
@@ -89,6 +90,7 @@ private:
     float PhysicalDragDistance = 0.0f;
     bool bDigitDragStarted = false;
     bool bRestorePending = false;
+    int32 PendingRestorePostTicks = 0;
     bool bAwaitingNativeCapture = false;
     bool bActiveSpinBoxIsIntegral = false;
 

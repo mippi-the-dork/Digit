@@ -29,5 +29,8 @@ public:
     UPROPERTY(EditAnywhere, Config, Category = "Appearance|Digit Highlight", meta = (DisplayName = "Highlighted Text Color", ToolTip = "Text color drawn over the numeric digit currently targeted by Digit scrubbing."))
     FLinearColor HighlightedTextColor;
 
+    UPROPERTY(EditAnywhere, Config, Category = "Diagnostics", meta = (DisplayName = "Log Numeric Widget Diagnostics", ToolTip = "When enabled, unresolved clicks on numeric spin boxes write widget paths and locale settings to the Output Log under LogDigit. Intended for reporting unsupported fields; leave off during normal editing."))
+    bool bLogWidgetDiagnostics;
+
     static const UDigitSettings* Get();
 };

@@ -7,6 +7,11 @@
 #include "Framework/Application/SlateApplication.h"
 #include "Input/Events.h"
 #include "InputCoreTypes.h"
+#include "Layout/Children.h"
+#include "Widgets/SWidget.h"
+#include "Internationalization/Internationalization.h"
+#include "Internationalization/Culture.h"
+#include "Internationalization/FastDecimalFormat.h"
 #include "Rendering/SlateRenderer.h"
 #include "Styling/CoreStyle.h"
 #include "Widgets/Input/SSpinBox.h"
@@ -18,6 +23,7 @@
 #include "Widgets/Text/STextBlock.h"
 
 #include <limits>
+#include <cmath>
 
 DEFINE_LOG_CATEGORY_STATIC(LogDigit, Log, All);
 
@@ -28,18 +34,267 @@ namespace DigitPrivate
     static const FLinearColor IncreaseOutlineColor(0.0f, 0.162029f, 0.745404f, 0.700000f);
     static const FLinearColor DecreaseOutlineColor(0.745404f, 0.228181f, 0.0f, 0.700000f);
 
-    static bool IsDigitCharacter(TCHAR Character)
+    // Always read the number locale, not the editor language. Region & Language
+    // can configure those independently (for example English UI and German numbers).
+    static const FDecimalNumberFormattingRules& GetNumberRules()
     {
-        return Character >= TEXT('0') && Character <= TEXT('9');
+        return FInternationalization::Get().GetCurrentLocale()->GetDecimalNumberFormattingRules();
     }
 
-    static bool IsNumericTokenCharacter(TCHAR Character)
+    static bool IsDigitCharacter(TCHAR Character)
     {
-        return IsDigitCharacter(Character)
-            || Character == TEXT('.')
-            || Character == TEXT(',')
-            || Character == TEXT('+')
-            || Character == TEXT('-');
+        if (Character >= TEXT('0') && Character <= TEXT('9'))
+        {
+            return true;
+        }
+        const FDecimalNumberFormattingRules& Rules = GetNumberRules();
+        for (int32 Index = 0; Index < 10; ++Index)
+        {
+            if (Character == Rules.DigitCharacters[Index])
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static bool IsNumberPunctuation(TCHAR Character)
+    {
+        const FDecimalNumberFormattingRules& Rules = GetNumberRules();
+        return Character == TEXT('.') || Character == TEXT(',')
+            || Character == Rules.DecimalSeparatorCharacter
+            || Character == Rules.GroupingSeparatorCharacter
+            || Character == TEXT('+') || Character == TEXT('-')
+            || Character == static_cast<TCHAR>(0x2212); // U+2212 minus
+    }
+
+    static bool IsNumericTokenCharacter(const FString& Text, int32 Index)
+    {
+        if (!Text.IsValidIndex(Index))
+        {
+            return false;
+        }
+        const TCHAR C = Text[Index];
+        if (IsDigitCharacter(C) || IsNumberPunctuation(C))
+        {
+            return true;
+        }
+        // Some locales group with a regular, no-break or narrow no-break space.
+        // Admit whitespace ONLY between digits so unit labels do not become
+        // part of the numeric token ("1 234,50 cm").
+        const bool bGroupingSpace = C == TEXT(' ')
+            || C == static_cast<TCHAR>(0x00A0)
+            || C == static_cast<TCHAR>(0x202F);
+        return bGroupingSpace
+            && Text.IsValidIndex(Index - 1)
+            && Text.IsValidIndex(Index + 1)
+            && IsDigitCharacter(Text[Index - 1])
+            && IsDigitCharacter(Text[Index + 1]);
+    }
+
+    struct FNumericToken
+    {
+        int32 Start = INDEX_NONE;
+        int32 End = INDEX_NONE;
+        int32 Radix = INDEX_NONE;
+    };
+
+    static bool LocateNumericToken(const FString& Text, int32 DigitIndex, FNumericToken& OutToken)
+    {
+        if (!Text.IsValidIndex(DigitIndex) || !IsDigitCharacter(Text[DigitIndex]))
+        {
+            return false;
+        }
+
+        int32 Start = DigitIndex;
+        while (Start > 0 && IsNumericTokenCharacter(Text, Start - 1))
+        {
+            --Start;
+        }
+        int32 End = DigitIndex;
+        while (End + 1 < Text.Len() && IsNumericTokenCharacter(Text, End + 1))
+        {
+            ++End;
+        }
+
+        // Avoid assigning nonsensical place values to scientific notation.
+        // e.g. the 04 in "1.25e-04" is an exponent, not a hundredths field.
+        if ((Start >= 1 && (Text[Start - 1] == TEXT('e') || Text[Start - 1] == TEXT('E')))
+            || (End + 1 < Text.Len() && (Text[End + 1] == TEXT('e') || Text[End + 1] == TEXT('E'))))
+        {
+            return false;
+        }
+
+        const FDecimalNumberFormattingRules& Rules = GetNumberRules();
+        int32 LastDot = INDEX_NONE;
+        int32 LastComma = INDEX_NONE;
+        int32 LastLocaleRadix = INDEX_NONE;
+        int32 OccurrencesOfLocaleGrouping = 0;
+        for (int32 Index = Start; Index <= End; ++Index)
+        {
+            const TCHAR C = Text[Index];
+            if (C == TEXT('.')) { LastDot = Index; }
+            if (C == TEXT(',')) { LastComma = Index; }
+            if (C == Rules.DecimalSeparatorCharacter) { LastLocaleRadix = Index; }
+            if (C == Rules.GroupingSeparatorCharacter) { ++OccurrencesOfLocaleGrouping; }
+        }
+
+        int32 Radix = INDEX_NONE;
+        if (LastDot != INDEX_NONE && LastComma != INDEX_NONE)
+        {
+            // Both styles appear: the final punctuation is conventionally the
+            // decimal separator, independent of the editor's active locale.
+            Radix = FMath::Max(LastDot, LastComma);
+        }
+        else if (LastLocaleRadix != INDEX_NONE)
+        {
+            Radix = LastLocaleRadix;
+        }
+        else
+        {
+            const int32 Candidate = FMath::Max(LastDot, LastComma);
+            if (Candidate != INDEX_NONE)
+            {
+                const TCHAR Separator = Text[Candidate];
+                if (Separator != Rules.GroupingSeparatorCharacter)
+                {
+                    // A custom numeric type interface may format with an
+                    // invariant decimal point even in a comma-decimal locale.
+                    Radix = Candidate;
+                }
+                else if (OccurrencesOfLocaleGrouping == 1)
+                {
+                    int32 FractionCount = 0;
+                    for (int32 Index = Candidate + 1; Index <= End; ++Index)
+                    {
+                        if (IsDigitCharacter(Text[Index])) { ++FractionCount; }
+                    }
+                    // Ambiguous "1.234" follows the locale's grouping convention.
+                    // "1.5" does not and is most likely a custom decimal value.
+                    if (FractionCount != 3 && FractionCount > 0)
+                    {
+                        Radix = Candidate;
+                    }
+                }
+            }
+        }
+
+        OutToken.Start = Start;
+        OutToken.End = End;
+        OutToken.Radix = Radix;
+        return true;
+    }
+
+    // SSpinBox may display a unit-converted number, e.g. 1.25 m for an
+    // underlying 125 cm. The selected place is in DISPLAY units, not in the
+    // widget's underlying NumericType. Only read the first numeric token.
+    static bool ParseDisplayedNumber(const FString& Text, double& OutValue)
+    {
+        int32 FirstDigit = INDEX_NONE;
+        for (int32 Index = 0; Index < Text.Len(); ++Index)
+        {
+            if (IsDigitCharacter(Text[Index]))
+            {
+                FirstDigit = Index;
+                break;
+            }
+        }
+        FNumericToken Token;
+        if (FirstDigit == INDEX_NONE || !LocateNumericToken(Text, FirstDigit, Token))
+        {
+            return false;
+        }
+        const FDecimalNumberFormattingRules& Rules = GetNumberRules();
+        FString Normalized;
+        bool bHasDigit = false;
+        for (int32 Index = Token.Start; Index <= Token.End; ++Index)
+        {
+            const TCHAR C = Text[Index];
+            if (C >= TEXT('0') && C <= TEXT('9'))
+            {
+                Normalized.AppendChar(C);
+                bHasDigit = true;
+                continue;
+            }
+            bool bConverted = false;
+            for (int32 Digit = 0; Digit < 10; ++Digit)
+            {
+                if (C == Rules.DigitCharacters[Digit])
+                {
+                    Normalized.AppendChar(static_cast<TCHAR>(TEXT('0') + Digit));
+                    bHasDigit = true;
+                    bConverted = true;
+                    break;
+                }
+            }
+            if (bConverted)
+            {
+                continue;
+            }
+            if (Index == Token.Radix)
+            {
+                Normalized.AppendChar(TEXT('.'));
+            }
+            else if (C == TEXT('-') || C == static_cast<TCHAR>(0x2212))
+            {
+                if (Normalized.IsEmpty()) { Normalized.AppendChar(TEXT('-')); }
+            }
+            else if (C == TEXT('+'))
+            {
+                if (Normalized.IsEmpty()) { Normalized.AppendChar(TEXT('+')); }
+            }
+            // All remaining separators are grouping, including Unicode spaces.
+        }
+        if (!bHasDigit)
+        {
+            return false;
+        }
+        OutValue = FCString::Atod(*Normalized);
+        return FMath::IsFinite(OutValue);
+    }
+
+    static double ResolveDisplayToNativeScale(double NativeValue, const FString& Text)
+    {
+        double DisplayValue = 0.0;
+        if (!ParseDisplayedNumber(Text, DisplayValue)
+            || FMath::Abs(DisplayValue) < 1.e-8 || !FMath::IsFinite(NativeValue))
+        {
+            return 1.0;
+        }
+        const double Scale = NativeValue / DisplayValue;
+        if (!FMath::IsFinite(Scale) || Scale <= 0.0)
+        {
+            return 1.0;
+        }
+        // Display roundoff should not masquerade as an exotic unit conversion.
+        if (Scale > 0.9 && Scale < 1.1)
+        {
+            return 1.0;
+        }
+        // Avoid huge conversions derived from near-zero rounded displays.
+        if (Scale < 1.e-9 || Scale > 1.e9)
+        {
+            return 1.0;
+        }
+        return Scale;
+    }
+
+    static FString LocalizeStepText(FString Text)
+    {
+        const FDecimalNumberFormattingRules& Rules = GetNumberRules();
+        for (int32 Index = 0; Index < Text.Len(); ++Index)
+        {
+            const TCHAR C = Text[Index];
+            if (C == TEXT('.'))
+            {
+                Text[Index] = Rules.DecimalSeparatorCharacter;
+            }
+            else if (C >= TEXT('0') && C <= TEXT('9'))
+            {
+                Text[Index] = Rules.DigitCharacters[C - TEXT('0')];
+            }
+        }
+        return Text;
     }
 
     static double GetDefaultInputEventMultiplier(const FInputEvent& InputEvent)
@@ -161,9 +416,9 @@ namespace DigitPrivate
 
     static FText MakeDigitToolTip(const FString& CurrentValue, int32 DigitPlace)
     {
-        const FString BaseIncrement = FormatIncrementForTooltip(DigitPlace);
-        const FString ShiftIncrement = FormatIncrementForTooltip(DigitPlace + 1);
-        const FString CtrlIncrement = FormatIncrementForTooltip(DigitPlace - 1);
+        const FString BaseIncrement = LocalizeStepText(FormatIncrementForTooltip(DigitPlace));
+        const FString ShiftIncrement = LocalizeStepText(FormatIncrementForTooltip(DigitPlace + 1));
+        const FString CtrlIncrement = LocalizeStepText(FormatIncrementForTooltip(DigitPlace - 1));
 
         return FText::FromString(FString::Printf(
             TEXT("%s\nIncrement by %s\nShift: %s    Ctrl: %s\nAlt: Value Ladder"),
@@ -178,7 +433,7 @@ namespace DigitPrivate
     {
         if (DigitPlace > 6 || DigitPlace < -6)
         {
-            return FString::Printf(TEXT("1e%+d"), DigitPlace);
+            return LocalizeStepText(FString::Printf(TEXT("1e%+d"), DigitPlace));
         }
 
         if (DigitPlace >= 0)
@@ -188,7 +443,7 @@ namespace DigitPrivate
             {
                 Result += TEXT("0");
             }
-            return Result;
+            return LocalizeStepText(Result);
         }
 
         FString Result(TEXT("0."));
@@ -197,7 +452,7 @@ namespace DigitPrivate
             Result += TEXT("0");
         }
         Result += TEXT("1");
-        return Result;
+        return LocalizeStepText(Result);
     }
 
     template<typename NumericType>
@@ -244,6 +499,59 @@ namespace DigitPrivate
     bool IsWidgetClass(const TSharedRef<SWidget>& Widget)
     {
         return &Widget->GetWidgetClass() == &GetRuntimeSpinBoxClass<NumericType>();
+    }
+
+    static TSharedPtr<STextBlock> FindTextUnderSpinBox(
+        const TSharedRef<SWidget>& Widget,
+        const FVector2D& ScreenPosition,
+        int32 RemainingDepth = 20)
+    {
+        if (RemainingDepth <= 0)
+        {
+            return nullptr;
+        }
+        if (Widget->GetType() == FName(TEXT("STextBlock")))
+        {
+            const TSharedRef<STextBlock> TextWidget = StaticCastSharedRef<STextBlock>(Widget);
+            const FString Text = TextWidget->GetText().ToString();
+            bool bHasDigit = false;
+            for (TCHAR Character : Text)
+            {
+                if (IsDigitCharacter(Character))
+                {
+                    bHasDigit = true;
+                    break;
+                }
+            }
+            if (bHasDigit)
+            {
+                const FGeometry& Geometry = TextWidget->GetTickSpaceGeometry();
+                const FVector2D LocalPosition = Geometry.AbsoluteToLocal(ScreenPosition);
+                const FVector2D Size = Geometry.GetLocalSize();
+                if (LocalPosition.X >= 0.0 && LocalPosition.Y >= 0.0
+                    && LocalPosition.X <= Size.X && LocalPosition.Y <= Size.Y)
+                {
+                    return TextWidget;
+                }
+            }
+        }
+        // Some SSpinBox skins use an overlay over their text or place the text
+        // in a hit-test-invisible subtree. Such text isn't on the pointer's
+        // FWidgetPath, but still has a valid layout geometry.
+        FChildren* Children = Widget->GetChildren();
+        if (!Children)
+        {
+            return nullptr;
+        }
+        for (int32 Index = 0; Index < Children->Num(); ++Index)
+        {
+            if (TSharedPtr<STextBlock> Candidate = FindTextUnderSpinBox(
+                Children->GetChildAt(Index), ScreenPosition, RemainingDepth - 1))
+            {
+                return Candidate;
+            }
+        }
+        return nullptr;
     }
 }
 
@@ -456,31 +764,40 @@ bool FDigitInputProcessor::HandleMouseButtonDownEvent(FSlateApplication& SlateAp
     FNumericHit Hit;
     if (!FindNumericHit(SlateApp, MouseEvent, Hit))
     {
-        // Only emit diagnostics when the failed path actually contains a spin box. This keeps
-        // ordinary editor clicks from flooding the Output Log while retaining useful failure data.
-        FWidgetPath DebugPath = SlateApp.LocateWindowUnderMouse(
-            MouseEvent.GetScreenSpacePosition(),
-            SlateApp.GetInteractiveTopLevelWindows(),
-            false,
-            MouseEvent.GetUserIndex());
-
-        FString PathTypes;
-        bool bContainsSpinBox = false;
-        for (int32 WidgetIndex = 0; WidgetIndex < DebugPath.Widgets.Num(); ++WidgetIndex)
+        // Numeric failures are common for intentional non-digit clicks. Keep
+        // diagnostics completely off the input hot path unless explicitly enabled.
+        const UDigitSettings* Settings = UDigitSettings::Get();
+        if (Settings && Settings->bLogWidgetDiagnostics)
         {
-            const FArrangedWidget& ArrangedWidget = DebugPath.Widgets[WidgetIndex];
-            const FString TypeString = ArrangedWidget.Widget->GetTypeAsString();
-            if (!PathTypes.IsEmpty())
+            FWidgetPath DebugPath = SlateApp.LocateWindowUnderMouse(
+                MouseEvent.GetScreenSpacePosition(),
+                SlateApp.GetInteractiveTopLevelWindows(),
+                false,
+                MouseEvent.GetUserIndex());
+
+            FString PathTypes;
+            bool bContainsSpinBox = false;
+            for (int32 WidgetIndex = 0; WidgetIndex < DebugPath.Widgets.Num(); ++WidgetIndex)
             {
-                PathTypes += TEXT(" > ");
+                const FArrangedWidget& ArrangedWidget = DebugPath.Widgets[WidgetIndex];
+                const FString TypeString = ArrangedWidget.Widget->GetTypeAsString();
+                if (!PathTypes.IsEmpty())
+                {
+                    PathTypes += TEXT(" > ");
+                }
+                PathTypes += TypeString;
+                bContainsSpinBox |= TypeString.StartsWith(TEXT("SSpinBox"));
             }
-            PathTypes += TypeString;
-            bContainsSpinBox |= TypeString.StartsWith(TEXT("SSpinBox"));
-        }
-
-        if (bContainsSpinBox)
-        {
-            UE_LOG(LogDigit, Warning, TEXT("Mouse-down did not resolve a numeric digit. Widget path: %s"), *PathTypes);
+            if (bContainsSpinBox)
+            {
+                const FDecimalNumberFormattingRules& Rules = DigitPrivate::GetNumberRules();
+                UE_LOG(LogDigit, Warning,
+                    TEXT("Unresolved numeric click (locale=%s, decimal U+%04X, group U+%04X). Widget path: %s"),
+                    *FInternationalization::Get().GetCurrentLocale()->GetName(),
+                    static_cast<uint32>(Rules.DecimalSeparatorCharacter),
+                    static_cast<uint32>(Rules.GroupingSeparatorCharacter),
+                    *PathTypes);
+            }
         }
 
         ClearHighlight();
@@ -521,8 +838,8 @@ bool FDigitInputProcessor::HandleMouseButtonUpEvent(FSlateApplication& SlateApp,
         && ActiveSpinBox.IsValid()
         && MouseEvent.GetPointerIndex() == ActivePointerIndex)
     {
-        // Keep the small working Delta in place for the native final commit. It preserves
-        // lower-order digits instead of snapping the whole value to the selected digit step.
+        // Preserve Delta=0 during the native final commit and deferred Tick.
+        // Restoring the original Delta early would re-snap material values.
         if (ApplySelectedDeltaFunction)
         {
             ApplySelectedDeltaFunction();
@@ -537,11 +854,15 @@ void FDigitInputProcessor::HandlePostSlateTick()
 {
     if (bRestorePending)
     {
-        // Clear the visual/tooltip while the active widget is still known so the cursor
-        // override can remain Default until the next pointer move. That avoids briefly
-        // exposing SSpinBox's native idle resize cursor immediately after mouse-up.
+        // SSpinBox 5.8 defers mouse-move commits to its own Tick. Keep Delta=0
+        // through one subsequent widget tick so a pending value is not snapped
+        // to the field's original Delta after mouse-up. This also preserves
+        // native OnEndSliderMovement and undo transaction ownership.
         ClearHighlight();
-        RestoreActiveDelta();
+        if (++PendingRestorePostTicks >= 2)
+        {
+            RestoreActiveDelta();
+        }
         return;
     }
 
@@ -592,20 +913,32 @@ bool FDigitInputProcessor::FindNumericHit(FSlateApplication& SlateApp, const FPo
         }
     }
 
-    if (SpinBoxPathIndex == INDEX_NONE || TextPathIndex == INDEX_NONE)
-    {
-        return false;
-    }
-
-    if (TextPathIndex <= SpinBoxPathIndex)
+    if (SpinBoxPathIndex == INDEX_NONE)
     {
         return false;
     }
 
     const TSharedRef<SWidget>& SpinWidget = Path.Widgets[SpinBoxPathIndex].Widget;
-    const TSharedRef<SWidget>& TextWidgetBase = Path.Widgets[TextPathIndex].Widget;
-    const TSharedRef<STextBlock> TextWidget = StaticCastSharedRef<STextBlock>(TextWidgetBase);
-    const FGeometry& TextGeometry = Path.Widgets[TextPathIndex].Geometry;
+    TSharedPtr<STextBlock> TextWidget;
+    FGeometry TextGeometry;
+    if (TextPathIndex > SpinBoxPathIndex)
+    {
+        TextWidget = StaticCastSharedRef<STextBlock>(Path.Widgets[TextPathIndex].Widget);
+        TextGeometry = Path.Widgets[TextPathIndex].Geometry;
+    }
+    else
+    {
+        TextWidget = DigitPrivate::FindTextUnderSpinBox(
+            SpinWidget, MouseEvent.GetScreenSpacePosition());
+        if (TextWidget.IsValid())
+        {
+            TextGeometry = TextWidget->GetTickSpaceGeometry();
+        }
+    }
+    if (!TextWidget.IsValid())
+    {
+        return false;
+    }
 
     const FText DisplayText = TextWidget->GetText();
     const FString DisplayString = DisplayText.ToString();
@@ -655,7 +988,21 @@ bool FDigitInputProcessor::FindNumericHit(FSlateApplication& SlateApp, const FPo
         return false;
     }
 
+    // Identify actual rotator component widgets from the Slate ancestry.
+    // A degree suffix alone is not sufficient: light cone angles and other
+    // scalar angle properties can have real hard limits and must not wrap.
+    bool bIsRotatorComponent = false;
+    for (int32 Index = 0; Index < SpinBoxPathIndex; ++Index)
+    {
+        if (Path.Widgets[Index].Widget->GetTypeAsString().Contains(TEXT("RotatorInputBox")))
+        {
+            bIsRotatorComponent = true;
+            break;
+        }
+    }
+
     OutHit.SpinBoxWidget = SpinWidget;
+    OutHit.bRotatorComponent = bIsRotatorComponent;
     OutHit.TextWidget = TextWidget;
     OutHit.TextGeometry = TextGeometry;
     OutHit.CharacterIndex = CharacterIndex;
@@ -666,37 +1013,15 @@ bool FDigitInputProcessor::FindNumericHit(FSlateApplication& SlateApp, const FPo
 
 bool FDigitInputProcessor::ResolveDigitPlace(const FString& DisplayString, int32 CharacterIndex, int32& OutDigitPlace) const
 {
-    if (!DisplayString.IsValidIndex(CharacterIndex)
-        || !DigitPrivate::IsDigitCharacter(DisplayString[CharacterIndex]))
+    DigitPrivate::FNumericToken Token;
+    if (!DigitPrivate::LocateNumericToken(DisplayString, CharacterIndex, Token))
     {
         return false;
     }
 
-    int32 TokenStart = CharacterIndex;
-    while (TokenStart > 0 && DigitPrivate::IsNumericTokenCharacter(DisplayString[TokenStart - 1]))
+    if (Token.Radix == INDEX_NONE || CharacterIndex < Token.Radix)
     {
-        --TokenStart;
-    }
-
-    int32 TokenEnd = CharacterIndex;
-    while (TokenEnd + 1 < DisplayString.Len() && DigitPrivate::IsNumericTokenCharacter(DisplayString[TokenEnd + 1]))
-    {
-        ++TokenEnd;
-    }
-
-    int32 DecimalIndex = INDEX_NONE;
-    for (int32 Index = TokenStart; Index <= TokenEnd; ++Index)
-    {
-        if (DisplayString[Index] == TEXT('.'))
-        {
-            DecimalIndex = Index;
-            break;
-        }
-    }
-
-    if (DecimalIndex == INDEX_NONE || CharacterIndex < DecimalIndex)
-    {
-        const int32 RightBoundary = (DecimalIndex == INDEX_NONE) ? TokenEnd : DecimalIndex - 1;
+        const int32 RightBoundary = Token.Radix == INDEX_NONE ? Token.End : Token.Radix - 1;
         int32 DigitsToRight = 0;
         for (int32 Index = CharacterIndex + 1; Index <= RightBoundary; ++Index)
         {
@@ -705,141 +1030,99 @@ bool FDigitInputProcessor::ResolveDigitPlace(const FString& DisplayString, int32
                 ++DigitsToRight;
             }
         }
-
         OutDigitPlace = DigitsToRight;
         return true;
     }
 
-    if (CharacterIndex > DecimalIndex)
+    int32 FractionalOrdinal = 0;
+    for (int32 Index = Token.Radix + 1; Index <= CharacterIndex; ++Index)
     {
-        int32 FractionalDigitOrdinal = 0;
-        for (int32 Index = DecimalIndex + 1; Index <= CharacterIndex; ++Index)
+        if (DigitPrivate::IsDigitCharacter(DisplayString[Index]))
         {
-            if (DigitPrivate::IsDigitCharacter(DisplayString[Index]))
-            {
-                ++FractionalDigitOrdinal;
-            }
+            ++FractionalOrdinal;
         }
-
-        if (FractionalDigitOrdinal <= 0)
-        {
-            return false;
-        }
-
-        OutDigitPlace = -FractionalDigitOrdinal;
-        return true;
     }
-
-    return false;
+    if (FractionalOrdinal == 0)
+    {
+        return false;
+    }
+    OutDigitPlace = -FractionalOrdinal;
+    return true;
 }
 
 bool FDigitInputProcessor::FindCharacterIndexForDigitPlace(const FString& DisplayString, int32 DigitPlace, int32& OutCharacterIndex) const
 {
     OutCharacterIndex = INDEX_NONE;
-
-    int32 DecimalIndex = INDEX_NONE;
+    DigitPrivate::FNumericToken Token;
+    bool bFoundToken = false;
+    // The editable numeric value is the first number in SSpinBox's display.
+    // Ignoring trailing unit labels matters for e.g. "125.00 cm2".
     for (int32 Index = 0; Index < DisplayString.Len(); ++Index)
     {
-        if (DisplayString[Index] == TEXT('.'))
+        if (DigitPrivate::IsDigitCharacter(DisplayString[Index]))
         {
-            DecimalIndex = Index;
+            bFoundToken = DigitPrivate::LocateNumericToken(DisplayString, Index, Token);
             break;
         }
+    }
+    if (!bFoundToken)
+    {
+        return false;
     }
 
     if (DigitPlace >= 0)
     {
-        const int32 RightBoundary = (DecimalIndex == INDEX_NONE) ? DisplayString.Len() - 1 : DecimalIndex - 1;
+        const int32 RightBoundary = Token.Radix == INDEX_NONE ? Token.End : Token.Radix - 1;
         int32 Place = 0;
-        for (int32 Index = RightBoundary; Index >= 0; --Index)
+        for (int32 Index = RightBoundary; Index >= Token.Start; --Index)
         {
             if (!DigitPrivate::IsDigitCharacter(DisplayString[Index]))
             {
                 continue;
             }
-
-            if (Place == DigitPlace)
+            if (Place++ == DigitPlace)
             {
                 OutCharacterIndex = Index;
                 return true;
             }
-
-            ++Place;
         }
-
         return false;
     }
 
-    if (DecimalIndex == INDEX_NONE)
+    if (Token.Radix == INDEX_NONE)
     {
         return false;
     }
-
-    const int32 TargetOrdinal = -DigitPlace;
-    int32 FractionalOrdinal = 0;
-    for (int32 Index = DecimalIndex + 1; Index < DisplayString.Len(); ++Index)
+    int32 Ordinal = 0;
+    for (int32 Index = Token.Radix + 1; Index <= Token.End; ++Index)
     {
-        if (!DigitPrivate::IsDigitCharacter(DisplayString[Index]))
-        {
-            // Stop once the numeric token ends. Grouping is not valid after the radix point.
-            break;
-        }
-
-        ++FractionalOrdinal;
-        if (FractionalOrdinal == TargetOrdinal)
+        if (DigitPrivate::IsDigitCharacter(DisplayString[Index]) && ++Ordinal == -DigitPlace)
         {
             OutCharacterIndex = Index;
             return true;
         }
     }
-
     return false;
 }
 
 int32 FDigitInputProcessor::CountFractionalDigits(const FString& DisplayString, int32 CharacterIndex) const
 {
-    if (!DisplayString.IsValidIndex(CharacterIndex))
+    DigitPrivate::FNumericToken Token;
+    if (!DigitPrivate::LocateNumericToken(DisplayString, CharacterIndex, Token)
+        || Token.Radix == INDEX_NONE)
     {
         return 0;
     }
 
-    int32 TokenStart = CharacterIndex;
-    while (TokenStart > 0 && DigitPrivate::IsNumericTokenCharacter(DisplayString[TokenStart - 1]))
-    {
-        --TokenStart;
-    }
-
-    int32 TokenEnd = CharacterIndex;
-    while (TokenEnd + 1 < DisplayString.Len() && DigitPrivate::IsNumericTokenCharacter(DisplayString[TokenEnd + 1]))
-    {
-        ++TokenEnd;
-    }
-
-    int32 DecimalIndex = INDEX_NONE;
-    for (int32 Index = TokenStart; Index <= TokenEnd; ++Index)
-    {
-        if (DisplayString[Index] == TEXT('.'))
-        {
-            DecimalIndex = Index;
-            break;
-        }
-    }
-
-    if (DecimalIndex == INDEX_NONE)
-    {
-        return 0;
-    }
-
-    int32 FractionalDigits = 0;
-    for (int32 Index = DecimalIndex + 1; Index <= TokenEnd; ++Index)
+    int32 Count = 0;
+    for (int32 Index = Token.Radix + 1; Index <= Token.End; ++Index)
     {
         if (DigitPrivate::IsDigitCharacter(DisplayString[Index]))
         {
-            ++FractionalDigits;
+            ++Count;
         }
     }
-
-    return FractionalDigits;
+    return Count;
 }
 
 bool FDigitInputProcessor::ArmSpinBox(const FNumericHit& Hit, int32 PointerIndex, bool bUseLadder)
@@ -870,6 +1153,7 @@ bool FDigitInputProcessor::ArmSpinBox(const FNumericHit& Hit, int32 PointerIndex
         PhysicalDragDistance = 0.0f;
         bDigitDragStarted = false;
         bRestorePending = false;
+        PendingRestorePostTicks = 0;
         bAwaitingNativeCapture = true;
         bLadderModeActive = bUseLadder;
         LadderOriginDigitPlace = Hit.DigitPlace;
@@ -888,6 +1172,17 @@ bool FDigitInputProcessor::ArmSpinBox(const FNumericHit& Hit, int32 PointerIndex
         ActiveLadderMagnitudeSensitivity = ConfiguredLadderSensitivity * 0.5f;
     }
 
+    if (!bArmed)
+    {
+        const UDigitSettings* Settings = UDigitSettings::Get();
+        if (Settings && Settings->bLogWidgetDiagnostics)
+        {
+            UE_LOG(LogDigit, Warning,
+                TEXT("Could not arm numeric widget: type=%s, value='%s', place=%d (possible unsupported template, native slider disabled, or unrepresentable step)"),
+                *Hit.SpinBoxWidget->GetTypeAsString(),
+                *Hit.DisplayString, Hit.DigitPlace);
+        }
+    }
     return bArmed;
 }
 
@@ -922,33 +1217,13 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
 
     const NumericType OriginalDelta = SpinBox->GetDelta();
 
-    // Delta controls both scrub magnitude and grid snapping in SSpinBox. Digit needs those
-    // responsibilities separated: selected digit place controls magnitude, while the working
-    // Delta is only a fine quantization grid that preserves lower-order digits.
-    //
-    // Ladder mode can move four places below the digit that opened it. Give floating-point
-    // fields enough working precision for that lower rung even when those decimals were not
-    // originally visible in the formatted value.
-    NumericType WorkingDelta = NumericType(1);
-    if constexpr (!TIsIntegral<NumericType>::Value)
-    {
-        const int32 DisplayFractionalDigits = CountFractionalDigits(Hit.DisplayString, Hit.CharacterIndex);
-        const int32 LowestLadderPlace = bUseLadder ? Hit.DigitPlace - 4 : Hit.DigitPlace;
-        const int32 LadderFractionalDigits = FMath::Max(0, -LowestLadderPlace);
-        const int32 RequiredFractionalDigits = FMath::Max(DisplayFractionalDigits, LadderFractionalDigits);
-
-        const double WorkingDeltaAsDouble = FMath::Pow(10.0, -static_cast<double>(RequiredFractionalDigits));
-        if (!FMath::IsFinite(WorkingDeltaAsDouble) || WorkingDeltaAsDouble <= 0.0)
-        {
-            return false;
-        }
-
-        WorkingDelta = static_cast<NumericType>(WorkingDeltaAsDouble);
-        if (WorkingDelta <= NumericType(0))
-        {
-            return false;
-        }
-    }
+    // UE 5.8 uses Delta for *two different purposes*: unbounded motion with
+    // private LinearDeltaSensitivity and final value grid snapping. Keep Delta
+    // zero strictly while OnMouseMove calculates movement, then restore a
+    // decimal-grid Delta BEFORE the deferred native Tick commits the result.
+    // This prevents a layout-dependent sensitivity path from engaging in e.g.
+    // Transform rows while still avoiding small floating-point display noise.
+    // Preserve the original field's Delta after the interaction.
 
     const UDigitSettings* DigitSettings = UDigitSettings::Get();
     const double ScrubSensitivity = DigitSettings && FMath::IsFinite(DigitSettings->ScrubSensitivity)
@@ -956,8 +1231,7 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         : 1.0;
 
     const double SliderExponent = static_cast<double>(SpinBox->GetSliderExponent());
-    const double WorkingInfluence = FMath::Pow(static_cast<double>(WorkingDelta), SliderExponent);
-    if (!FMath::IsFinite(WorkingInfluence) || WorkingInfluence <= 0.0)
+    if (!FMath::IsFinite(SliderExponent) || SliderExponent <= 0.0)
     {
         return false;
     }
@@ -976,55 +1250,118 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         && MaxSliderValue != NumericMax
         && MaxSliderValue > MinSliderValue;
 
+    const double MinSliderAsDouble = static_cast<double>(MinSliderValue);
+    const double MaxSliderAsDouble = static_cast<double>(MaxSliderValue);
+    const double MinValueAsDouble = static_cast<double>(SpinBox->GetMinValue());
+    const double MaxValueAsDouble = static_cast<double>(SpinBox->GetMaxValue());
     const double SliderRange = bBoundedSliderRange
-        ? static_cast<double>(MaxSliderValue) - static_cast<double>(MinSliderValue)
+        ? MaxSliderAsDouble - MinSliderAsDouble
         : 0.0;
-    const double NativeBaseStep = bBoundedSliderRange && SliderRange <= 10.0 ? 0.1 : 1.0;
 
     if (bBoundedSliderRange && (!FMath::IsFinite(SliderRange) || SliderRange <= 0.0))
     {
         return false;
     }
 
-    const TWeakPtr<SSpinBox<NumericType>> WeakSpinBox = SpinBox;
+    // SSpinBox::GetDefaultStepSize in UE 5.8.3 uses this exact test,
+    // including for integer spin boxes. The routed event carries no modifiers:
+    // Digit itself applies its advertised Shift/Ctrl/Alt magnitude, avoiding
+    // hidden host-specific multiplier settings and Alt dynamic-bound changes.
+    const double NativeBaseStep = bBoundedSliderRange && SliderRange <= 10.0 ? 0.1 : 1.0;
+    // A nonlinear bounded slider can have far less precision than its numeric
+    // property. Ground Radius is float, slider 1..7000 and exponent 5: near
+    // 6360, one representable float fill fraction is roughly 1.2 km. Passing
+    // tiny virtual mouse deltas through that curve makes the value jump even
+    // though the float property can represent hundredths and thousandths.
+    // Bypass ONLY that lossy movement conversion, while keeping SSpinBox's
+    // native drag begin/end, capture, callbacks, and property transaction.
+    const bool bRouteNonlinearValuesDirectly = bBoundedSliderRange
+        && !TIsIntegral<NumericType>::Value
+        && !FMath::IsNearlyEqual(SliderExponent, 1.0);
 
-    SpinBox->SetDelta(WorkingDelta);
+    // Integer SSpinBoxes lose large selected-place increments when their
+    // fractional slider position is converted back to an integer. A rotator
+    // is also not a bounded scalar: it should retain an unwrapped accumulator
+    // while the displayed property cycles through +/-180 degrees.
+    // Constrain rotator detection to the actual rotator widget hierarchy.
+    const bool bRouteIntegersDirectly = TIsIntegral<NumericType>::Value;
+    const bool bRouteRotatorsDirectly = Hit.bRotatorComponent && !TIsIntegral<NumericType>::Value;
+    const bool bRouteValueDirectly = bRouteNonlinearValuesDirectly
+        || bRouteIntegersDirectly || bRouteRotatorsDirectly;
+
+    // Integer precision beyond 2^53 cannot be safely represented in the
+    // double accumulator. Let Unreal's native input take over rather than
+    // corrupt an int64/uint64 field through a lossy conversion.
+    if constexpr (TIsIntegral<NumericType>::Value)
+    {
+        const double SafeIntegerLimit = 9007199254740991.0;
+        if (FMath::Abs(static_cast<double>(SpinBox->GetValue())) > SafeIntegerLimit
+            || static_cast<double>(InitialDesiredStep) > SafeIntegerLimit)
+        {
+            return false;
+        }
+    }
+    const TAttribute<NumericType> OriginalValueAttribute = SpinBox->GetValueAttribute();
+    const TSharedRef<bool> bDirectValueAssigned = MakeShared<bool>(false);
+    const TWeakPtr<SSpinBox<NumericType>> WeakSpinBox = SpinBox;
+    const TSharedRef<NumericType> WorkingDelta = MakeShared<NumericType>(NumericType(0));
+    SpinBox->SetDelta(NumericType(0));
 
     ApplySelectedDeltaFunction = [WeakSpinBox, WorkingDelta]()
     {
         if (const TSharedPtr<SSpinBox<NumericType>> PinnedSpinBox = WeakSpinBox.Pin())
         {
-            PinnedSpinBox->SetDelta(WorkingDelta);
+            PinnedSpinBox->SetDelta(*WorkingDelta);
         }
     };
 
-    RestoreDeltaFunction = [WeakSpinBox, OriginalDelta]()
+    RestoreDeltaFunction = [WeakSpinBox, OriginalDelta, OriginalValueAttribute, bDirectValueAssigned]()
     {
         if (const TSharedPtr<SSpinBox<NumericType>> PinnedSpinBox = WeakSpinBox.Pin())
         {
             PinnedSpinBox->SetDelta(OriginalDelta);
+            // SetValue with a literal temporarily replaces the widget's bound
+            // value attribute. Restore the original binding after the mouse-up
+            // and deferred native ticks have completed. Never restore an
+            // unbound initial constant: that would discard the edited value.
+            if (*bDirectValueAssigned && OriginalValueAttribute.IsBound())
+            {
+                PinnedSpinBox->SetValue(OriginalValueAttribute);
+            }
         }
     };
 
     const double InitialDigitValue = static_cast<double>(SpinBox->GetValue());
-    const double MinSliderAsDouble = static_cast<double>(MinSliderValue);
-    const double MaxSliderAsDouble = static_cast<double>(MaxSliderValue);
-    const double MinValueAsDouble = static_cast<double>(SpinBox->GetMinValue());
-    const double MaxValueAsDouble = static_cast<double>(SpinBox->GetMaxValue());
+    const double DisplayScale = DigitPrivate::ResolveDisplayToNativeScale(
+        InitialDigitValue, Hit.DisplayString);
+    const int32 DisplayFractionDigits = CountFractionalDigits(Hit.DisplayString, Hit.CharacterIndex);
+    // Native Delta snapping can keep numeric fields on their visible decimal grid.
+    // Only do so when the current numeric value is already aligned to the grid;
+    // otherwise do not discard lower digits the user had before dragging.
 
     RouteActiveMoveFunction = [
         WeakSpinBox,
+        WorkingDelta,
+        bRouteIntegersDirectly,
+        bRouteRotatorsDirectly,
+        bRouteValueDirectly,
+        bDirectValueAssigned,
+        DisplayScale,
+        DisplayFractionDigits,
         bBoundedSliderRange,
         SliderRange,
         NativeBaseStep,
         SliderExponent,
-        WorkingInfluence,
         ScrubSensitivity,
         MinSliderAsDouble,
         MaxSliderAsDouble,
         MinValueAsDouble,
         MaxValueAsDouble,
-        DigitValue = InitialDigitValue](
+        DigitValue = InitialDigitValue,
+        LastObservedValue = InitialDigitValue,
+        LastWrittenNative = SpinBox->GetValue(),
+        InitialDigitValue,
+        bLoggedPrecisionLimit = false](
             const FPointerEvent& MouseEvent,
             bool bScaleMovement,
             int32 DigitPlace,
@@ -1042,60 +1379,239 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
             return false;
         }
 
-        const double DesiredStepAsDouble = static_cast<double>(DesiredStep);
         FVector2D RoutedDelta = MouseEvent.GetCursorDelta();
-
         if (bSuppressHorizontalMovement)
         {
             RoutedDelta.X = 0.0f;
         }
         else if (bScaleMovement)
         {
-            if (bBoundedSliderRange)
+            const double PhysicalDeltaX = static_cast<double>(MouseEvent.GetCursorDelta().X);
+            const double InputMultiplier = DigitPrivate::GetDefaultInputEventMultiplier(MouseEvent);
+            const double NativeStep = static_cast<double>(DesiredStep) * DisplayScale;
+            const double RequestedChange = PhysicalDeltaX
+                * NativeStep * InputMultiplier * ScrubSensitivity;
+
+            // UE 5.8 may defer a mouse move's native commit to a widget Tick.
+            // When the committed value becomes observable, rebase on it instead
+            // of carrying forward a mathematically idealized target indefinitely.
+            const double ObservedValue = static_cast<double>(PinnedSpinBox->GetValue());
+            if (ObservedValue != LastObservedValue)
             {
-                const double PhysicalDeltaX = static_cast<double>(MouseEvent.GetCursorDelta().X);
-                const double InputMultiplier = DigitPrivate::GetDefaultInputEventMultiplier(MouseEvent);
-                const double NativeStep = NativeBaseStep * InputMultiplier;
-                const double SliderWidth = FMath::Max(static_cast<double>(PinnedSpinBox->GetTickSpaceGeometry().GetDrawSize().X), 100.0);
-
-                if (FMath::IsFinite(PhysicalDeltaX)
-                    && FMath::IsFinite(NativeStep)
-                    && !FMath::IsNearlyZero(NativeStep)
-                    && FMath::IsFinite(SliderWidth)
-                    && SliderWidth > 0.0)
+                // An angle may normalize from +180 to -180 many times in a
+                // single drag. Never rebase its continuous accumulator on the
+                // normalized display value; this is what makes reversal and
+                // multiple turns possible. Likewise, retain sub-integer
+                // movement remainder rather than truncating it each tick.
+                if (!bRouteValueDirectly && FMath::IsFinite(ObservedValue))
                 {
-                    double TargetValue = DigitValue + (PhysicalDeltaX * DesiredStepAsDouble * InputMultiplier * ScrubSensitivity);
-                    TargetValue = FMath::Clamp(TargetValue, MinSliderAsDouble, MaxSliderAsDouble);
-                    TargetValue = FMath::Clamp(TargetValue, MinValueAsDouble, MaxValueAsDouble);
-
-                    const double CurrentFraction = FMath::Clamp((DigitValue - MinSliderAsDouble) / SliderRange, 0.0, 1.0);
-                    const double TargetFraction = FMath::Clamp((TargetValue - MinSliderAsDouble) / SliderRange, 0.0, 1.0);
-                    const double CurrentFilled = DigitPrivate::ApplySliderExponent(CurrentFraction, SliderExponent);
-                    const double TargetFilled = DigitPrivate::ApplySliderExponent(TargetFraction, SliderExponent);
-
-                    RoutedDelta.X = (TargetFilled - CurrentFilled) * SliderWidth / NativeStep;
-                    DigitValue = TargetValue;
+                    DigitValue = ObservedValue;
                 }
-                else
+                LastObservedValue = ObservedValue;
+            }
+
+            // A native float/double cannot change by a step below its ULP.
+            // Avoid injecting huge virtual mouse deltas for such changes.
+            // Rotator's backing float lives in its *normalized* range, not in
+            // the cumulative drag angle (which can grow through many turns).
+            const double RepresentedValue = bRouteRotatorsDirectly ? ObservedValue : DigitValue;
+            const double ApproxUlp = static_cast<double>(std::numeric_limits<NumericType>::epsilon())
+                * FMath::Max(FMath::Abs(RepresentedValue), 1.0);
+            const bool bUnrepresentableStep = !TIsIntegral<NumericType>::Value
+                && FMath::Abs(NativeStep * InputMultiplier) < ApproxUlp * 0.50;
+            if (bUnrepresentableStep)
+            {
+                RoutedDelta.X = 0.0;
+                *WorkingDelta = NumericType(0);
+                if (!bLoggedPrecisionLimit)
                 {
-                    RoutedDelta.X = 0.0;
+                    bLoggedPrecisionLimit = true;
+                    const UDigitSettings* Settings = UDigitSettings::Get();
+                    if (Settings && Settings->bLogWidgetDiagnostics)
+                    {
+                        UE_LOG(LogDigit, Warning,
+                            TEXT("Selected digit step %.9g cannot be represented near numeric value %.9g (native ULP approx %.9g); suppressing sub-resolution scrub"),
+                            NativeStep, DigitValue, ApproxUlp);
+                    }
                 }
             }
             else
             {
-                const double DesiredInfluence = FMath::Pow(DesiredStepAsDouble, SliderExponent);
-                const double MovementScale = DesiredInfluence / WorkingInfluence;
-                if (!FMath::IsFinite(MovementScale) || MovementScale <= 0.0)
+                // Native CommitValue grid-snaps to Delta, but a fixed selected
+                // place need not delete digits that were already present to its
+                // right. Prefer the original display's fractional resolution.
+                // Never snap converted values based on a rounded guessed scale.
+                const double GridStep = FMath::Min(
+                    FMath::Abs(NativeStep * InputMultiplier),
+                    FMath::Pow(10.0, -static_cast<double>(FMath::Clamp(DisplayFractionDigits, 0, 9))));
+                const double SnappedInitial = GridStep > 0.0
+                    ? std::round(InitialDigitValue / GridStep) * GridStep
+                    : InitialDigitValue;
+                const bool bGridAligned = DisplayScale == 1.0 && GridStep > 0.0
+                    && FMath::IsFinite(GridStep)
+                    && FMath::Abs(SnappedInitial - InitialDigitValue)
+                        <= FMath::Max(ApproxUlp * 2.0, GridStep * 0.00001);
+                *WorkingDelta = bGridAligned && GridStep >= ApproxUlp * 0.50
+                    ? static_cast<NumericType>(GridStep)
+                    : NumericType(0);
+            }
+            const double SliderWidth = FMath::Max(
+                static_cast<double>(PinnedSpinBox->GetTickSpaceGeometry().GetDrawSize().X), 100.0);
+
+            if (bUnrepresentableStep || !FMath::IsFinite(RequestedChange)
+                || !FMath::IsFinite(SliderWidth) || SliderWidth <= 0.0)
+            {
+                RoutedDelta.X = 0.0f;
+            }
+            else if (bRouteValueDirectly)
+            {
+                // Avoid the float-valued slider fraction for integers and
+                // nonlinear fields. For rotator components, maintain an
+                // UNWRAPPED value and normalize only what is sent to Unreal.
+                // Never rebase on the normalized readback during a drag.
+                const double AccumulatedValue = DigitValue + RequestedChange;
+                double TargetValue = AccumulatedValue;
+                if (bRouteRotatorsDirectly)
                 {
-                    RoutedDelta.X = 0.0;
+                    // [-180, 180), repeatedly, in BOTH directions. Fmod is
+                    // signed, so compensate for negative values explicitly.
+                    TargetValue = FMath::Fmod(AccumulatedValue + 180.0, 360.0);
+                    if (TargetValue < 0.0)
+                    {
+                        TargetValue += 360.0;
+                    }
+                    TargetValue -= 180.0;
+                    TargetValue = FMath::Clamp(TargetValue, MinValueAsDouble, MaxValueAsDouble);
                 }
                 else
                 {
-                    RoutedDelta.X *= MovementScale * ScrubSensitivity;
+                    // Integer controls with a 0 minimum can use the type's
+                    // numeric 'lowest()' as a real slider boundary. Detect
+                    // those even when the ordinary bounded-range inference
+                    // (used by float controls) cannot distinguish them.
+                    const bool bIntegerHasSliderLimits = bRouteIntegersDirectly
+                        && (MinSliderAsDouble != static_cast<double>(std::numeric_limits<NumericType>::lowest())
+                            || MaxSliderAsDouble != static_cast<double>(std::numeric_limits<NumericType>::max()));
+                    if (bBoundedSliderRange || bIntegerHasSliderLimits)
+                    {
+                        TargetValue = FMath::Clamp(TargetValue, MinSliderAsDouble, MaxSliderAsDouble);
+                    }
+                    TargetValue = FMath::Clamp(TargetValue, MinValueAsDouble, MaxValueAsDouble);
+                }
+
+                // Round explicitly instead of letting a fractional slider
+                // fraction quantize a hundreds or tens-place integer change.
+                // Retain the pre-rounding accumulator so low sensitivity does
+                // not lose movement fractions on every physical mouse event.
+                const double UnroundedTarget = TargetValue;
+                if constexpr (TIsIntegral<NumericType>::Value)
+                {
+                    TargetValue = std::round(TargetValue);
+                }
+
+                // No lossy conversion to int64/uint64 outside the exactly
+                // representable double integer range. Do not overwrite the
+                // backing property with a rounded 64-bit value.
+                const bool bUnsafeWideInteger = bRouteIntegersDirectly
+                    && FMath::Abs(TargetValue) > 9007199254740991.0;
+                if (FMath::IsFinite(TargetValue) && !bUnsafeWideInteger)
+                {
+                    // For rotators retain the continuous position even as the
+                    // property displays -180..180. For integers retain any
+                    // sub-integer cursor remainder while within hard limits.
+                    if (bRouteRotatorsDirectly)
+                    {
+                        DigitValue = AccumulatedValue;
+                    }
+                    else if (bRouteIntegersDirectly)
+                    {
+                        DigitValue = UnroundedTarget;
+                    }
+                    else if (TargetValue == AccumulatedValue)
+                    {
+                        DigitValue = AccumulatedValue;
+                    }
+                    else
+                    {
+                        DigitValue = TargetValue;
+                    }
+
+                    const NumericType TargetNative = static_cast<NumericType>(TargetValue);
+                    if (TargetNative != LastWrittenNative)
+                    {
+                        PinnedSpinBox->SetDelta(NumericType(0));
+                        PinnedSpinBox->SetValue(TAttribute<NumericType>(TargetNative));
+                        LastWrittenNative = TargetNative;
+                        *bDirectValueAssigned = true;
+                    }
+                }
+                RoutedDelta.X = 0.0f;
+                *WorkingDelta = NumericType(0);
+                // Bypassing synthetic mouse movement also avoids a deferred
+                // slider-fraction commit overwriting the exact value.
+                return true;
+            }
+            else if (bBoundedSliderRange)
+            {
+                // This is the inverse of UE 5.8 SSpinBox's bounded path:
+                // Fraction += CursorDelta * NativeStep, then divide by width,
+                // apply the inverse slider exponent, and interpolate bounds.
+                // The native float fraction is inherently precision-limited.
+                const double TargetValue = FMath::Clamp(
+                    FMath::Clamp(DigitValue + RequestedChange, MinSliderAsDouble, MaxSliderAsDouble),
+                    MinValueAsDouble, MaxValueAsDouble);
+                const double CurrentFraction = FMath::Clamp(
+                    (DigitValue - MinSliderAsDouble) / SliderRange, 0.0, 1.0);
+                const double TargetFraction = FMath::Clamp(
+                    (TargetValue - MinSliderAsDouble) / SliderRange, 0.0, 1.0);
+                const double CurrentFilled = DigitPrivate::ApplySliderExponent(CurrentFraction, SliderExponent);
+                const double TargetFilled = DigitPrivate::ApplySliderExponent(TargetFraction, SliderExponent);
+                const double VirtualDelta = (TargetFilled - CurrentFilled) * SliderWidth / NativeBaseStep;
+                if (FMath::IsFinite(VirtualDelta)
+                    && FMath::Abs(VirtualDelta) <= static_cast<double>(std::numeric_limits<float>::max()))
+                {
+                    RoutedDelta.X = VirtualDelta;
+                    DigitValue = TargetValue;
+                }
+                else
+                {
+                    RoutedDelta.X = 0.0f;
+                }
+            }
+            else
+            {
+                // UE 5.8 SSpinBox's *unbounded* fallback ignores Delta
+                // unless its private LinearDeltaSensitivity attribute is set.
+                // The per-move zero Delta forces the public-value-based branch:
+                // Internal += CursorDelta / Width * pow(max(abs(V),1), Exp).
+                // Invert that exact scale instead of dividing by an imagined
+                // pow(WorkingDelta, Exp), which previously caused huge jumps.
+                const double CurrentMagnitude = FMath::Clamp(
+                    FMath::Abs(DigitValue), 1.0,
+                    static_cast<double>(std::numeric_limits<NumericType>::max()));
+                const double NativeInfluence = FMath::Pow(CurrentMagnitude, SliderExponent);
+                const double TargetValue = FMath::Clamp(
+                    DigitValue + RequestedChange, MinValueAsDouble, MaxValueAsDouble);
+                const double VirtualDelta = NativeInfluence > 0.0
+                    ? (TargetValue - DigitValue) * SliderWidth / NativeInfluence
+                    : 0.0;
+                if (FMath::IsFinite(VirtualDelta)
+                    && FMath::Abs(VirtualDelta) <= static_cast<double>(std::numeric_limits<float>::max()))
+                {
+                    RoutedDelta.X = VirtualDelta;
+                    DigitValue = TargetValue;
+                }
+                else
+                {
+                    RoutedDelta.X = 0.0f;
                 }
             }
         }
 
+        // The native mouse-move modifier values are configurable per widget.
+        // Strip them here: Digit has already applied its own advertised
+        // Shift/Ctrl multipliers, while Alt must not resize slider limits.
+        // This also lets native CommittedViaSpin respect its normal clamps.
         const FPointerEvent RoutedEvent(
             MouseEvent.GetUserIndex(),
             MouseEvent.GetPointerIndex(),
@@ -1103,29 +1619,32 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
             MouseEvent.GetLastScreenSpacePosition(),
             RoutedDelta,
             MouseEvent.GetPressedButtons(),
-            MouseEvent.GetModifierKeys());
+            FModifierKeysState());
 
+        // Force the native motion calculation onto the same unbounded branch
+        // we inverted, regardless of this widget's private sensitivity setting.
+        // The widget may commit later during its Tick, so install our working
+        // grid AFTER computing the new InternalValue, before the deferred commit.
+        PinnedSpinBox->SetDelta(NumericType(0));
         PinnedSpinBox->OnMouseMove(PinnedSpinBox->GetTickSpaceGeometry(), RoutedEvent);
+        PinnedSpinBox->SetDelta(*WorkingDelta);
         return true;
     };
 
-    const double InitialMovementScale = bBoundedSliderRange
-        ? 0.0
-        : FMath::Pow(static_cast<double>(InitialDesiredStep), SliderExponent) / WorkingInfluence;
-
     UE_LOG(LogDigit, Log,
-        TEXT("Armed digit place %d%s: desired step %.9g, working Delta %.9g, original Delta %.9g, move scale %.9g, sensitivity %.3g, bounded %s, slider [%.9g, %.9g], exponent %.9g"),
+        TEXT("Armed digit place %d%s: display step %.9g, native/display scale %.9g, original Delta %.9g, sensitivity %.3g, bounded %s, slider [%.9g, %.9g], exponent %.9g, direct route %s, rotator %s"),
         Hit.DigitPlace,
         bUseLadder ? TEXT(" with ladder") : TEXT(""),
         static_cast<double>(InitialDesiredStep),
-        static_cast<double>(WorkingDelta),
+        DisplayScale,
         static_cast<double>(OriginalDelta),
-        InitialMovementScale,
         ScrubSensitivity,
         bBoundedSliderRange ? TEXT("true") : TEXT("false"),
-        static_cast<double>(MinSliderValue),
-        static_cast<double>(MaxSliderValue),
-        SliderExponent);
+        MinSliderAsDouble,
+        MaxSliderAsDouble,
+        SliderExponent,
+        bRouteValueDirectly ? TEXT("true") : TEXT("false"),
+        bRouteRotatorsDirectly ? TEXT("true") : TEXT("false"));
 
     return true;
 }
@@ -1843,6 +2362,10 @@ void FDigitInputProcessor::QueueRestore()
 
     if (ActiveSpinBox.IsValid() && RestoreDeltaFunction)
     {
+        if (!bRestorePending)
+        {
+            PendingRestorePostTicks = 0;
+        }
         bRestorePending = true;
     }
 }
@@ -1866,6 +2389,7 @@ void FDigitInputProcessor::RestoreActiveDelta()
     PhysicalDragDistance = 0.0f;
     bDigitDragStarted = false;
     bRestorePending = false;
+    PendingRestorePostTicks = 0;
     bAwaitingNativeCapture = false;
     bActiveSpinBoxIsIntegral = false;
     bLadderModeActive = false;

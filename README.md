@@ -9,7 +9,7 @@ Hover the hundreds place to work in hundreds. Hover the tenths place to make fin
 ![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.8.x-black?logo=unrealengine)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2064--bit-blue)
 ![Type](https://img.shields.io/badge/Plugin-Editor%20Only-green)
-![Version](https://img.shields.io/badge/Version-1.0.5-blue)
+![Version](https://img.shields.io/badge/Version-1.0.12-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 ![Digit targeting a numeric place value in Unreal Engine](Doc/Images/Digit-Hero.png)
@@ -130,7 +130,7 @@ A click still behaves like a click instead of immediately changing the value.
 
 ### Native Numeric Constraints
 
-Digit works through Unreal Engine's supported numeric spin boxes, respecting their hard numeric limits, numeric types, native mouse capture, and editing callbacks. Floating-point linear/unbounded fields use digit-scaled native drag behavior. Integer fields, rotator components, and nonlinear bounded fields use direct numeric targets where native mouse-fraction calculations cannot express the intended change reliably. Rotator components wrap through the normalized angle range continuously in either direction. Precision remains limited by the stored numeric type.
+Digit works through Unreal Engine's supported numeric spin boxes, respecting their hard numeric limits, numeric types, native mouse capture, and editing callbacks. Floating-point linear/unbounded fields use digit-scaled native drag behavior. Integer fields, rotator components, and nonlinear bounded fields use direct numeric targets where native mouse-fraction calculations cannot express the intended change reliably. Rotator components wrap through the normalized angle range continuously in either direction. A zero-valued rotation still allows selecting its visible digits, because Digit knows rotator components store degrees even when the displayed zero cannot identify a unit by numerical conversion alone. Precision remains limited by the stored numeric type.
 
 ### Direction Feedback
 
@@ -148,11 +148,15 @@ Adjust how much vertical mouse movement is required to change Value Ladder magni
 
 A value of `1.0` is the default and is tuned for more deliberate rung changes. Lower values require more vertical movement, while higher values switch magnitudes more quickly.
 
-### Native Mouse Capture
+### Native Mouse Capture and Interaction Cleanup
 
-Digit preserves Unreal Engine's normal mouse capture behavior during numeric scrubbing.
+Digit uses Unreal Engine's native mouse capture, drag threshold, and numeric slider callbacks. It does not create separate editor transactions. A numeric field only begins adjusting after its native spin box captures the initiating mouse pointer.
 
-Depending on the field and editor context, the cursor may be hidden while the drag is active. Digit relies on the targeted-digit highlight and increase/decrease outline to keep the interaction readable.
+If a click does not start a native slider interaction, or the numeric widget disappears during editing, Digit stops targeting that field and restores its temporary widget settings. On ordinary mouse release, it waits for native capture and deferred numeric commits to finish before restoring them. A new Digit interaction cannot begin while the preceding one is being cleaned up.
+
+Pressing Escape during a captured drag remains an Unreal Engine action: Digit does not consume the key or replace the widget's native cancel handler. Undo and Redo are handled by the owning Unreal editor.
+
+Depending on the editor context, the cursor may be hidden while the drag is active. Digit's targeted-digit highlight and increase/decrease outline provide direction feedback.
 
 ### Customizable Highlight
 
@@ -160,11 +164,11 @@ Configure the digit highlight background and highlighted text color from Project
 
 ### Editor-Wide Integration
 
-Digit works with supported scrub-enabled Unreal Editor numeric spin boxes rather than being tied to one specific Details panel. This can include compatible scalar fields in Material Instances and Material Parameter Collections.
+Digit works with supported scrub-enabled Unreal Editor numeric spin boxes rather than being tied to one specific Details panel. This can include compatible scalar fields in Material Instances and Material Parameter Collections. Niagara inline float, integer, and vector inputs that expose native scrub-enabled spin boxes are eligible: their existing begin/change/end parameter callbacks remain in control. Sequencer numeric key fields and Control Rig single-value numeric fields can also use compatible spin boxes. Specialized frame/timecode formatting, Control Rig multi-value annotations, non-spin Niagara controls, and editor-specific transaction behavior must be validated in UE 5.8.3 before claiming comprehensive coverage.
 
 ### International Number Formats
 
-Digit uses Unreal Editor's numeric locale when interpreting decimal and thousands separators, including comma-decimal formats and localized digit glyphs. The Editor's interface language and number-formatting locale can differ.
+Digit reads the same localized number-formatting rules used by Unreal's numeric type interface when interpreting decimal and grouping separators, including comma-decimal formats and localized digit glyphs. The Editor's interface language and number-formatting locale can differ.
 
 ### Optional Diagnostics
 
@@ -241,7 +245,7 @@ The formatting characters do not change the meaning of the digits.
 
 ## Regional Number Formats
 
-Digit interprets the value using Unreal Editor's active **numeric locale**, which is controlled independently of the Editor interface language under **Editor Preferences > General > Region & Language**.
+Digit interprets numeric displays using Unreal Editor's active **numeric formatting rules**, which can be configured independently of the Editor interface language under **Editor Preferences > General > Region & Language**. Digit follows the same `ExpressionParser` formatting rules that Unreal's default numeric type interface uses.
 
 | Example display | Number format | Digit `5` position |
 |---|---|---|
@@ -252,6 +256,12 @@ Digit interprets the value using Unreal Editor's active **numeric locale**, whic
 | `1 234,56` | Narrow-space grouping, comma decimal | Tenths (`0.1`) |
 
 Localized numeric digits and common grouping spaces are supported. Non-numeric unit labels are ignored when determining place value. Digit does not change the Editor's language or regional preferences.
+
+### Numeric Units During a Drag
+
+Some Details-panel numeric fields automatically switch their displayed units as their value changes (for example, centimeters to meters). Digit uses the unit shown when the drag begins to determine the chosen digit's magnitude. If Unreal changes the displayed unit during that drag, Digit pauses further numerical adjustments until the mouse button is released. Release and select a digit in the newly displayed unit to continue. The underlying native slider release and edit transaction still complete normally.
+
+For a field displaying an explicit unit label, Digit uses Unreal's own unit definitions to identify the relationship between its displayed units and its stored value. The relationship must be unambiguous at the visible numeric precision. Digit supports offset-based conversions such as Fahrenheit and Celsius when Unreal's conversion uniquely identifies the underlying unit; it adjusts by the conversion's *step size*, not by a value ratio. Where the underlying unit cannot be identified reliably (especially at zero with auto-selected units or heavily rounded values), Digit leaves the field to Unreal's normal numeric editor instead of guessing.
 
 Scientific-notation values such as `1.25e-04` are not eligible for direct digit-place scrubbing. Special or custom numeric formatting may also prevent Digit from safely interpreting a field.
 
@@ -665,7 +675,7 @@ Supported fields continue to respect their configured numeric behavior, includin
 - Native mouse capture
 - Native drag threshold
 
-Digit calculates the requested numeric change from the highlighted digit and Scrub Sensitivity. For ordinary floating-point linear bounded fields, it translates movement through the control's width and slider range; for unbounded fields, it compensates for native value-dependent sensitivity. For integral spin boxes and nonlinear bounded sliders, it uses the spin box's public numeric-value interface to avoid lossy slider-fraction conversion. Transform Rotation components keep a continuous internal angle that wraps at 180 degrees in either direction, allowing unlimited turns and mid-drag reversals. Standard native min/max constraints still apply to non-rotator numeric fields. When displays use different units, Digit attempts to infer the relationship between displayed and underlying values; this is not always discoverable, especially at zero.
+Digit calculates the requested numeric change from the highlighted digit and Scrub Sensitivity. For ordinary floating-point linear bounded fields, it translates movement through the control's width and slider range; for unbounded fields, it compensates for native value-dependent sensitivity. For integral spin boxes, nonlinear bounded sliders, and linear bounded sliders whose fine magnitude exceeds the native slider fraction's resolution, it uses the spin box's public numeric-value interface to avoid lossy slider-fraction conversion. Transform Rotation components keep a continuous internal angle that wraps at 180 degrees in either direction, allowing unlimited turns and mid-drag reversals. Standard native min/max constraints still apply to non-rotator numeric fields. When a field displays explicit units, Digit checks the label against Unreal's unit definitions and uses an unambiguous native-to-display conversion slope for the chosen digit magnitude. This covers compatible linear units and offset units where the underlying unit can be inferred uniquely. A rounded display by itself does not prove a different unit scale. Ambiguous, unrecognized, or zero-valued conversions that cannot be resolved safely remain in Unreal's native editor.
 
 While Digit calculates the native mouse movement, the spin box's `Delta` is temporarily set to zero so its optional linear sensitivity cannot change the selected place's movement scale. When the value is already aligned to a representable decimal grid, Digit uses that grid for Unreal's subsequent numeric commit to reduce stray lower-order digits. It retains the field's existing visible lower-order digits where possible. The original `Delta` is restored after the interaction and any deferred commit; Digit does not permanently change the field's native step or slider settings.
 
@@ -697,6 +707,8 @@ Digit recognizes compatible Unreal Engine scrub-enabled numeric spin boxes using
 - `uint16`
 - `uint32`
 - `uint64`
+
+For 64-bit integer fields, Digit only targets values and digit increments inside the range that its double-based drag accumulator can represent exactly (up to \(2^{53}-1\) in magnitude). Values outside that range are not highlighted or intercepted, and remain editable through Unreal's standard numeric input. Integer fields do not advertise fractional places that cannot be represented by the underlying integer type.
 
 The field must support normal slider-style numeric scrubbing.
 
@@ -980,7 +992,7 @@ Digit is configured for:
 
 | | |
 |---|---|
-| **Digit Version** | 1.0.5 |
+| **Digit Version** | 1.0.12 |
 | **Unreal Engine** | 5.8.x |
 | **Platform** | Windows 64-bit |
 | **Plugin Type** | Editor |
@@ -1011,11 +1023,11 @@ When the cursor moves over a compatible numeric field:
 When a drag begins:
 
 1. Unreal Engine receives the normal mouse-down interaction.
-2. Digit preserves Unreal's native drag threshold.
+2. Digit confirms native spin box capture and preserves Unreal's native drag threshold.
 3. Once normal scrubbing begins, Digit scales horizontal movement according to the selected place value and configured Scrub Sensitivity.
 4. Digit routes adjusted movement through the native spin box, or sets explicit numeric targets when slider-fraction math would lose integer magnitude, fine nonlinear precision, or repeated rotation wrapping.
 5. Regular scalar fields retain their numeric constraints; Transform Rotation components wrap cyclically.
-6. Digit restores the field's original scrub configuration when the interaction ends.
+6. Digit waits for native capture to end and its deferred value commits to complete before restoring the field's original scrub configuration. An ignored click or destroyed field is cleaned up without leaving Digit armed.
 
 When the Value Ladder is active, vertical movement changes the selected magnitude using the configured Ladder Magnitude Sensitivity while horizontal movement continues to control the value using Scrub Sensitivity.
 
@@ -1055,11 +1067,11 @@ Digit works with existing compatible numeric controls rather than replacing them
 
 Digit currently targets standard Unreal Engine scrub-enabled `SSpinBox` numeric controls.
 
-Custom numeric widgets that do not use compatible Unreal Engine spin boxes are outside its current scope.
+Custom numeric widgets that do not use compatible Unreal Engine spin boxes are outside its current scope. Niagara slider-only, volume, and dropdown controls are examples; compatible Niagara inline spin boxes retain Niagara-owned parameter callbacks. Sequencer timecode and transformed time representations are not assumed to be ordinary decimal place values.
 
 ### Slider Scrubbing Must Be Enabled
 
-If a numeric spin box does not allow slider-style mouse scrubbing, Digit does not force that behavior on.
+If a numeric spin box is disabled or does not allow slider-style mouse scrubbing, Digit does not highlight or force scrubbing on that control. This intentionally excludes read-only and keyboard-only numeric fields. Digit also respects a disabled parent Details row or editor and does not attempt to scrub hidden spin widgets that are replaced by an undetermined-value text field. When multiple objects show `Multiple Values` without a shared numeric value, normal text editing remains available.
 
 ### Visible Digits
 
@@ -1071,17 +1083,21 @@ A digit must be present in the formatted value before it can be directly targete
 
 Integer fields cannot use fractional ladder magnitudes. Fractional ladder positions are disabled automatically. Integer values beyond the exact range of Digit's double-precision accumulator (approximately 2^53) are intentionally left to Unreal's native handling, rather than risk a lossy 64-bit integer rewrite.
 
+### Unit-Converted Displays
+
+Digit recognizes Unreal's supported numeric unit suffixes and checks actual engine conversions, including those that use an additive offset. Because the standard spin box does not expose the owning property's underlying-unit metadata, Digit only scrubs an explicit-unit field when the displayed value identifies one safe increment size. Zero and heavily rounded values may be ambiguous and will not receive a Digit highlight. Native-degree rotator components are an exception: an explicit degree label and matching displayed value provide reliable unit identity, including at 0.0. Bare numeric fields use native-unit values; unfamiliar unit labels are left to Unreal's own editor.
+
 ### Number Formatting
 
-Digit follows Unreal's current numeric locale for ordinary localized decimal and grouping conventions, including common space-grouping formats. If both period and comma occur in one value, the last separator is interpreted as decimal; a single ambiguous separator uses the locale's grouping convention. Some custom formatting and bidirectional text layouts may not map reliably to a numeric place.
+Digit follows Unreal's numeric type interface formatting rules for ordinary localized decimal and grouping conventions, including common space-grouping formats. If both period and comma occur in one value, the last separator is interpreted as decimal; a single ambiguous separator uses the locale's grouping convention. Some custom formatting and bidirectional text layouts may not map reliably to a numeric place.
 
-Scientific-notation displays are excluded from digit-place scrubbing because exponent digits do not represent ordinary decimal places.
+Numeric annotations with a textual prefix, such as Control Rig's relative multi-edit display, are also excluded because their displayed digits are not the absolute stored property value. Scientific-notation displays are excluded from digit-place scrubbing because exponent digits do not represent ordinary decimal places. Fields using the `...` indicator for an underlying number rounded to an apparently simpler value are also excluded, since the displayed digits do not fully describe the stored value.
 
 ### Floating-Point and Slider Precision
 
-`float` and `double` values cannot represent every decimal exactly. A requested adjustment such as `0.01` may round to a nearby representable value. At large magnitudes, a very small change may be too small to affect a `float` at all. Digit avoids routing sub-resolution steps where it can determine that a native numeric value cannot represent them.
+`float` and `double` values cannot represent every decimal exactly. A requested adjustment such as `0.01` may round to a nearby representable value. At large magnitudes, a very small change may be too small to affect a `float` at all. Digit determines representable precision using neighboring float or double values at the actual current magnitude, including values close to zero. It avoids routing sub-resolution steps where the native numeric type cannot represent them.
 
-Unreal's bounded slider calculations use single-precision fractions internally. Digit routes nonlinear bounded sliders and integral spin boxes through the public numeric value interface to avoid losing precision in that fraction. Linear bounded floating-point sliders still use the native slider fraction, and all fields remain limited by the actual numeric type, snapping rules, clamping, and the widget's editing callbacks. A precision smaller than the float or double's representable spacing cannot be guaranteed.
+Unreal's bounded slider calculations use single-precision fractions internally. Digit routes nonlinear bounded sliders and integral spin boxes through the public numeric value interface to avoid losing precision in that fraction. Linear bounded floating-point sliders use native fractions when the selected place can be represented reliably; sufficiently fine magnitudes on wide linear slider ranges use numeric targets instead. All fields remain limited by the actual numeric type, snapping rules, clamping, and the widget's editing callbacks. A precision smaller than the float or double's representable spacing cannot be guaranteed.
 
 Some specialized spin boxes implement a nonlinear slider with a private exponent-neutral value that Digit cannot inspect through the public `SSpinBox` interface. Those controls may not follow the usual drag-scaling relationship.
 

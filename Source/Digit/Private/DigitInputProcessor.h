@@ -74,6 +74,7 @@ private:
     bool UpdateLadderSelection(const FPointerEvent& MouseEvent);
     bool IsIntegralSpinBox(const TSharedPtr<SWidget>& Widget) const;
 
+    bool HasActiveSession() const;
     void QueueRestore();
     void RestoreActiveDelta();
 
@@ -86,11 +87,14 @@ private:
     TFunction<void()> RestoreDeltaFunction;
     TFunction<bool(const FPointerEvent&, bool, int32, bool)> RouteActiveMoveFunction;
     int32 ActivePointerIndex = INDEX_NONE;
+    int32 ActiveUserIndex = INDEX_NONE;
     int32 ActiveDigitPlace = 0;
     float PhysicalDragDistance = 0.0f;
     bool bDigitDragStarted = false;
+    bool bActiveDigitScrubSuspended = false;
     bool bRestorePending = false;
     int32 PendingRestorePostTicks = 0;
+    int32 PendingCapturePostTicks = 0;
     bool bAwaitingNativeCapture = false;
     bool bActiveSpinBoxIsIntegral = false;
 

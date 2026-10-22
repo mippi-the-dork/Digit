@@ -12,6 +12,9 @@
 #include "Internationalization/Internationalization.h"
 #include "Internationalization/Culture.h"
 #include "Internationalization/FastDecimalFormat.h"
+#include "Math/UnitConversion.h"
+#include "Widgets/Input/NumericTypeInterface.h"
+#include "Layout/Visibility.h"
 #include "Rendering/SlateRenderer.h"
 #include "Styling/CoreStyle.h"
 #include "Widgets/Input/SSpinBox.h"
@@ -24,6 +27,7 @@
 
 #include <limits>
 #include <cmath>
+#include <type_traits>
 
 DEFINE_LOG_CATEGORY_STATIC(LogDigit, Log, All);
 
@@ -34,11 +38,13 @@ namespace DigitPrivate
     static const FLinearColor IncreaseOutlineColor(0.0f, 0.162029f, 0.745404f, 0.700000f);
     static const FLinearColor DecreaseOutlineColor(0.745404f, 0.228181f, 0.0f, 0.700000f);
 
-    // Always read the number locale, not the editor language. Region & Language
-    // can configure those independently (for example English UI and German numbers).
+    // Follow the EXACT rules used by UE 5.8's numeric entry interface.
+    // TDefaultNumericTypeInterface formats and parses through ExpressionParser,
+    // whose localized rules can differ from the FInternationalization locale
+    // selected for non-numeric text. This matters for Region & Language options.
     static const FDecimalNumberFormattingRules& GetNumberRules()
     {
-        return FInternationalization::Get().GetCurrentLocale()->GetDecimalNumberFormattingRules();
+        return ExpressionParser::GetLocalizedNumberFormattingRules();
     }
 
     static bool IsDigitCharacter(TCHAR Character)
@@ -253,30 +259,248 @@ namespace DigitPrivate
         return FMath::IsFinite(OutValue);
     }
 
-    static double ResolveDisplayToNativeScale(double NativeValue, const FString& Text)
+    // SPropertyEditorNumeric can change its fixed display unit when the
+    // property crosses an automatic unit threshold. Isolate the suffix so
+    // the digit selected at mouse-down is never silently reinterpreted in
+    // another unit mid-drag (e.g. cm changing to m).
+    static FString GetNumericUnitSuffix(const FString& Text)
+    {
+        for (int32 Index = 0; Index < Text.Len(); ++Index)
+        {
+            if (IsDigitCharacter(Text[Index]))
+            {
+                FNumericToken Token;
+                if (LocateNumericToken(Text, Index, Token))
+                {
+                    FString Suffix = Text.Mid(Token.End + 1);
+                    Suffix.TrimStartAndEndInline();
+                    return Suffix;
+                }
+                break;
+            }
+        }
+        return FString();
+    }
+
+    // SSpinBox does not expose INumericTypeInterface or the source property's
+    // Units/ForceUnits metadata. Resolve a visible unit only if the displayed
+    // suffix is recognized by Unreal and the actual engine conversion produces
+    // the displayed rounded number from exactly ONE numeric scale.
+    //
+    // A native/display value ratio is not a unit conversion. It fails for
+    // temperatures with offsets, for zero, and for rounded fields. Instead,
+    // test the complete set of UE EUnit source candidates that are compatible
+    // with the displayed unit. A candidate's native-units-per-display-unit
+    // slope is calculated from Convert(0) and Convert(1); that works for
+    // affine conversions such as Fahrenheit to Celsius too.
+    //
+    // The underlying unit remains private to the owning editor. If several
+    // candidate sources fit the display but require different step sizes,
+    // we must NOT invent a mapping. Native editing remains available.
+    static TOptional<double> ResolveDisplayToNativeScale(
+        double NativeValue, const FString& Text, bool bKnownNativeDegrees = false)
     {
         double DisplayValue = 0.0;
-        if (!ParseDisplayedNumber(Text, DisplayValue)
-            || FMath::Abs(DisplayValue) < 1.e-8 || !FMath::IsFinite(NativeValue))
+        if (!FMath::IsFinite(NativeValue) || !ParseDisplayedNumber(Text, DisplayValue))
+        {
+            return TOptional<double>();
+        }
+
+        int32 FirstDigit = INDEX_NONE;
+        for (int32 Index = 0; Index < Text.Len(); ++Index)
+        {
+            if (IsDigitCharacter(Text[Index]))
+            {
+                FirstDigit = Index;
+                break;
+            }
+        }
+        FNumericToken Token;
+        if (FirstDigit == INDEX_NONE || !LocateNumericToken(Text, FirstDigit, Token))
+        {
+            return TOptional<double>();
+        }
+
+        // Only an ordinary number may define a digit place. Specialized
+        // editors can paint a numeric *annotation* (e.g. Control Rig's
+        // "Multiple Values: + 0.000" relative-edit overlay) while the actual
+        // SSpinBox still holds the first selected object's absolute value.
+        // Treating that annotation as the absolute value could apply a very
+        // different delta to every selected rig control. A genuine numeric
+        // value may have whitespace or Unicode directional marks before it,
+        // but never an arbitrary textual prefix.
+        for (int32 Index = 0; Index < Token.Start; ++Index)
+        {
+            const TCHAR Prefix = Text[Index];
+            const bool bHarmlessPrefix = Prefix == TEXT(' ') || Prefix == TEXT('\t')
+                || Prefix == static_cast<TCHAR>(0x00A0) // no-break space
+                || Prefix == static_cast<TCHAR>(0x202F) // narrow no-break space
+                || Prefix == static_cast<TCHAR>(0x200E) // left-to-right mark
+                || Prefix == static_cast<TCHAR>(0x200F) // right-to-left mark
+                || Prefix == static_cast<TCHAR>(0x061C); // Arabic letter mark
+            if (!bHarmlessPrefix)
+            {
+                return TOptional<double>();
+            }
+        }
+
+        const FString UnitSuffix = GetNumericUnitSuffix(Text);
+        int32 FractionalDigits = 0;
+        if (Token.Radix != INDEX_NONE)
+        {
+            for (int32 Index = Token.Radix + 1; Index <= Token.End; ++Index)
+            {
+                if (IsDigitCharacter(Text[Index]))
+                {
+                    ++FractionalDigits;
+                }
+            }
+        }
+        // The visible precision determines how far its rounded value can
+        // legitimately differ from the numeric value held by the spin box.
+        const double DisplayTolerance = 0.500001 * FMath::Pow(
+            10.0, -static_cast<double>(FMath::Min(FractionalDigits, 12)));
+
+        if (UnitSuffix.IsEmpty())
+        {
+            // The ordinary numeric interface displays the native value in
+            // the same units. However, some specialized editors use a custom
+            // OnGetDisplayValue to show a transformed number WITHOUT a suffix
+            // (frames, percentages, etc.). Those must not be scrubbed using
+            // an assumed 1:1 mapping. Ordinary display rounding is fine.
+            return FMath::Abs(NativeValue - DisplayValue) <= DisplayTolerance
+                ? TOptional<double>(1.0) : TOptional<double>();
+        }
+
+        const TOptional<EUnit> DisplayUnit = FUnitConversion::UnitFromString(*UnitSuffix);
+        // A rotator component's stored numeric value is already in degrees.
+        // For an explicit degree symbol/name, that native unit is known from
+        // the SNumericRotatorInputBox ancestry. Do not try to infer it from
+        // the displayed number: both 0 radians and 0 degrees display as 0,
+        // which otherwise makes every zero-valued rotator fail eligibility.
+        // This exception is NEVER applied to unrelated angle-valued fields.
+        const bool bExplicitDegrees =
+            (DisplayUnit.IsSet() && DisplayUnit.GetValue() == EUnit::Degrees)
+            || UnitSuffix == FUnitConversion::GetUnitDisplayString(EUnit::Degrees);
+        if ((!DisplayUnit.IsSet() || DisplayUnit.GetValue() == EUnit::Unspecified)
+            && !(bKnownNativeDegrees && bExplicitDegrees))
+        {
+            // Includes custom/unrecognized unit abbreviations. No guessing.
+            return TOptional<double>();
+        }
+
+        if (bKnownNativeDegrees)
+        {
+            // The number must actually display the stored degree value,
+            // allowing only the rounding implied by the visible decimals.
+            // A custom rotator displaying radians is not a 1:1 degree field.
+            return bExplicitDegrees
+                && FMath::Abs(NativeValue - DisplayValue) <= DisplayTolerance
+                ? TOptional<double>(1.0) : TOptional<double>();
+        }
+
+        TOptional<double> UniqueScale;
+        // EUnit is documented as a contiguous, zero-indexed enum. Do not
+        // include EUnit::Unspecified in candidate conversions.
+        for (int32 Index = 0; Index < static_cast<int32>(EUnit::Unspecified); ++Index)
+        {
+            const EUnit SourceUnit = static_cast<EUnit>(Index);
+            if (!FUnitConversion::AreUnitsCompatible(SourceUnit, DisplayUnit.GetValue()))
+            {
+                continue;
+            }
+
+            const double ConvertedDisplay = FUnitConversion::Convert(
+                NativeValue, SourceUnit, DisplayUnit.GetValue());
+            // Coarsely rounded displays may accidentally match an unrelated
+            // source unit within half a displayed digit. Require close relative
+            // agreement too; displayed zero requires near-exact agreement.
+            const double AbsoluteError = FMath::Abs(ConvertedDisplay - DisplayValue);
+            const double RelativeConfidence = FMath::Max(
+                1.e-8, FMath::Abs(DisplayValue) * 0.075);
+            if (!FMath::IsFinite(ConvertedDisplay)
+                || AbsoluteError > DisplayTolerance
+                || AbsoluteError > RelativeConfidence)
+            {
+                continue;
+            }
+
+            const double AtZero = FUnitConversion::Convert(
+                0.0, SourceUnit, DisplayUnit.GetValue());
+            const double AtOne = FUnitConversion::Convert(
+                1.0, SourceUnit, DisplayUnit.GetValue());
+            const double DisplayUnitsPerNative = AtOne - AtZero;
+            if (!FMath::IsFinite(DisplayUnitsPerNative) || DisplayUnitsPerNative <= 0.0)
+            {
+                continue;
+            }
+            const double Scale = 1.0 / DisplayUnitsPerNative;
+            if (!FMath::IsFinite(Scale) || Scale <= 0.0)
+            {
+                continue;
+            }
+
+            if (UniqueScale.IsSet())
+            {
+                // Equivalent aliases can have the same scale. Different
+                // native units fitting a heavily rounded display are unsafe.
+                const double RelativeDifference = FMath::Abs(
+                    Scale / UniqueScale.GetValue() - 1.0);
+                if (RelativeDifference > 1.e-7)
+                {
+                    return TOptional<double>();
+                }
+            }
+            else
+            {
+                UniqueScale = Scale;
+            }
+        }
+        return UniqueScale;
+    }
+
+    template<typename NumericType>
+    static bool CanSafelyScrubInteger(NumericType Value)
+    {
+        if constexpr (TIsIntegral<NumericType>::Value)
+        {
+            // Digit accumulates movement as double. Both signs of a wide
+            // integer must be exactly representable or the first drag could
+            // silently overwrite low bits. Check the original integer before
+            // casting it to double, including UINT64_MAX and INT64_MIN.
+            constexpr long double MaxExactInteger = 9007199254740991.0L;
+            const long double ExactValue = static_cast<long double>(Value);
+            return ExactValue >= -MaxExactInteger && ExactValue <= MaxExactInteger;
+        }
+        else
+        {
+            return true;
+        }
+    }
+
+    // The spacing near 0.001f is ~1e-10, not epsilon(float) * 1.0f.
+    // Using the real adjacent representable values avoids incorrectly
+    // disabling precision for tiny material and animation parameters.
+    template<typename NumericType>
+    static double GetNumericResolution(double NativeValue)
+    {
+        if constexpr (std::is_floating_point_v<NumericType>)
+        {
+            if (!FMath::IsFinite(NativeValue))
+            {
+                return std::numeric_limits<double>::infinity();
+            }
+            const NumericType Native = static_cast<NumericType>(NativeValue);
+            const NumericType Above = std::nextafter(Native, std::numeric_limits<NumericType>::infinity());
+            const NumericType Below = std::nextafter(Native, -std::numeric_limits<NumericType>::infinity());
+            const double UpStep = static_cast<double>(Above) - static_cast<double>(Native);
+            const double DownStep = static_cast<double>(Native) - static_cast<double>(Below);
+            return FMath::Min(UpStep, DownStep);
+        }
+        else
         {
             return 1.0;
         }
-        const double Scale = NativeValue / DisplayValue;
-        if (!FMath::IsFinite(Scale) || Scale <= 0.0)
-        {
-            return 1.0;
-        }
-        // Display roundoff should not masquerade as an exotic unit conversion.
-        if (Scale > 0.9 && Scale < 1.1)
-        {
-            return 1.0;
-        }
-        // Avoid huge conversions derived from near-zero rounded displays.
-        if (Scale < 1.e-9 || Scale > 1.e9)
-        {
-            return 1.0;
-        }
-        return Scale;
     }
 
     static FString LocalizeStepText(FString Text)
@@ -498,7 +722,79 @@ namespace DigitPrivate
     template<typename NumericType>
     bool IsWidgetClass(const TSharedRef<SWidget>& Widget)
     {
+        // Sequencer's SNonThrottledSpinBox<T> inherits SSpinBox<T>
+        // without declaring a new Slate widget class. Its inherited class
+        // identity matches this probe, so callbacks stay on the native widget.
         return &Widget->GetWidgetClass() == &GetRuntimeSpinBoxClass<NumericType>();
+    }
+
+    template<typename NumericType>
+    bool IsScrubbableSpinBox(const TSharedRef<SWidget>& Widget)
+    {
+        if (!IsWidgetClass<NumericType>(Widget))
+        {
+            return false;
+        }
+        const TSharedRef<SSpinBox<NumericType>> SpinBox = StaticCastSharedRef<SSpinBox<NumericType>>(Widget);
+        return SpinBox->IsEnabled() && SpinBox->GetEnableSlider();
+    }
+
+    template<typename NumericType>
+    bool CanRepresentDisplayedMagnitude(
+        const TSharedRef<SWidget>& Widget, const FString& DisplayString, bool bKnownNativeDegrees)
+    {
+        if (!IsWidgetClass<NumericType>(Widget))
+        {
+            return false;
+        }
+        const TSharedRef<SSpinBox<NumericType>> SpinBox = StaticCastSharedRef<SSpinBox<NumericType>>(Widget);
+        return CanSafelyScrubInteger(SpinBox->GetValue())
+            && ResolveDisplayToNativeScale(
+                static_cast<double>(SpinBox->GetValue()), DisplayString, bKnownNativeDegrees).IsSet();
+    }
+
+    static bool CanRepresentDisplayedMagnitude(
+        const TSharedRef<SWidget>& Widget, const FString& DisplayString, bool bKnownNativeDegrees)
+    {
+        return CanRepresentDisplayedMagnitude<double>(Widget, DisplayString, bKnownNativeDegrees)
+            || CanRepresentDisplayedMagnitude<float>(Widget, DisplayString, bKnownNativeDegrees)
+            || CanRepresentDisplayedMagnitude<uint64>(Widget, DisplayString, bKnownNativeDegrees)
+            || CanRepresentDisplayedMagnitude<uint32>(Widget, DisplayString, bKnownNativeDegrees)
+            || CanRepresentDisplayedMagnitude<uint16>(Widget, DisplayString, bKnownNativeDegrees)
+            || CanRepresentDisplayedMagnitude<uint8>(Widget, DisplayString, bKnownNativeDegrees)
+            || CanRepresentDisplayedMagnitude<int64>(Widget, DisplayString, bKnownNativeDegrees)
+            || CanRepresentDisplayedMagnitude<int32>(Widget, DisplayString, bKnownNativeDegrees)
+            || CanRepresentDisplayedMagnitude<int16>(Widget, DisplayString, bKnownNativeDegrees)
+            || CanRepresentDisplayedMagnitude<int8>(Widget, DisplayString, bKnownNativeDegrees);
+    }
+
+    template<typename NumericType>
+    bool CanScrubDisplayedPlace(const TSharedRef<SWidget>& Widget, int32 DigitPlace)
+    {
+        if (!IsWidgetClass<NumericType>(Widget))
+        {
+            return false;
+        }
+        NumericType Step = NumericType(0);
+        if (!MakeStepForPlace<NumericType>(DigitPlace, Step))
+        {
+            return false;
+        }
+        return CanSafelyScrubInteger(Step);
+    }
+
+    static bool CanScrubDisplayedPlace(const TSharedRef<SWidget>& Widget, int32 DigitPlace)
+    {
+        return CanScrubDisplayedPlace<double>(Widget, DigitPlace)
+            || CanScrubDisplayedPlace<float>(Widget, DigitPlace)
+            || CanScrubDisplayedPlace<uint64>(Widget, DigitPlace)
+            || CanScrubDisplayedPlace<uint32>(Widget, DigitPlace)
+            || CanScrubDisplayedPlace<uint16>(Widget, DigitPlace)
+            || CanScrubDisplayedPlace<uint8>(Widget, DigitPlace)
+            || CanScrubDisplayedPlace<int64>(Widget, DigitPlace)
+            || CanScrubDisplayedPlace<int32>(Widget, DigitPlace)
+            || CanScrubDisplayedPlace<int16>(Widget, DigitPlace)
+            || CanScrubDisplayedPlace<int8>(Widget, DigitPlace);
     }
 
     static TSharedPtr<STextBlock> FindTextUnderSpinBox(
@@ -607,41 +903,59 @@ void FDigitInputProcessor::ApplyDigitCursor()
 
 void FDigitInputProcessor::Tick(const float DeltaTime, FSlateApplication& SlateApp, TSharedRef<ICursor> Cursor)
 {
-    if (ActiveSpinBox.IsValid() && !bRestorePending)
+    if (!HasActiveSession() || bRestorePending)
     {
-        const TSharedPtr<SWidget> PinnedSpinBox = ActiveSpinBox.Pin();
-        if (!PinnedSpinBox.IsValid())
-        {
-            QueueRestore();
-            return;
-        }
+        return;
+    }
 
-        if (bAwaitingNativeCapture)
-        {
-            if (PinnedSpinBox->HasMouseCapture())
-            {
-                bAwaitingNativeCapture = false;
-            }
-            return;
-        }
+    const TSharedPtr<SWidget> PinnedSpinBox = ActiveSpinBox.Pin();
+    if (!PinnedSpinBox.IsValid())
+    {
+        // A Details row or floating editor tab can be destroyed during a drag.
+        // A weak widget does not keep the owning editor (or its callbacks) alive.
+        QueueRestore();
+        return;
+    }
 
-        if (!PinnedSpinBox->HasMouseCapture())
+    if (bAwaitingNativeCapture)
+    {
+        if (PinnedSpinBox->HasMouseCapture())
         {
-            QueueRestore();
+            bAwaitingNativeCapture = false;
+            PendingCapturePostTicks = 0;
         }
+        return;
+    }
+
+    if (!PinnedSpinBox->HasMouseCapture())
+    {
+        // Native mouse capture was lost without passing through our button-up
+        // preprocessor. Never continue scaling subsequent pointer movements.
+        QueueRestore();
     }
 }
 
 bool FDigitInputProcessor::HandleKeyDownEvent(FSlateApplication& SlateApp, const FKeyEvent& InKeyEvent)
 {
-    if (InKeyEvent.GetKey() == EKeys::Escape && ActiveSpinBox.IsValid())
+    if (InKeyEvent.GetKey() == EKeys::Escape
+        && HasActiveSession()
+        && !bRestorePending
+        && InKeyEvent.GetUserIndex() == ActiveUserIndex)
     {
-        QueueRestore();
-        return false;
+        // DO NOT consume Escape. SSpinBox::OnKeyDown is responsible for
+        // CancelMouseCapture/NotifyValueCommitted. We only defer restoring our
+        // temporary attributes until Slate has delivered that native event.
+        if (const TSharedPtr<SWidget> PinnedSpinBox = ActiveSpinBox.Pin())
+        {
+            if (PinnedSpinBox->HasMouseCapture())
+            {
+                QueueRestore();
+            }
+        }
     }
 
     if ((InKeyEvent.GetKey() == EKeys::LeftAlt || InKeyEvent.GetKey() == EKeys::RightAlt)
-        && !ActiveSpinBox.IsValid()
+        && !HasActiveSession()
         && !bRestorePending)
     {
         ShowLadderFromCurrentHighlight(SlateApp);
@@ -663,7 +977,7 @@ bool FDigitInputProcessor::HandleKeyUpEvent(FSlateApplication& SlateApp, const F
 
 bool FDigitInputProcessor::HandleMouseMoveEvent(FSlateApplication& SlateApp, const FPointerEvent& MouseEvent)
 {
-    if (ActiveSpinBox.IsValid() && !bRestorePending)
+    if (HasActiveSession() && !bRestorePending)
     {
         const TSharedPtr<SWidget> PinnedSpinBox = ActiveSpinBox.Pin();
         if (!PinnedSpinBox.IsValid())
@@ -674,12 +988,24 @@ bool FDigitInputProcessor::HandleMouseMoveEvent(FSlateApplication& SlateApp, con
 
         if (!PinnedSpinBox->HasMouseCapture())
         {
-            // Mouse-down is preprocessed before SSpinBox receives it. If capture has not
-            // happened yet, allow normal Slate routing for this event instead of consuming it.
+            // A native mouse-down can be intercepted. Before the initial capture,
+            // let the original event route normally; after capture, abort the Digit
+            // session instead of ever forwarding an unscaled extra movement.
+            if (!bAwaitingNativeCapture)
+            {
+                QueueRestore();
+            }
             return false;
         }
 
         bAwaitingNativeCapture = false;
+        PendingCapturePostTicks = 0;
+        // Another pointer/user must not modify this pointer's active scrub.
+        if (MouseEvent.GetPointerIndex() != ActivePointerIndex
+            || MouseEvent.GetUserIndex() != ActiveUserIndex)
+        {
+            return false;
+        }
 
         if (ApplySelectedDeltaFunction)
         {
@@ -713,8 +1039,14 @@ bool FDigitInputProcessor::HandleMouseMoveEvent(FSlateApplication& SlateApp, con
             ActiveDigitPlace,
             bMagnitudeChangedThisMove);
 
+        if (bActiveDigitScrubSuspended)
+        {
+            ClearActiveDragOutline();
+        }
+
         if (bScaleMovement
             && bRouted
+            && !bActiveDigitScrubSuspended
             && !bMagnitudeChangedThisMove
             && !FMath::IsNearlyZero(static_cast<float>(MouseEvent.GetCursorDelta().X)))
         {
@@ -756,7 +1088,7 @@ bool FDigitInputProcessor::HandleMouseMoveEvent(FSlateApplication& SlateApp, con
 
 bool FDigitInputProcessor::HandleMouseButtonDownEvent(FSlateApplication& SlateApp, const FPointerEvent& MouseEvent)
 {
-    if (MouseEvent.GetEffectingButton() != EKeys::LeftMouseButton || ActiveSpinBox.IsValid())
+    if (MouseEvent.GetEffectingButton() != EKeys::LeftMouseButton || HasActiveSession() || bRestorePending)
     {
         return false;
     }
@@ -792,7 +1124,7 @@ bool FDigitInputProcessor::HandleMouseButtonDownEvent(FSlateApplication& SlateAp
             {
                 const FDecimalNumberFormattingRules& Rules = DigitPrivate::GetNumberRules();
                 UE_LOG(LogDigit, Warning,
-                    TEXT("Unresolved numeric click (locale=%s, decimal U+%04X, group U+%04X). Widget path: %s"),
+                    TEXT("Unresolved numeric click (culture=%s, active numeric decimal U+%04X, group U+%04X). Widget path: %s"),
                     *FInternationalization::Get().GetCurrentLocale()->GetName(),
                     static_cast<uint32>(Rules.DecimalSeparatorCharacter),
                     static_cast<uint32>(Rules.GroupingSeparatorCharacter),
@@ -808,6 +1140,7 @@ bool FDigitInputProcessor::HandleMouseButtonDownEvent(FSlateApplication& SlateAp
     const bool bUseLadder = MouseEvent.IsAltDown();
     if (ArmSpinBox(Hit, MouseEvent.GetPointerIndex(), bUseLadder))
     {
+        ActiveUserIndex = MouseEvent.GetUserIndex();
         FWidgetPath Path = SlateApp.LocateWindowUnderMouse(
             MouseEvent.GetScreenSpacePosition(),
             SlateApp.GetInteractiveTopLevelWindows(),
@@ -835,8 +1168,9 @@ bool FDigitInputProcessor::HandleMouseButtonDownEvent(FSlateApplication& SlateAp
 bool FDigitInputProcessor::HandleMouseButtonUpEvent(FSlateApplication& SlateApp, const FPointerEvent& MouseEvent)
 {
     if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton
-        && ActiveSpinBox.IsValid()
-        && MouseEvent.GetPointerIndex() == ActivePointerIndex)
+        && HasActiveSession()
+        && MouseEvent.GetPointerIndex() == ActivePointerIndex
+        && MouseEvent.GetUserIndex() == ActiveUserIndex)
     {
         // Preserve Delta=0 during the native final commit and deferred Tick.
         // Restoring the original Delta early would re-snap material values.
@@ -852,12 +1186,67 @@ bool FDigitInputProcessor::HandleMouseButtonUpEvent(FSlateApplication& SlateApp,
 
 void FDigitInputProcessor::HandlePostSlateTick()
 {
+    if (HasActiveSession() && !bRestorePending)
+    {
+        const TSharedPtr<SWidget> PinnedSpinBox = ActiveSpinBox.Pin();
+        if (!PinnedSpinBox.IsValid())
+        {
+            // The row can expire without another input event (selection changes,
+            // panel teardown, asset-editor replacement). Do not orphan the
+            // per-widget temporary Delta or block all future Digit sessions.
+            QueueRestore();
+        }
+        else if (bAwaitingNativeCapture)
+        {
+            if (PinnedSpinBox->HasMouseCapture())
+            {
+                bAwaitingNativeCapture = false;
+                PendingCapturePostTicks = 0;
+            }
+            else if (++PendingCapturePostTicks >= 2)
+            {
+                // The preprocessor arms before native OnMouseButtonDown. If
+                // another widget intercepts mouse-down, SSpinBox never captures
+                // and there will be no matching native slider release. Disarm.
+                const UDigitSettings* Settings = UDigitSettings::Get();
+                if (Settings && Settings->bLogWidgetDiagnostics)
+                {
+                    UE_LOG(LogDigit, Warning,
+                        TEXT("Native spin box did not capture within two Slate post-ticks; cancelling Digit arm"));
+                }
+                QueueRestore();
+            }
+        }
+        else if (!PinnedSpinBox->HasMouseCapture())
+        {
+            // Lost capture can skip the native slider-end delegate; Digit does
+            // not synthesize property transactions or call engine-private APIs.
+            const UDigitSettings* Settings = UDigitSettings::Get();
+            if (Settings && Settings->bLogWidgetDiagnostics && bDigitDragStarted)
+            {
+                UE_LOG(LogDigit, Warning,
+                    TEXT("Native spin box lost capture during a Digit drag; restoring widget state (verify editor transaction behavior)"));
+            }
+            QueueRestore();
+        }
+    }
+
     if (bRestorePending)
     {
-        // SSpinBox 5.8 defers mouse-move commits to its own Tick. Keep Delta=0
-        // through one subsequent widget tick so a pending value is not snapped
-        // to the field's original Delta after mouse-up. This also preserves
-        // native OnEndSliderMovement and undo transaction ownership.
+        // Mouse-up and Escape arrive at the input preprocessor BEFORE the
+        // captured SSpinBox. Never restore during the native release/commit.
+        if (const TSharedPtr<SWidget> CapturedSpinBox = ActiveSpinBox.Pin())
+        {
+            if (CapturedSpinBox->HasMouseCapture())
+            {
+                PendingRestorePostTicks = 0;
+                return;
+            }
+        }
+
+        // A native mouse-move value may be committed in SSpinBox::Tick. Allow
+        // another complete widget tick before reinstating its original Delta
+        // and, for direct-value routes, its original bound value attribute.
         ClearHighlight();
         if (++PendingRestorePostTicks >= 2)
         {
@@ -866,7 +1255,7 @@ void FDigitInputProcessor::HandlePostSlateTick()
         return;
     }
 
-    if (ActiveSpinBox.IsValid() && ActiveTextWidget.IsValid() && FSlateApplication::IsInitialized())
+    if (HasActiveSession() && ActiveTextWidget.IsValid() && FSlateApplication::IsInitialized())
     {
         RefreshActiveHighlight(FSlateApplication::Get());
     }
@@ -918,6 +1307,46 @@ bool FDigitInputProcessor::FindNumericHit(FSlateApplication& SlateApp, const FPo
         return false;
     }
 
+    // Identify rotators *before* unit eligibility, including at displayed
+    // zero. SNumericRotatorInputBox supplies native degrees; other scalar
+    // fields with a degree suffix have no such guarantee.
+    bool bIsRotatorComponent = false;
+    for (int32 Index = 0; Index < SpinBoxPathIndex; ++Index)
+    {
+        const FString WidgetType = Path.Widgets[Index].Widget->GetTypeAsString();
+        if (WidgetType.Contains(TEXT("RotatorInputBox")))
+        {
+            bIsRotatorComponent = true;
+        }
+
+        // Niagara's standard float/int/vector parameter editors were audited
+        // against UE 5.8.3 source. Their nested SNumericEntryBox spin boxes
+        // forward OnBeginSliderMovement, OnValueChanged and
+        // OnEndSliderMovement to Niagara's own parameter-change lifecycle.
+        // Let those native callbacks run normally. Non-spin Niagara widgets
+        // (dropdowns, slider-only variants, volume controls) cannot pass the
+        // IsSupportedSpinBox test above and remain untouched by Digit.
+    }
+
+    // A child SSpinBox can report itself enabled while an enclosing Details
+    // row or editor is disabled. Slate's effective enabled state also depends
+    // on its ancestors, so do not advertise Digit on a read-only hierarchy.
+    // An undetermined SNumericEntryBox uses its text-only overlay with the
+    // underlying spinbox collapsed. Never arm a hidden spinbox.
+    for (int32 Index = 0; Index <= SpinBoxPathIndex; ++Index)
+    {
+        const TSharedRef<SWidget>& Candidate = Path.Widgets[Index].Widget;
+        if (!Candidate->IsEnabled())
+        {
+            return false;
+        }
+        const EVisibility Visibility = Candidate->GetVisibility();
+        if (Visibility == EVisibility::Collapsed || Visibility == EVisibility::Hidden)
+        {
+            return false;
+        }
+    }
+
     const TSharedRef<SWidget>& SpinWidget = Path.Widgets[SpinBoxPathIndex].Widget;
     TSharedPtr<STextBlock> TextWidget;
     FGeometry TextGeometry;
@@ -943,6 +1372,24 @@ bool FDigitInputProcessor::FindNumericHit(FSlateApplication& SlateApp, const FPo
     const FText DisplayText = TextWidget->GetText();
     const FString DisplayString = DisplayText.ToString();
     if (DisplayString.IsEmpty())
+    {
+        return false;
+    }
+
+    // UE's numeric type interface may append "..." when the displayed
+    // decimal is rounded away from a nonzero (often extremely small) value.
+    // Selecting a digit in the rounded string would suggest an inaccurate
+    // step and can mislead users into overwriting values they cannot see.
+    if (DisplayString.Contains(TEXT("...")))
+    {
+        return false;
+    }
+
+    // A converted unit with an unknown scale is not digit-safe. Reject it
+    // during hover as well as mouse-down so the highlight never promises a
+    // scrubbing magnitude that the plugin cannot honor.
+    if (!DigitPrivate::CanRepresentDisplayedMagnitude(
+        SpinWidget, DisplayString, bIsRotatorComponent))
     {
         return false;
     }
@@ -987,18 +1434,12 @@ bool FDigitInputProcessor::FindNumericHit(FSlateApplication& SlateApp, const FPo
     {
         return false;
     }
-
-    // Identify actual rotator component widgets from the Slate ancestry.
-    // A degree suffix alone is not sufficient: light cone angles and other
-    // scalar angle properties can have real hard limits and must not wrap.
-    bool bIsRotatorComponent = false;
-    for (int32 Index = 0; Index < SpinBoxPathIndex; ++Index)
+    // The text may contain a digit that the backing numeric type cannot
+    // actually adjust (fractional places on integral spin boxes or enormous
+    // places beyond safe 64-bit integer precision). Do not highlight it.
+    if (!DigitPrivate::CanScrubDisplayedPlace(SpinWidget, DigitPlace))
     {
-        if (Path.Widgets[Index].Widget->GetTypeAsString().Contains(TEXT("RotatorInputBox")))
-        {
-            bIsRotatorComponent = true;
-            break;
-        }
+        return false;
     }
 
     OutHit.SpinBoxWidget = SpinWidget;
@@ -1152,8 +1593,10 @@ bool FDigitInputProcessor::ArmSpinBox(const FNumericHit& Hit, int32 PointerIndex
         ActiveDigitPlace = Hit.DigitPlace;
         PhysicalDragDistance = 0.0f;
         bDigitDragStarted = false;
+        bActiveDigitScrubSuspended = false;
         bRestorePending = false;
         PendingRestorePostTicks = 0;
+        PendingCapturePostTicks = 0;
         bAwaitingNativeCapture = true;
         bLadderModeActive = bUseLadder;
         LadderOriginDigitPlace = Hit.DigitPlace;
@@ -1210,7 +1653,7 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
     bActiveSpinBoxIsIntegral = TIsIntegral<NumericType>::Value;
     bLadderIntegral = bActiveSpinBoxIsIntegral;
 
-    if (!SpinBox->GetEnableSlider())
+    if (!SpinBox->IsEnabled() || !SpinBox->GetEnableSlider())
     {
         return false;
     }
@@ -1278,6 +1721,18 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
     const bool bRouteNonlinearValuesDirectly = bBoundedSliderRange
         && !TIsIntegral<NumericType>::Value
         && !FMath::IsNearlyEqual(SliderExponent, 1.0);
+    // Bounded *linear* sliders also quantize to float-filled fractions.
+    // Take the precision-preserving route only when the finest selected
+    // magnitude (including Ctrl and the optional Value Ladder) approaches
+    // that float fraction's precision, leaving ordinary sliders native.
+    const int32 FinestReachablePlace = Hit.DigitPlace - (bUseLadder ? 4 : 1);
+    const double FinestReachableStep = FMath::Pow(10.0, static_cast<double>(FinestReachablePlace));
+    const bool bRoutePrecisionLimitedLinearValuesDirectly = bBoundedSliderRange
+        && !TIsIntegral<NumericType>::Value
+        && FMath::IsNearlyEqual(SliderExponent, 1.0)
+        && FMath::IsFinite(FinestReachableStep)
+        && FinestReachableStep > 0.0
+        && FinestReachableStep <= SliderRange * static_cast<double>(std::numeric_limits<float>::epsilon()) * 2.0;
 
     // Integer SSpinBoxes lose large selected-place increments when their
     // fractional slider position is converted back to an integer. A rotator
@@ -1287,6 +1742,7 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
     const bool bRouteIntegersDirectly = TIsIntegral<NumericType>::Value;
     const bool bRouteRotatorsDirectly = Hit.bRotatorComponent && !TIsIntegral<NumericType>::Value;
     const bool bRouteValueDirectly = bRouteNonlinearValuesDirectly
+        || bRoutePrecisionLimitedLinearValuesDirectly
         || bRouteIntegersDirectly || bRouteRotatorsDirectly;
 
     // Integer precision beyond 2^53 cannot be safely represented in the
@@ -1294,9 +1750,8 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
     // corrupt an int64/uint64 field through a lossy conversion.
     if constexpr (TIsIntegral<NumericType>::Value)
     {
-        const double SafeIntegerLimit = 9007199254740991.0;
-        if (FMath::Abs(static_cast<double>(SpinBox->GetValue())) > SafeIntegerLimit
-            || static_cast<double>(InitialDesiredStep) > SafeIntegerLimit)
+        if (!DigitPrivate::CanSafelyScrubInteger(SpinBox->GetValue())
+            || !DigitPrivate::CanSafelyScrubInteger(InitialDesiredStep))
         {
             return false;
         }
@@ -1332,15 +1787,38 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
     };
 
     const double InitialDigitValue = static_cast<double>(SpinBox->GetValue());
-    const double DisplayScale = DigitPrivate::ResolveDisplayToNativeScale(
-        InitialDigitValue, Hit.DisplayString);
+    const TOptional<double> ResolvedDisplayScale = DigitPrivate::ResolveDisplayToNativeScale(
+        InitialDigitValue, Hit.DisplayString, Hit.bRotatorComponent);
+    if (!ResolvedDisplayScale.IsSet())
+    {
+        // A visible unit conversion is not always a simple ratio (and the
+        // numeric TypeInterface cannot be retrieved from SSpinBox). Do not
+        // pretend the hovered display digit is in native units.
+        const UDigitSettings* Settings = UDigitSettings::Get();
+        if (Settings && Settings->bLogWidgetDiagnostics)
+        {
+            UE_LOG(LogDigit, Warning,
+                TEXT("Numeric scrub skipped: unavailable or ambiguous displayed-unit conversion for '%s' (native %.9g)"),
+                *Hit.DisplayString, InitialDigitValue);
+        }
+        SpinBox->SetDelta(OriginalDelta);
+        ApplySelectedDeltaFunction = nullptr;
+        RestoreDeltaFunction = nullptr;
+        return false;
+    }
+    const double DisplayScale = ResolvedDisplayScale.GetValue();
+    const FString InitialUnitSuffix = DigitPrivate::GetNumericUnitSuffix(Hit.DisplayString);
+    const TWeakPtr<STextBlock> WeakDisplayText = Hit.TextWidget;
     const int32 DisplayFractionDigits = CountFractionalDigits(Hit.DisplayString, Hit.CharacterIndex);
     // Native Delta snapping can keep numeric fields on their visible decimal grid.
     // Only do so when the current numeric value is already aligned to the grid;
     // otherwise do not discard lower digits the user had before dragging.
 
     RouteActiveMoveFunction = [
+        this,
         WeakSpinBox,
+        WeakDisplayText,
+        InitialUnitSuffix,
         WorkingDelta,
         bRouteIntegersDirectly,
         bRouteRotatorsDirectly,
@@ -1379,6 +1857,43 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
             return false;
         }
 
+        // SPropertyEditorNumeric::OnValueChanged updates the unit type
+        // interface after every interactive change. If that makes the visible
+        // suffix change, the original display-to-native scale is no longer
+        // valid. Suspend value changes for the rest of this captured drag;
+        // mouse-up still goes through the native SSpinBox and closes its
+        // existing Details-panel transaction normally. The user can release
+        // and target a digit in the newly displayed unit.
+        if (bScaleMovement && !bActiveDigitScrubSuspended)
+        {
+            if (const TSharedPtr<STextBlock> DisplayText = WeakDisplayText.Pin())
+            {
+                const FString CurrentSuffix = DigitPrivate::GetNumericUnitSuffix(
+                    DisplayText->GetText().ToString());
+                if (CurrentSuffix != InitialUnitSuffix)
+                {
+                    bActiveDigitScrubSuspended = true;
+                    const UDigitSettings* Settings = UDigitSettings::Get();
+                    if (Settings && Settings->bLogWidgetDiagnostics)
+                    {
+                        UE_LOG(LogDigit, Warning,
+                            TEXT("Unit changed during a digit scrub from '%s' to '%s'; holding value until mouse release"),
+                            *InitialUnitSuffix, *CurrentSuffix);
+                    }
+                }
+            }
+        }
+        if (bActiveDigitScrubSuspended)
+        {
+            // A stale native decimal grid must not snap the last real value
+            // on mouse-up after the display unit changed.
+            *WorkingDelta = NumericType(0);
+            PinnedSpinBox->SetDelta(NumericType(0));
+            // Consume the mouse movement so the unscaled event never reaches
+            // SSpinBox a second time. Leave native capture/release untouched.
+            return true;
+        }
+
         FVector2D RoutedDelta = MouseEvent.GetCursorDelta();
         if (bSuppressHorizontalMovement)
         {
@@ -1415,8 +1930,7 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
             // Rotator's backing float lives in its *normalized* range, not in
             // the cumulative drag angle (which can grow through many turns).
             const double RepresentedValue = bRouteRotatorsDirectly ? ObservedValue : DigitValue;
-            const double ApproxUlp = static_cast<double>(std::numeric_limits<NumericType>::epsilon())
-                * FMath::Max(FMath::Abs(RepresentedValue), 1.0);
+            const double ApproxUlp = DigitPrivate::GetNumericResolution<NumericType>(RepresentedValue);
             const bool bUnrepresentableStep = !TIsIntegral<NumericType>::Value
                 && FMath::Abs(NativeStep * InputMultiplier) < ApproxUlp * 0.50;
             if (bUnrepresentableStep)
@@ -2351,6 +2865,13 @@ bool FDigitInputProcessor::IsIntegralSpinBox(const TSharedPtr<SWidget>& Widget) 
         || DigitPrivate::IsWidgetClass<int8>(WidgetRef);
 }
 
+bool FDigitInputProcessor::HasActiveSession() const
+{
+    // The weak widget may already be destroyed. Its validity alone must not
+    // determine whether there is still a temporary Delta/binding to restore.
+    return ActivePointerIndex != INDEX_NONE || static_cast<bool>(RestoreDeltaFunction);
+}
+
 void FDigitInputProcessor::QueueRestore()
 {
     // Any path that ends an active interaction, including lost mouse capture, must
@@ -2360,7 +2881,7 @@ void FDigitInputProcessor::QueueRestore()
     ClearActiveDragOutline();
     ClearLadder();
 
-    if (ActiveSpinBox.IsValid() && RestoreDeltaFunction)
+    if (HasActiveSession())
     {
         if (!bRestorePending)
         {
@@ -2374,22 +2895,24 @@ void FDigitInputProcessor::RestoreActiveDelta()
 {
     ClearActiveDragOutline();
 
-    if (RestoreDeltaFunction)
-    {
-        RestoreDeltaFunction();
-    }
-
+    // Restoring a bound value attribute can synchronously notify its owning
+    // editor. Clear ALL session state before invoking the callback so an input
+    // re-entry cannot run an old restore or be cleared as a newly armed scrub.
+    TFunction<void()> RestoreFunction = MoveTemp(RestoreDeltaFunction);
     ApplySelectedDeltaFunction = nullptr;
     RestoreDeltaFunction = nullptr;
     RouteActiveMoveFunction = nullptr;
     ActiveSpinBox.Reset();
     ActiveTextWidget.Reset();
     ActivePointerIndex = INDEX_NONE;
+    ActiveUserIndex = INDEX_NONE;
     ActiveDigitPlace = 0;
     PhysicalDragDistance = 0.0f;
     bDigitDragStarted = false;
+    bActiveDigitScrubSuspended = false;
     bRestorePending = false;
     PendingRestorePostTicks = 0;
+    PendingCapturePostTicks = 0;
     bAwaitingNativeCapture = false;
     bActiveSpinBoxIsIntegral = false;
     bLadderModeActive = false;
@@ -2398,18 +2921,22 @@ void FDigitInputProcessor::RestoreActiveDelta()
     LadderSelectedDigitPlace = 0;
     LadderVerticalTravel = 0.0f;
     ActiveLadderMagnitudeSensitivity = 0.5f;
+    if (RestoreFunction)
+    {
+        RestoreFunction();
+    }
 }
 
 bool FDigitInputProcessor::IsSupportedSpinBox(const TSharedRef<SWidget>& Widget) const
 {
-    return DigitPrivate::IsWidgetClass<double>(Widget)
-        || DigitPrivate::IsWidgetClass<float>(Widget)
-        || DigitPrivate::IsWidgetClass<uint64>(Widget)
-        || DigitPrivate::IsWidgetClass<uint32>(Widget)
-        || DigitPrivate::IsWidgetClass<uint16>(Widget)
-        || DigitPrivate::IsWidgetClass<uint8>(Widget)
-        || DigitPrivate::IsWidgetClass<int64>(Widget)
-        || DigitPrivate::IsWidgetClass<int32>(Widget)
-        || DigitPrivate::IsWidgetClass<int16>(Widget)
-        || DigitPrivate::IsWidgetClass<int8>(Widget);
+    return DigitPrivate::IsScrubbableSpinBox<double>(Widget)
+        || DigitPrivate::IsScrubbableSpinBox<float>(Widget)
+        || DigitPrivate::IsScrubbableSpinBox<uint64>(Widget)
+        || DigitPrivate::IsScrubbableSpinBox<uint32>(Widget)
+        || DigitPrivate::IsScrubbableSpinBox<uint16>(Widget)
+        || DigitPrivate::IsScrubbableSpinBox<uint8>(Widget)
+        || DigitPrivate::IsScrubbableSpinBox<int64>(Widget)
+        || DigitPrivate::IsScrubbableSpinBox<int32>(Widget)
+        || DigitPrivate::IsScrubbableSpinBox<int16>(Widget)
+        || DigitPrivate::IsScrubbableSpinBox<int8>(Widget);
 }

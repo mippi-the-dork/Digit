@@ -36,6 +36,20 @@ public:
     void Shutdown();
 
 private:
+    // The owning editor determines what the spin box's value callbacks mean.
+    // This classification is based on the actual Slate ancestry of the field,
+    // not the active tab/window name. Native editors still own transactions.
+    enum class ENumericOwner : uint8
+    {
+        General,
+        NiagaraParameter,
+        SequencerKey,
+        SequencerValueStepper,
+        CurveEditorKeyDetail,
+        CurveEditorToolOptions,
+        ControlRigAnimationDetails
+    };
+
     struct FNumericHit
     {
         TSharedPtr<SWidget> SpinBoxWidget;
@@ -44,6 +58,8 @@ private:
         int32 CharacterIndex = INDEX_NONE;
         int32 DigitPlace = 0;
         bool bRotatorComponent = false;
+        bool bCurveKeyTimeField = false;
+        ENumericOwner Owner = ENumericOwner::General;
         FString DisplayString;
     };
 
@@ -86,6 +102,8 @@ private:
     TFunction<void()> ApplySelectedDeltaFunction;
     TFunction<void()> RestoreDeltaFunction;
     TFunction<bool(const FPointerEvent&, bool, int32, bool)> RouteActiveMoveFunction;
+    TFunction<void()> VerifyActiveSourceFunction;
+    TFunction<void()> VerifyActiveDisplayFunction;
     int32 ActivePointerIndex = INDEX_NONE;
     int32 ActiveUserIndex = INDEX_NONE;
     int32 ActiveDigitPlace = 0;

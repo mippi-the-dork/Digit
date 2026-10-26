@@ -9,7 +9,7 @@ Hover the hundreds place to work in hundreds. Hover the tenths place to make fin
 ![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.8.x-black?logo=unrealengine)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2064--bit-blue)
 ![Type](https://img.shields.io/badge/Plugin-Editor%20Only-green)
-![Version](https://img.shields.io/badge/Version-1.0.19-blue)
+![Version](https://img.shields.io/badge/Version-1.0.30-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 ![Digit targeting a numeric place value in Unreal Engine](Doc/Images/Digit-Hero.png)
@@ -72,6 +72,16 @@ Digit gives precision control without adding another editing mode or replacing U
 
 ## Features
 
+### Curve Editor Timecode Text Editing (Preview)
+
+For a verified non-drop-frame timecode text field in the Curve Editor's **Time** slot:
+
+1. Click into the field and select exactly one timecode digit.
+2. Keep the mouse over the field and press **Ctrl+Alt+Up** or **Ctrl+Alt+Down** to stage a one-place adjustment.
+3. Press **Enter** to commit using Unreal's original frame-number property handler, or **Escape** to cancel the text edit.
+
+This is a limited keyboard interaction, **not drag scrubbing**. It only activates when the field belongs to a live, matched Sequencer and the host numeric interface verifies the format and exact integer tick conversion. Drop-frame, subframes, standalone Curve Editors, and text fields outside the Time slot use their original Unreal behavior. The Value Ladder does not apply.
+
 ### Digit-Aware Scrubbing
 
 The exact digit beneath the cursor determines the magnitude of the numeric scrub.
@@ -79,6 +89,8 @@ The exact digit beneath the cursor determines the magnitude of the numeric scrub
 ### Per-Digit Highlighting
 
 Digit highlights the individual numeric character currently targeted by the cursor.
+
+Digit targets editable native numeric spin boxes, not informational viewport gizmo readouts or unrelated numeric labels. Highlighting is limited to the visible value belonging to the eligible control, and read-only or overlay-less controls retain their native behavior.
 
 ### Place-Value Tooltips
 
@@ -93,6 +105,10 @@ Hover a digit to see:
 ### Integer and Decimal Support
 
 Work with whole-number and floating-point fields using the place values appropriate to each. Integer spin boxes use direct whole-number changes so targeting tens, hundreds, or larger places is not reduced to one-unit increments by the native slider fraction. The displayed numeric type is never changed.
+
+### Preserve Decimal Digits While Scrubbing
+
+Floating-point fields keep the number of visible decimal places they had when the mouse drag started. When a digit carries past 9, a trailing zero stays visible and scrubbable until the mouse is released. For example, `1.229` becomes `1.230` and then `1.231` without the selected thousandths place disappearing. This works for compatible Location, Rotation, Scale, and float/double number fields wherever Unreal's spin box formatter supports the displayed precision. After release, Unreal returns to its usual compact presentation (`1.230` becomes `1.23`). Integer and structured timecode fields retain their native presentation.
 
 ### Continuous Rotation Scrubbing
 
@@ -122,6 +138,12 @@ The Value Ladder displays up to:
 
 Integer fields automatically prevent fractional ladder values.
 
+### Frame and Timecode Integrity
+
+Sequencer time fields are not always decimal quantities. Their stored values can be native ticks while the editor displays frames, seconds, or bracketed timecode. For compatible Sequencer Value Stepper and Curve Editor Time spin boxes, Digit can now query the **owning Sequencer instance** and verify the displayed numeric interface against its actual frame rate and tick resolution, including when the field shows zero. Digit verifies two consecutive native-unit increments and the owner's display formatting, rather than inferring a unit from its displayed value. Curve Editor Time fields require this proof at every value, including nonzero. A generic Sequencer stepper without a verified time mapping only qualifies as an ordinary numeric scalar when the displayed number exactly matches its stored native value, and not when it displays zero. Frame-rate or display-format changes during a drag suspend the original digit magnitude, even when their numerical unit scales happen to match. Verified **non-drop-frame timecode inside native Sequencer spin boxes** can now use hours/minutes/seconds/frames digit scrubbing with whole selected-digit tick steps and native spin-box mouse-up commits. These controls do not offer a decimal Value Ladder. Drop-frame timecode, subframes, and unverified text fields retain Unreal's native behavior. Verified non-drop-frame Curve Editor Time text fields also provide an opt-in one-digit keyboard staging gesture as described above.
+
+For developers validating compatibility in UE 5.8.x, Digit includes editor automation tests `Digit.Temporal.NativeFrameInterface`, `Digit.Temporal.SequencerRateBridge`, `Digit.Temporal.SequencerFormatSignature`, and `Digit.Temporal.TimecodeDigitSteps`, and `Digit.Temporal.TimecodeSpinQuantization`. These exercise Unreal's actual frame, seconds, timecode, zero-value, and fractional-frame-rate conversions. The non-drop-frame timecode test resolves each timecode digit to an integral native-tick increment and covers minute rollover. The verified non-drop timecode conversion also supports an opt-in selected-digit keyboard gesture in qualified Curve Editor Time text fields. Unreal retains the original Enter/focus-loss property commit path. The experimental text shortcut stages only one adjustment per unchanged source text: Slate does not expose the modified edit buffer through `SEditableText::GetText()`, and `SetEditableText()` does not create a native text-edit undo transaction. Treat this shortcut as limited until in-editor validation; native property Undo/Redo applies after the host successfully commits, not to each staged keystroke. Drop-frame labels and subframes intentionally remain outside this linear conversion. They test the native calculations, not the live widget interaction or comprehensive timecode support. See `Doc/Temporal-Engine-Validation.md`, `Doc/Sequencer-Live-Frame-Bridge.md`, and `Doc/Curve-Editor-Text-Editing-V126.md`.
+
 ### Native Drag Threshold
 
 Digit preserves Unreal Engine's normal drag threshold before numeric scrubbing begins.
@@ -130,7 +152,7 @@ A click still behaves like a click instead of immediately changing the value.
 
 ### Native Numeric Constraints
 
-Digit works through Unreal Engine's supported numeric spin boxes, respecting their hard numeric limits, numeric types, native mouse capture, and editing callbacks. Floating-point linear/unbounded fields use digit-scaled native drag behavior. Integer fields, rotator components, and nonlinear bounded fields use direct numeric targets where native mouse-fraction calculations cannot express the intended change reliably. Rotator components wrap through the normalized angle range continuously in either direction. A zero-valued rotation still allows selecting its visible digits, because Digit knows rotator components store degrees even when the displayed zero cannot identify a unit by numerical conversion alone. Precision remains limited by the stored numeric type. When Digit temporarily substitutes a precise numeric value for a bound editor control, it restores the original binding with snapping temporarily disabled, then returns the control's original snapping increment. This avoids a second rounding step during native cleanup. For double-valued fields, the working snap grid respects displayed fractional digits beyond nine when the number type can represent them.
+Digit works through Unreal Engine's supported numeric spin boxes, respecting their hard numeric limits, numeric types, native mouse capture, and editing callbacks. Floating-point linear/unbounded fields use digit-scaled native drag behavior. Integer fields, rotator components, and nonlinear bounded fields use direct numeric targets where native mouse-fraction calculations cannot express the intended change reliably. Rotator components wrap through the normalized angle range continuously in either direction. A zero-valued rotation still allows selecting its visible digits, because Digit knows rotator components store degrees even when the displayed zero cannot identify a unit by numerical conversion alone. Rotation digit steps must also be large enough to survive the native numeric type's storage resolution. Digit blocks too-fine float-backed Rotator steps, checks the prospective float conversion and decimal formatting before writing, and stabilizes arithmetic dust between whole degrees without rounding away pre-existing source precision. This prevents Digit from generating invisible fractional changes that can cause `...` or scientific-format tooltips; an unsupported fine digit may therefore do nothing. All eligible floating-point scrubs, including Location, Rotation, Scale and ordinary scalar float/double controls, temporarily preserve the number of visible fractional digits present at mouse-down. For example, carrying 1.234569 through 1.234570 keeps the rightmost zero present for continued scrubbing. Unreal restores normal trailing-zero trimming after mouse-up. This presentation-only hold respects each field's existing maximum fractional digits and is not applied to integers or structured timecode. See `Doc/Rotation-and-Editable-Text-Safety-V127.md`, `Doc/Rotation-Trailing-Zero-Drag-V128.md`, and `Doc/Floating-Point-Trailing-Zero-Drag-V129.md`. Precision remains limited by the stored numeric type. When Digit temporarily substitutes a precise numeric value for a bound editor control, it restores the original binding with snapping temporarily disabled, then returns the control's original snapping increment. This avoids a second rounding step during native cleanup. For double-valued fields, the working snap grid respects displayed fractional digits beyond nine when the number type can represent them.
 
 ### Direction Feedback
 
@@ -164,7 +186,7 @@ Configure the digit highlight background and highlighted text color from Project
 
 ### Editor-Wide Integration
 
-Digit works with supported scrub-enabled Unreal Editor numeric spin boxes rather than being tied to one specific Details panel. This can include compatible scalar fields in Material Instances and Material Parameter Collections. Niagara inline float, integer, and vector inputs that expose native scrub-enabled spin boxes are eligible: their existing begin/change/end parameter callbacks remain in control. Niagara's verified standard parameter interfaces keep displayed and stored units identical, so digit targeting also works with an explicitly labeled value of zero, such as `0.00 cm`. This rule never applies to arbitrary converted-unit fields. Sequencer numeric key fields and Control Rig single-value numeric fields can also use compatible native spin boxes. Digit recognizes those specialized numeric owners to avoid overriding an independently refreshed host value with a stale direct-write target. During a captured drag it also pauses Digit-specific movement if the visible field switches to a non-scalar annotation, structured time, an ellipsis, a different visible decimal precision, or another display unit. Digit also checks a field's displayed unit/format and a specialized field's original bound source every captured Slate post-tick and immediately before native mouse-up. If the owning editor changed the value without another mouse movement, Digit restores that source before the native release callback can commit an obsolete direct-write target. If the displayed numeric format changes while the cursor is stationary, Digit suspends place-specific movement and clears temporary snapping for the native release. Delayed callbacks that merely echo Digit's own recent values are accepted. The owning editor retains its native mouse-up and transaction lifecycle. Native editors continue to own their transactions and commit behavior. The Curve Editor's key-detail panel uses property-backed fields for key Time and Value. Compatible numeric Value fields retain native commit callbacks. Curve Editor extension-tool numeric settings are also recognized as specialized, structure-backed Details fields, so independent source updates will not silently overwrite active direct-value scrubs. At zero, a key Time spin box is left to Unreal because its frame/tick/display-rate conversion cannot be established from a single displayed value. The standard frame-number Time customization actually uses a text editor rather than a numeric spin box; Digit does not intercept that control. Structured timecode (including drop-frame and subframe indicators) is excluded from decimal place-value targeting; its digits represent separate time components. Sequencer's generic Value Stepper may be backed by frames, seconds, or ticks, so Digit does not claim a zero-value mapping it cannot establish. Converted frame/second fields, Control Rig differing-value multi-edit annotations, non-spin Niagara controls, and editor-specific transaction behavior still require in-editor validation before claiming comprehensive coverage.
+Digit works with supported scrub-enabled Unreal Editor numeric spin boxes rather than being tied to one specific Details panel. This can include compatible scalar fields in Material Instances and Material Parameter Collections. Niagara inline float, integer, and vector inputs that expose native scrub-enabled spin boxes are eligible: their existing begin/change/end parameter callbacks remain in control. Niagara's verified standard parameter interfaces keep displayed and stored units identical, so digit targeting also works with an explicitly labeled value of zero, such as `0.00 cm`. This rule never applies to arbitrary converted-unit fields. Sequencer numeric key fields and Control Rig single-value numeric fields can also use compatible native spin boxes. Digit recognizes those specialized numeric owners to avoid overriding an independently refreshed host value with a stale direct-write target. During a captured drag it also pauses Digit-specific movement if the visible field switches to a non-scalar annotation, unverified structured time, an ellipsis, a different visible decimal precision, or another display unit. Verified non-drop timecode spin boxes instead retain their original component step until release, and suspend if the owner, rate, or format changes. Digit also checks a field's displayed unit/format and a specialized field's original bound source every captured Slate post-tick and immediately before native mouse-up. If the owning editor changed the value without another mouse movement, Digit restores that source before the native release callback can commit an obsolete direct-write target. If the displayed numeric format changes while the cursor is stationary, Digit suspends place-specific movement and clears temporary snapping for the native release. Delayed callbacks that merely echo Digit's own recent values are accepted. The owning editor retains its native mouse-up and transaction lifecycle. Native editors continue to own their transactions and commit behavior. The Curve Editor's key-detail panel uses property-backed fields for key Time and Value. Compatible numeric Value fields retain native commit callbacks. Curve Editor extension-tool numeric settings are also recognized as specialized, structure-backed Details fields, so independent source updates will not silently overwrite active direct-value scrubs. A key Time spin box is accepted only when Digit can verify its unit conversion through the owning Sequencer's numeric interface, regardless of its displayed value; otherwise it is left to Unreal. The standard frame-number Time customization uses a text editor rather than a numeric spin box. Digit only intercepts the explicit Ctrl+Alt+Up/Down selected-digit gesture in a verified Sequencer-owned Curve Editor Time field, and leaves actual commit behavior to Unreal. Structured timecode is never interpreted as an ordinary decimal; a verified native non-drop-frame Sequencer spin box has a dedicated component-aware path, while drop-frame, subframes and unverified text editors retain native input. A verified Curve Editor Time text editor additionally supports explicit one-digit keyboard staging, with native commit required. Sequencer's generic Value Stepper may be backed by frames, seconds, or ticks. Digit only uses a frame/second mapping if the owning Sequencer's native interface proves the conversion at consecutive values. Without an owner match, a generic stepper may qualify only as a genuinely unconverted nonzero scalar. Converted frame/second fields, Control Rig differing-value multi-edit annotations, non-spin Niagara controls, and editor-specific transaction behavior still require in-editor validation before claiming comprehensive coverage.
 
 ### International Number Formats
 
@@ -992,7 +1014,7 @@ Digit is configured for:
 
 | | |
 |---|---|
-| **Digit Version** | 1.0.16 |
+| **Digit Version** | 1.0.30 |
 | **Unreal Engine** | 5.8.x |
 | **Platform** | Windows 64-bit |
 | **Plugin Type** | Editor |
@@ -1067,7 +1089,7 @@ Digit works with existing compatible numeric controls rather than replacing them
 
 Digit currently targets standard Unreal Engine scrub-enabled `SSpinBox` numeric controls.
 
-Custom numeric widgets that do not use compatible Unreal Engine spin boxes are outside its current scope. Niagara slider-only, volume, and dropdown controls are examples; compatible Niagara inline spin boxes retain Niagara-owned parameter callbacks. Sequencer timecode and transformed time representations are not assumed to be ordinary decimal place values.
+Custom numeric widgets that do not use compatible Unreal Engine spin boxes are outside its current scope. Niagara slider-only, volume, and dropdown controls are examples; compatible Niagara inline spin boxes retain Niagara-owned parameter callbacks. Sequencer timecode and transformed time representations are not assumed to be ordinary decimal place values; verified non-drop-frame timecode spin boxes use Digit's component-aware tick path, and verified Curve Editor Time text fields support a selected-digit Ctrl+Alt+Up/Down staging shortcut.
 
 ### Slider Scrubbing Must Be Enabled
 

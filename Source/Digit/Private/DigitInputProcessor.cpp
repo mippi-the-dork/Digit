@@ -5,6 +5,10 @@
 
 #include "Fonts/FontMeasure.h"
 #include "Framework/Application/SlateApplication.h"
+#include "DigitTemporalDisplay.h"
+#include "DigitTemporalTimecode.h"
+#include "DigitTemporalQuantize.h"
+#include "DigitTemporalEditable.h"
 #include "Input/Events.h"
 #include "InputCoreTypes.h"
 #include "Layout/Children.h"
@@ -18,6 +22,9 @@
 #include "Rendering/SlateRenderer.h"
 #include "Styling/CoreStyle.h"
 #include "Widgets/Input/SSpinBox.h"
+#include "Widgets/Input/SEditableTextBox.h"
+#include "Widgets/Input/SEditableText.h"
+#include "Framework/Text/TextLayout.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/SBoxPanel.h"
@@ -199,9 +206,7 @@ namespace DigitPrivate
     // conversion is available through a verified public interface.
     static bool HasStructuredTimeDisplay(const FString& Text)
     {
-        return Text.Contains(TEXT(":")) || Text.Contains(TEXT(";"))
-            || Text.Contains(TEXT("[")) || Text.Contains(TEXT("]"))
-            || Text.Contains(TEXT("*"));
+        return DigitTemporalDisplay::IsStructuredTimeDisplay(Text);
     }
 
     // Some editor panels replace an ordinary numeric label with a relative
@@ -374,6 +379,31 @@ namespace DigitPrivate
             }
         }
         return FString();
+    }
+
+    // Sequencer's generic SValueStepper accepts a custom numeric type
+    // interface. If there is no owning Sequencer, we can only fall back to
+    // Digit's normal scalar path when the visible value is demonstrably the
+    // native value, NOT merely its rounded representation. Otherwise an
+    // unverified time conversion could produce a wrong step at nonzero values.
+    static bool IsUnconvertedNativeDisplay(const FString& Text, double NativeValue)
+    {
+        double DisplayValue = 0.0;
+        if (!FMath::IsFinite(NativeValue)
+            || !HasCanonicalNumericPrefix(Text)
+            || !GetNumericUnitSuffix(Text).IsEmpty()
+            || !ParseDisplayedNumber(Text, DisplayValue))
+        {
+            return false;
+        }
+        // A unit suffix belongs to a different converter: do not treat it as
+        // proof that the generic Sequencer stepper uses the native value.
+        // Ordinary digits must be a native-value identity even before taking
+        // rounding into account. Zero remains ambiguous and is rejected by
+        // the caller unless the host interface has been verified.
+        const double Tolerance = std::numeric_limits<double>::epsilon()
+            * FMath::Max(1.0, FMath::Abs(NativeValue)) * 4.0;
+        return FMath::Abs(NativeValue - DisplayValue) <= Tolerance;
     }
 
     // SSpinBox does not expose INumericTypeInterface or the source property's
@@ -615,6 +645,25 @@ namespace DigitPrivate
             * FMath::Max(1.0, FMath::Abs(WrappedDegrees));
         return FMath::Abs(WrappedDegrees - NearestDegree) <= DustTolerance
             ? NearestDegree : WrappedDegrees;
+    }
+
+    // IEEE-754 arithmetic can create tiny off-grid fractions between degrees,
+    // not just at whole degrees. Only remove double-rounding noise if the
+    // starting rotation was exactly on the visible decimal grid. Never erase
+    // meaningful subdegree precision that predates the drag.
+    static double StabilizeRotatorDecimalGrid(double WrappedDegrees,
+        bool bCleanInitialDisplay, double DisplayGrid)
+    {
+        if (!bCleanInitialDisplay || !FMath::IsFinite(WrappedDegrees)
+            || !FMath::IsFinite(DisplayGrid) || DisplayGrid <= 0.0)
+        {
+            return WrappedDegrees;
+        }
+        const double NearestGridValue = std::round(WrappedDegrees / DisplayGrid) * DisplayGrid;
+        const double DustTolerance = 16.0 * std::numeric_limits<double>::epsilon()
+            * FMath::Max(1.0, FMath::Abs(WrappedDegrees));
+        return FMath::Abs(WrappedDegrees - NearestGridValue) <= DustTolerance
+            ? NearestGridValue : WrappedDegrees;
     }
 
     static FString LocalizeStepText(FString Text)
@@ -914,8 +963,58 @@ namespace DigitPrivate
             || CanScrubDisplayedPlace<int8>(Widget, DigitPlace);
     }
 
+    // UE 5.8's SSpinBox<T> owns the displayed value as the first slot in its
+    // SHorizontalBox content. GetDisplayValue() is PROTECTED in UE 5.8, so a
+    // plugin must not call it. Instead, inspect the native value-label widget
+    // through Slate's public child hierarchy. This also distinguishes the
+    // editable value from unrelated informational text nearby.
+    static TSharedPtr<STextBlock> GetNativeSpinValueLabel(const TSharedRef<SWidget>& SpinWidget)
+    {
+        FChildren* RootChildren = SpinWidget->GetChildren();
+        if (!RootChildren || RootChildren->Num() != 1)
+        {
+            return nullptr;
+        }
+
+        const TSharedRef<SWidget> LayoutWidget = RootChildren->GetChildAt(0);
+        if (LayoutWidget->GetType() != FName(TEXT("SHorizontalBox")))
+        {
+            return nullptr;
+        }
+
+        FChildren* LayoutChildren = LayoutWidget->GetChildren();
+        if (!LayoutChildren || LayoutChildren->Num() < 2)
+        {
+            return nullptr;
+        }
+
+        const TSharedRef<SWidget> ValueWidget = LayoutChildren->GetChildAt(0);
+        if (ValueWidget->GetType() != FName(TEXT("STextBlock")))
+        {
+            return nullptr;
+        }
+
+        const TSharedRef<STextBlock> ValueText = StaticCastSharedRef<STextBlock>(ValueWidget);
+        const EVisibility Visibility = ValueText->GetVisibility();
+        if (Visibility == EVisibility::Hidden || Visibility == EVisibility::Collapsed)
+        {
+            // SSpinBox collapses the display text during native text entry.
+            return nullptr;
+        }
+        return ValueText;
+    }
+
+    static bool IsVisibleValueLabel(const TSharedRef<STextBlock>& Widget, const FString& ExpectedDisplay)
+    {
+        const EVisibility Visibility = Widget->GetVisibility();
+        return Visibility != EVisibility::Hidden
+            && Visibility != EVisibility::Collapsed
+            && Widget->GetText().ToString() == ExpectedDisplay;
+    }
+
     static TSharedPtr<STextBlock> FindTextUnderSpinBox(
         const TSharedRef<SWidget>& Widget,
+        const FString& ExpectedDisplay,
         const FVector2D& ScreenPosition,
         int32 RemainingDepth = 20)
     {
@@ -926,17 +1025,7 @@ namespace DigitPrivate
         if (Widget->GetType() == FName(TEXT("STextBlock")))
         {
             const TSharedRef<STextBlock> TextWidget = StaticCastSharedRef<STextBlock>(Widget);
-            const FString Text = TextWidget->GetText().ToString();
-            bool bHasDigit = false;
-            for (TCHAR Character : Text)
-            {
-                if (IsDigitCharacter(Character))
-                {
-                    bHasDigit = true;
-                    break;
-                }
-            }
-            if (bHasDigit)
+            if (IsVisibleValueLabel(TextWidget, ExpectedDisplay))
             {
                 const FGeometry& Geometry = TextWidget->GetTickSpaceGeometry();
                 const FVector2D LocalPosition = Geometry.AbsoluteToLocal(ScreenPosition);
@@ -959,7 +1048,7 @@ namespace DigitPrivate
         for (int32 Index = 0; Index < Children->Num(); ++Index)
         {
             if (TSharedPtr<STextBlock> Candidate = FindTextUnderSpinBox(
-                Children->GetChildAt(Index), ScreenPosition, RemainingDepth - 1))
+                Children->GetChildAt(Index), ExpectedDisplay, ScreenPosition, RemainingDepth - 1))
             {
                 return Candidate;
             }
@@ -1020,6 +1109,12 @@ void FDigitInputProcessor::ApplyDigitCursor()
 
 void FDigitInputProcessor::Tick(const float DeltaTime, FSlateApplication& SlateApp, TSharedRef<ICursor> Cursor)
 {
+    if (LastStagedEditable.IsValid()
+        && SlateApp.GetKeyboardFocusedWidget().Get() != LastStagedEditable.Pin().Get())
+    {
+        LastStagedEditable.Reset();
+        LastStagedSource.Reset();
+    }
     if (!HasActiveSession() || bRestorePending)
     {
         return;
@@ -1054,6 +1149,123 @@ void FDigitInputProcessor::Tick(const float DeltaTime, FSlateApplication& SlateA
 
 bool FDigitInputProcessor::HandleKeyDownEvent(FSlateApplication& SlateApp, const FKeyEvent& InKeyEvent)
 {
+    // An explicit keyboard-only path for Curve Editor Time's text editor.
+    // Keep this separate from SSpinBox capture: SEditableTextBox has no
+    // public numeric slider transaction or external OnTextCommitted call.
+    // Stage a valid formatted edit, then let Enter / focus loss invoke the
+    // original FFrameNumberDetailsCustomization property-handle callback.
+    if (!HasActiveSession() && !bRestorePending
+        && InKeyEvent.IsControlDown() && InKeyEvent.IsAltDown()
+        && !InKeyEvent.IsShiftDown()
+        && (InKeyEvent.GetKey() == EKeys::Up || InKeyEvent.GetKey() == EKeys::Down))
+    {
+        const TSharedPtr<SWidget> FocusedWidget = SlateApp.GetKeyboardFocusedWidget();
+        if (FocusedWidget.IsValid()
+            && FocusedWidget->GetType() == FName(TEXT("SEditableText")))
+        {
+            const FWidgetPath Path = SlateApp.LocateWindowUnderMouse(
+                SlateApp.GetCursorPos(),
+                SlateApp.GetInteractiveTopLevelWindows(),
+                false, InKeyEvent.GetUserIndex());
+            int32 CurvePanelIndex = INDEX_NONE;
+            int32 TextBoxIndex = INDEX_NONE;
+            int32 EditableIndex = INDEX_NONE;
+            for (int32 Index = 0; Index < Path.Widgets.Num(); ++Index)
+            {
+                const TSharedRef<SWidget>& Item = Path.Widgets[Index].Widget;
+                if (Item->GetType() == FName(TEXT("SCurveKeyDetailPanel")))
+                {
+                    CurvePanelIndex = Index;
+                }
+                else if (Item->GetType() == FName(TEXT("SEditableTextBox")))
+                {
+                    TextBoxIndex = Index;
+                }
+                else if (&Item.Get() == FocusedWidget.Get()
+                    && Item->GetType() == FName(TEXT("SEditableText")))
+                {
+                    EditableIndex = Index;
+                }
+            }
+            if (CurvePanelIndex != INDEX_NONE
+                && TextBoxIndex > CurvePanelIndex
+                && EditableIndex > TextBoxIndex)
+            {
+                // UE 5.8.3 SCurveKeyDetailPanel uses an SHorizontalBox:
+                // child 0 is Time, child 1 is Value. The temporary loading
+                // placeholder must not qualify as a frame editor.
+                bool bInsideTimeBranch = false;
+                for (int32 Index = CurvePanelIndex + 1; Index < TextBoxIndex; ++Index)
+                {
+                    const TSharedRef<SWidget>& Item = Path.Widgets[Index].Widget;
+                    if (Item->GetType() == FName(TEXT("SHorizontalBox")))
+                    {
+                        FChildren* Children = Item->GetChildren();
+                        if (Children && Children->Num() == 2
+                            && Index + 1 < Path.Widgets.Num())
+                        {
+                            bInsideTimeBranch = &Children->GetChildAt(0).Get()
+                                == &Path.Widgets[Index + 1].Widget.Get();
+                        }
+                        break;
+                    }
+                }
+                if (bInsideTimeBranch)
+                {
+                    const TSharedRef<SEditableTextBox> TextBox =
+                        StaticCastSharedRef<SEditableTextBox>(Path.Widgets[TextBoxIndex].Widget);
+                    const TSharedRef<SEditableText> Editable =
+                        StaticCastSharedRef<SEditableText>(Path.Widgets[EditableIndex].Widget);
+                    bool bHostEnabled = !TextBox->IsReadOnly() && !TextBox->IsPassword()
+                        && !Editable->IsTextReadOnly();
+                    for (int32 Index = CurvePanelIndex; Index <= EditableIndex; ++Index)
+                    {
+                        const TSharedRef<SWidget>& Item = Path.Widgets[Index].Widget;
+                        const EVisibility Visibility = Item->GetVisibility();
+                        bHostEnabled &= Item->IsEnabled()
+                            && Visibility != EVisibility::Collapsed
+                            && Visibility != EVisibility::Hidden;
+                    }
+                    if (bHostEnabled)
+                    {
+                        // Require exactly one explicitly selected digit.
+                        // Never reinterpret a caret or multi-digit selection.
+                        const FString DisplayText = TextBox->GetText().ToString();
+                        int32 CharacterIndex = INDEX_NONE;
+                        if (DigitTemporalEditable::TryGetSingleSelectedDigit(
+                            Editable->GetSelection(), DisplayText, CharacterIndex))
+                        {
+                            // SEditableText::GetText reports its BOUND source,
+                            // not necessarily the uncommitted edit buffer.
+                            // Do not calculate another step from stale source
+                            // text after SetEditableText has staged a change.
+                            // Clear the guard when focus exits or the host
+                            // genuinely updates its bound property.
+                            if (LastStagedEditable.Pin().Get() == &Editable.Get()
+                                && DisplayText == LastStagedSource)
+                            {
+                                return false;
+                            }
+                            FString NextDisplay;
+                            const int32 Direction = InKeyEvent.GetKey() == EKeys::Up ? 1 : -1;
+                            if (FDigitSequencerContext::TryStepEditableNonDropTimecode(
+                                    Path, DisplayText, CharacterIndex, Direction, NextDisplay)
+                                && Editable->SetEditableText(FText::FromString(NextDisplay)))
+                            {
+                                LastStagedEditable = Editable;
+                                LastStagedSource = DisplayText;
+                                Editable->SelectText(
+                                    FTextLocation(0, CharacterIndex),
+                                    FTextLocation(0, CharacterIndex + 1));
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if (InKeyEvent.GetKey() == EKeys::Escape
         && HasActiveSession()
         && !bRestorePending
@@ -1449,6 +1661,16 @@ bool FDigitInputProcessor::FindNumericHit(FSlateApplication& SlateApp, const FPo
         return false;
     }
 
+    // Some Slate windows (notably virtual/drag-drop windows) do not construct
+    // an overlay. Digit draws its digit marker, drag outline, and value ladder
+    // in SWindow overlay slots. Do not arm custom numeric input in a window
+    // where those visuals cannot be hosted; let the native widget handle it.
+    const TSharedPtr<SWindow> NumericWindow = SlateApp.FindWidgetWindow(Path.Widgets[SpinBoxPathIndex].Widget);
+    if (!NumericWindow.IsValid() || !NumericWindow->HasOverlay())
+    {
+        return false;
+    }
+
     // Identify rotators *before* unit eligibility, including at displayed
     // zero. SNumericRotatorInputBox supplies native degrees; other scalar
     // fields with a degree suffix have no such guarantee.
@@ -1550,6 +1772,17 @@ bool FDigitInputProcessor::FindNumericHit(FSlateApplication& SlateApp, const FPo
     }
 
     const TSharedRef<SWidget>& SpinWidget = Path.Widgets[SpinBoxPathIndex].Widget;
+    const TSharedPtr<STextBlock> NativeValueText = DigitPrivate::GetNativeSpinValueLabel(SpinWidget);
+    if (!NativeValueText.IsValid())
+    {
+        return false;
+    }
+    const FString NativeDisplayString = NativeValueText->GetText().ToString();
+    if (NativeDisplayString.IsEmpty())
+    {
+        return false;
+    }
+
     TSharedPtr<STextBlock> TextWidget;
     FGeometry TextGeometry;
     if (TextPathIndex > SpinBoxPathIndex)
@@ -1560,7 +1793,7 @@ bool FDigitInputProcessor::FindNumericHit(FSlateApplication& SlateApp, const FPo
     else
     {
         TextWidget = DigitPrivate::FindTextUnderSpinBox(
-            SpinWidget, MouseEvent.GetScreenSpacePosition());
+            SpinWidget, NativeDisplayString, MouseEvent.GetScreenSpacePosition());
         if (TextWidget.IsValid())
         {
             TextGeometry = TextWidget->GetTickSpaceGeometry();
@@ -1571,40 +1804,78 @@ bool FDigitInputProcessor::FindNumericHit(FSlateApplication& SlateApp, const FPo
         return false;
     }
 
-    const FText DisplayText = TextWidget->GetText();
-    const FString DisplayString = DisplayText.ToString();
-    if (DisplayString.IsEmpty())
+    // The hit-test path can also contain informational numeric labels or
+    // an SSpinBox's collapsed display label while it is in text-edit mode.
+    // Only the *visible, bound value label* constructed by SSpinBox qualifies.
+    if (TextWidget != NativeValueText
+        || !DigitPrivate::IsVisibleValueLabel(TextWidget.ToSharedRef(), NativeDisplayString))
     {
         return false;
     }
+
+    const FText DisplayText = TextWidget->GetText();
+    const FString DisplayString = NativeDisplayString;
 
     // UE's numeric type interface may append "..." when the displayed
     // decimal is rounded away from a nonzero (often extremely small) value.
     // Selecting a digit in the rounded string would suggest an inaccurate
     // step and can mislead users into overwriting values they cannot see.
-    if (DisplayString.Contains(TEXT("...")))
+    const bool bStructuredDisplay = DigitPrivate::HasStructuredTimeDisplay(DisplayString);
+    const bool bTimecodeCandidate = bStructuredDisplay
+        && DisplayString.StartsWith(TEXT("["))
+        && DisplayString.EndsWith(TEXT("]"))
+        && (NumericOwner == ENumericOwner::SequencerValueStepper || bCurveKeyTimeField)
+        && DigitPrivate::IsWidgetClass<double>(SpinWidget);
+    if (DisplayString.Contains(TEXT("..."))
+        || (bStructuredDisplay && !bTimecodeCandidate)
+        || (!bTimecodeCandidate && !DigitPrivate::HasCanonicalNumericPrefix(DisplayString)))
     {
         return false;
     }
 
-    // SValueStepper accepts any INumericTypeInterface<double>, including
-    // Sequencer's frame-number interface. Curve Editor key Time also has its
-    // own frame/tick resolution semantics. At displayed zero, native units
-    // cannot be inferred from display text: 0 ticks, seconds and frames all
-    // look identical. Value-field zero and other proven 1:1 fields are not
-    // subject to this ambiguity.
-    if ((NumericOwner == ENumericOwner::SequencerValueStepper || bCurveKeyTimeField)
-        && DigitPrivate::IsDisplayedZero(DisplayString))
+    // A Sequencer stepper may display frames or seconds while storing ticks.
+    // Ask the actual owning Sequencer and verify its numeric interface's
+    // ToString/FromString mapping before using any frame-aware magnitude.
+    // In particular, 0 frames and 0 ticks cannot be resolved by a ratio.
+    TOptional<FDigitTemporalSpinContext> TemporalContext;
+    const bool bPotentialTemporalField = NumericOwner == ENumericOwner::SequencerValueStepper
+        || bCurveKeyTimeField;
+    if (bPotentialTemporalField && !bTimecodeCandidate
+        && DigitPrivate::IsWidgetClass<double>(SpinWidget))
     {
-        return false;
+        const double NativeValue = StaticCastSharedRef<SSpinBox<double>>(SpinWidget)->GetValue();
+        FDigitTemporalSpinContext VerifiedContext;
+        if (FDigitSequencerContext::Resolve(Path, DisplayString, NativeValue, VerifiedContext))
+        {
+            TemporalContext = VerifiedContext;
+        }
+    }
+    if (bPotentialTemporalField && !bTimecodeCandidate && !TemporalContext.IsSet())
+    {
+        // Curve key Time belongs to a timeline, even when its displayed
+        // number is nonzero. Never guess a tick/frame ratio from that number.
+        // SValueStepper is a generic widget: allow its *nonzero* ordinary
+        // scalar values only when the visible and stored values match at
+        // double precision, with no inferred numeric conversion.
+        const double NativeValue = DigitPrivate::IsWidgetClass<double>(SpinWidget)
+            ? StaticCastSharedRef<SSpinBox<double>>(SpinWidget)->GetValue()
+            : 0.0;
+        if (bCurveKeyTimeField || DigitPrivate::IsDisplayedZero(DisplayString)
+            || !DigitPrivate::IsWidgetClass<double>(SpinWidget)
+            || !DigitPrivate::IsUnconvertedNativeDisplay(DisplayString, NativeValue))
+        {
+            return false;
+        }
     }
 
     // A converted unit with an unknown scale is not digit-safe. Reject it
     // during hover as well as mouse-down so the highlight never promises a
-    // scrubbing magnitude that the plugin cannot honor.
-    if (!DigitPrivate::CanRepresentDisplayedMagnitude(
-        SpinWidget, DisplayString, bIsRotatorComponent,
-        NumericOwner == ENumericOwner::NiagaraParameter))
+    // scrubbing magnitude that the plugin cannot honor. A temporal field
+    // with a verified host conversion is the one exception at displayed zero.
+    if (!TemporalContext.IsSet() && !bTimecodeCandidate
+        && !DigitPrivate::CanRepresentDisplayedMagnitude(
+            SpinWidget, DisplayString, bIsRotatorComponent,
+            NumericOwner == ENumericOwner::NiagaraParameter))
     {
         return false;
     }
@@ -1645,14 +1916,31 @@ bool FDigitInputProcessor::FindNumericHit(FSlateApplication& SlateApp, const FPo
     }
 
     int32 DigitPlace = 0;
-    if (!ResolveDigitPlace(DisplayString, CharacterIndex, DigitPlace))
+    if (bTimecodeCandidate)
+    {
+        // Timecode magnitude is component-aware, not a decimal place.
+        // Store the exact character index and resolve its native tick size
+        // from the verified owning Sequencer numeric interface.
+        FDigitTemporalSpinContext VerifiedTimecode;
+        const double NativeValue =
+            StaticCastSharedRef<SSpinBox<double>>(SpinWidget)->GetValue();
+        if (!FDigitSequencerContext::ResolveNonDropTimecode(
+            Path, DisplayString, NativeValue, CharacterIndex, VerifiedTimecode))
+        {
+            return false;
+        }
+        TemporalContext = VerifiedTimecode;
+        DigitPlace = CharacterIndex;
+    }
+    else if (!ResolveDigitPlace(DisplayString, CharacterIndex, DigitPlace))
     {
         return false;
     }
     // The text may contain a digit that the backing numeric type cannot
     // actually adjust (fractional places on integral spin boxes or enormous
     // places beyond safe 64-bit integer precision). Do not highlight it.
-    if (!DigitPrivate::CanScrubDisplayedPlace(SpinWidget, DigitPlace))
+    if (!bTimecodeCandidate
+        && !DigitPrivate::CanScrubDisplayedPlace(SpinWidget, DigitPlace))
     {
         return false;
     }
@@ -1661,6 +1949,7 @@ bool FDigitInputProcessor::FindNumericHit(FSlateApplication& SlateApp, const FPo
     OutHit.bRotatorComponent = bIsRotatorComponent;
     OutHit.bCurveKeyTimeField = bCurveKeyTimeField;
     OutHit.Owner = NumericOwner;
+    OutHit.TemporalContext = TemporalContext;
     OutHit.TextWidget = TextWidget;
     OutHit.TextGeometry = TextGeometry;
     OutHit.CharacterIndex = CharacterIndex;
@@ -1808,6 +2097,8 @@ bool FDigitInputProcessor::ArmSpinBox(const FNumericHit& Hit, int32 PointerIndex
         ActiveTextWidget = Hit.TextWidget;
         ActivePointerIndex = PointerIndex;
         ActiveDigitPlace = Hit.DigitPlace;
+        bActiveNonDropTimecode = Hit.TemporalContext.IsSet()
+            && Hit.TemporalContext.GetValue().bNonDropTimecode;
         PhysicalDragDistance = 0.0f;
         bDigitDragStarted = false;
         bActiveDigitScrubSuspended = false;
@@ -1815,7 +2106,7 @@ bool FDigitInputProcessor::ArmSpinBox(const FNumericHit& Hit, int32 PointerIndex
         PendingRestorePostTicks = 0;
         PendingCapturePostTicks = 0;
         bAwaitingNativeCapture = true;
-        bLadderModeActive = bUseLadder;
+        bLadderModeActive = bUseLadder && !bActiveNonDropTimecode;
         LadderOriginDigitPlace = Hit.DigitPlace;
         LadderSelectedDigitPlace = Hit.DigitPlace;
         LadderVerticalTravel = 0.0f;
@@ -1860,8 +2151,19 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         return false;
     }
 
+    const bool bNonDropTimecode = Hit.TemporalContext.IsSet()
+        && Hit.TemporalContext.GetValue().bNonDropTimecode;
+    if (bNonDropTimecode && !std::is_same<NumericType, double>::value)
+    {
+        return false;
+    }
     NumericType InitialDesiredStep = NumericType(0);
-    if (!DigitPrivate::MakeStepForPlace<NumericType>(Hit.DigitPlace, InitialDesiredStep))
+    if (bNonDropTimecode)
+    {
+        InitialDesiredStep = static_cast<NumericType>(
+            Hit.TemporalContext.GetValue().NativeTimecodeTickStep);
+    }
+    else if (!DigitPrivate::MakeStepForPlace<NumericType>(Hit.DigitPlace, InitialDesiredStep))
     {
         return false;
     }
@@ -1942,7 +2244,8 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
     // Take the precision-preserving route only when the finest selected
     // magnitude (including Ctrl and the optional Value Ladder) approaches
     // that float fraction's precision, leaving ordinary sliders native.
-    const int32 FinestReachablePlace = Hit.DigitPlace - (bUseLadder ? 4 : 1);
+    const int32 FinestReachablePlace = bNonDropTimecode
+        ? 0 : Hit.DigitPlace - (bUseLadder ? 4 : 1);
     const double FinestReachableStep = FMath::Pow(10.0, static_cast<double>(FinestReachablePlace));
     const bool bRoutePrecisionLimitedLinearValuesDirectly = bBoundedSliderRange
         && !TIsIntegral<NumericType>::Value
@@ -1958,7 +2261,8 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
     // Constrain rotator detection to the actual rotator widget hierarchy.
     const bool bRouteIntegersDirectly = TIsIntegral<NumericType>::Value;
     const bool bRouteRotatorsDirectly = Hit.bRotatorComponent && !TIsIntegral<NumericType>::Value;
-    const bool bRouteValueDirectly = bRouteNonlinearValuesDirectly
+    const bool bRouteValueDirectly = bNonDropTimecode
+        || bRouteNonlinearValuesDirectly
         || bRoutePrecisionLimitedLinearValuesDirectly
         || bRouteIntegersDirectly || bRouteRotatorsDirectly;
 
@@ -1994,7 +2298,11 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         }
     };
 
-    RestoreDeltaFunction = [WeakSpinBox, OriginalDelta, OriginalValueAttribute, bDirectValueAssigned]()
+    // Shared between the arm path and cleanup, including capture loss.
+    const TSharedRef<bool> bPinnedFractionalDisplayWidth = MakeShared<bool>(false);
+    const int32 SavedMinFractionalDigits = SpinBox->GetMinFractionalDigits();
+    RestoreDeltaFunction = [WeakSpinBox, OriginalDelta, OriginalValueAttribute, bDirectValueAssigned,
+        bPinnedFractionalDisplayWidth, SavedMinFractionalDigits]()
     {
         if (const TSharedPtr<SSpinBox<NumericType>> PinnedSpinBox = WeakSpinBox.Pin())
         {
@@ -2012,15 +2320,35 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
                 PinnedSpinBox->SetValue(OriginalValueAttribute);
             }
             PinnedSpinBox->SetDelta(OriginalDelta);
+            if (*bPinnedFractionalDisplayWidth)
+            {
+                // Restoration runs after the host's native mouse-up commit,
+                // not during it. Restore the exact original formatter minimum
+                // (including when this numeric interface is shared by other
+                // fields), so native trailing-zero trimming resumes.
+                PinnedSpinBox->SetMinFractionalDigits(
+                    TAttribute<TOptional<int32>>(TOptional<int32>(SavedMinFractionalDigits)));
+            }
         }
     };
 
     // Repeat the temporal preflight at capture time. A Sequencer stepper may
     // change formatting between hover and mouse-down without changing its
     // widget identity.
-    if ((Hit.Owner == ENumericOwner::SequencerValueStepper || Hit.bCurveKeyTimeField)
-        && DigitPrivate::IsDisplayedZero(Hit.DisplayString))
+    const bool bTemporalCandidate = Hit.Owner == ENumericOwner::SequencerValueStepper
+        || Hit.bCurveKeyTimeField;
+    const bool bStaleHostTemporalConversion = Hit.TemporalContext.IsSet()
+        && !FDigitSequencerContext::IsStillCurrent(Hit.TemporalContext.GetValue());
+    const bool bUnverifiedTemporalField = bTemporalCandidate
+        && !Hit.TemporalContext.IsSet()
+        && (Hit.bCurveKeyTimeField
+            || DigitPrivate::IsDisplayedZero(Hit.DisplayString)
+            || !DigitPrivate::IsUnconvertedNativeDisplay(
+                Hit.DisplayString, static_cast<double>(SpinBox->GetValue())));
+    if (bStaleHostTemporalConversion || bUnverifiedTemporalField)
     {
+        // No temporary value binding has been installed yet. Leave the
+        // native spin box and its host transaction in control.
         SpinBox->SetDelta(OriginalDelta);
         ApplySelectedDeltaFunction = nullptr;
         RestoreDeltaFunction = nullptr;
@@ -2028,9 +2356,13 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
     }
 
     const double InitialDigitValue = static_cast<double>(SpinBox->GetValue());
-    const TOptional<double> ResolvedDisplayScale = DigitPrivate::ResolveDisplayToNativeScale(
-        InitialDigitValue, Hit.DisplayString, Hit.bRotatorComponent,
-        Hit.Owner == ENumericOwner::NiagaraParameter);
+    const TOptional<double> ResolvedDisplayScale = bNonDropTimecode
+        ? TOptional<double>(1.0)
+        : Hit.TemporalContext.IsSet()
+        ? TOptional<double>(Hit.TemporalContext.GetValue().NativePerDisplayedUnit)
+        : DigitPrivate::ResolveDisplayToNativeScale(
+            InitialDigitValue, Hit.DisplayString, Hit.bRotatorComponent,
+            Hit.Owner == ENumericOwner::NiagaraParameter);
     if (!ResolvedDisplayScale.IsSet())
     {
         // A visible unit conversion is not always a simple ratio (and the
@@ -2051,7 +2383,27 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
     const double DisplayScale = ResolvedDisplayScale.GetValue();
     const FString InitialUnitSuffix = DigitPrivate::GetNumericUnitSuffix(Hit.DisplayString);
     const TWeakPtr<STextBlock> WeakDisplayText = Hit.TextWidget;
-    const int32 DisplayFractionDigits = CountFractionalDigits(Hit.DisplayString, Hit.CharacterIndex);
+    const int32 DisplayFractionDigits = bNonDropTimecode
+        ? 0 : CountFractionalDigits(Hit.DisplayString, Hit.CharacterIndex);
+    // Any floating-point spin box can trim insignificant trailing zeros (e.g.
+    // 1.234570 becomes 1.23457). Doing that mid-drag deletes the selected
+    // rightmost digit after a carry. Hold the original displayed fractional
+    // width for this mouse-captured session, including values with native unit
+    // suffixes, then restore the host formatter after native mouse-up. This
+    // changes only presentation, never the stored numeric value.
+    const int32 OriginalMinFractionalDigits = SpinBox->GetMinFractionalDigits();
+    const int32 OriginalMaxFractionalDigits = SpinBox->GetMaxFractionalDigits();
+    // This is a FLOATING-POINT display rule, not a Rotation rule. Location,
+    // Scale, ordinary float/double properties and editor-specific numeric
+    // spin boxes all lose the selected digit if a carry creates a trailing
+    // zero and their numeric interface trims it while mouse capture is held.
+    // Keep the starting fractional width for any eligible scalar spin box.
+    // Never change integer or structured timecode presentation, and do not
+    // exceed the host numeric formatter's existing maximum precision.
+    const bool bPinFractionalDisplayWidth = !TIsIntegral<NumericType>::Value
+        && !bNonDropTimecode
+        && DisplayFractionDigits > OriginalMinFractionalDigits
+        && DisplayFractionDigits <= OriginalMaxFractionalDigits;
     // Only clean up numerical dust when the starting rotator value was on
     // its visible decimal grid. Preserve off-grid source precision, including
     // values that were already extremely close to a whole degree.
@@ -2072,7 +2424,9 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
     // immediately before native mouse-up, not only on horizontal movement.
     VerifyActiveDisplayFunction = [
         this, WeakSpinBox, WeakDisplayText, InitialUnitSuffix,
-        DisplayFractionDigits, WorkingDelta]()
+        DisplayFractionDigits, WorkingDelta, bNonDropTimecode,
+        TimecodeCharacterIndex = Hit.CharacterIndex,
+        TemporalContext = Hit.TemporalContext]()
     {
         if (bActiveDigitScrubSuspended)
         {
@@ -2088,12 +2442,34 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         const FString CurrentSuffix = DigitPrivate::GetNumericUnitSuffix(CurrentDisplay);
         const int32 CurrentFractionDigits =
             DigitPrivate::GetDisplayedFractionalDigitCount(CurrentDisplay);
-        const bool bUnsupportedDisplay = CurrentDisplay.IsEmpty()
+        bool bUnsupportedDisplay = CurrentDisplay.IsEmpty()
             || CurrentDisplay.Contains(TEXT("..."))
-            || DigitPrivate::HasStructuredTimeDisplay(CurrentDisplay)
-            || !DigitPrivate::HasCanonicalNumericPrefix(CurrentDisplay)
-            || CurrentFractionDigits != DisplayFractionDigits;
-        if (CurrentSuffix != InitialUnitSuffix || bUnsupportedDisplay)
+            || (TemporalContext.IsSet()
+                && !FDigitSequencerContext::IsStillCurrent(TemporalContext.GetValue()));
+        if (bNonDropTimecode)
+        {
+            DigitTemporalTimecode::FDigitStep CurrentStep;
+            bUnsupportedDisplay = bUnsupportedDisplay
+                || !TemporalContext.IsSet()
+                || !DigitTemporalTimecode::TryGetNonDropFrameDigitStep(
+                    CurrentDisplay, TimecodeCharacterIndex,
+                    TemporalContext.GetValue().TickResolution,
+                    TemporalContext.GetValue().DisplayRate, CurrentStep)
+                || CurrentStep.NativeTickStep
+                    != TemporalContext.GetValue().NativeTimecodeTickStep;
+        }
+        else
+        {
+            bUnsupportedDisplay = bUnsupportedDisplay
+                || DigitPrivate::HasStructuredTimeDisplay(CurrentDisplay)
+                || !DigitPrivate::HasCanonicalNumericPrefix(CurrentDisplay)
+                || CurrentFractionDigits != DisplayFractionDigits;
+        }
+        // A timecode's "suffix" would include its remaining components,
+        // which naturally change as frames roll over. Only compare decimal
+        // unit suffixes for ordinary numeric displays.
+        if ((!bNonDropTimecode && CurrentSuffix != InitialUnitSuffix)
+            || bUnsupportedDisplay)
         {
             bActiveDigitScrubSuspended = true;
             *WorkingDelta = NumericType(0);
@@ -2180,6 +2556,9 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         bMonitorSpecializedSource,
         DisplayScale,
         DisplayFractionDigits,
+        bNonDropTimecode,
+        TimecodeNativeTickStep = bNonDropTimecode
+            ? static_cast<double>(Hit.TemporalContext.GetValue().NativeTimecodeTickStep) : 0.0,
         bBoundedSliderRange,
         SliderRange,
         NativeBaseStep,
@@ -2195,8 +2574,10 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         RecentDirectWrites,
         InitialDigitValue,
         bCleanInitialRotatorDisplay,
+        RotatorDisplayGrid,
         RotationAccumulatedChange = 0.0,
         RotationChangeCorrection = 0.0,
+        TimecodeAccumulatedTickChange = 0.0,
         bLoggedPrecisionLimit = false](
             const FPointerEvent& MouseEvent,
             bool bScaleMovement,
@@ -2210,7 +2591,11 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         }
 
         NumericType DesiredStep = NumericType(0);
-        if (!DigitPrivate::MakeStepForPlace<NumericType>(DigitPlace, DesiredStep))
+        if (bNonDropTimecode)
+        {
+            DesiredStep = static_cast<NumericType>(TimecodeNativeTickStep);
+        }
+        else if (!DigitPrivate::MakeStepForPlace<NumericType>(DigitPlace, DesiredStep))
         {
             return false;
         }
@@ -2276,8 +2661,18 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
             // the cumulative drag angle (which can grow through many turns).
             const double RepresentedValue = bRouteRotatorsDirectly ? ObservedValue : DigitValue;
             const double ApproxUlp = DigitPrivate::GetNumericResolution<NumericType>(RepresentedValue);
-            const bool bUnrepresentableStep = !TIsIntegral<NumericType>::Value
-                && FMath::Abs(NativeStep * InputMultiplier) < ApproxUlp * 0.50;
+            // In a float-backed Rotator a one-ULP change is technically
+            // representable but often cannot preserve the SELECTED decimal
+            // place. For example at 75 degrees a float ULP is ~0.0000076:
+            // attempting to edit 0.00001 produces 75.000007629..., which
+            // can shorten the visible digits or invoke scientific/ellipsis
+            // formatting. Require at least eight storage ULPs per selected
+            // unmodified place, and leave finer digits native/unchanged.
+            const bool bRotatorDigitBelowStoragePrecision = bRouteRotatorsDirectly
+                && FMath::Abs(NativeStep) < ApproxUlp * 8.0;
+            const bool bUnrepresentableStep = (!TIsIntegral<NumericType>::Value
+                && FMath::Abs(NativeStep * InputMultiplier) < ApproxUlp * 0.50)
+                || bRotatorDigitBelowStoragePrecision;
             if (bUnrepresentableStep)
             {
                 RoutedDelta.X = 0.0;
@@ -2329,6 +2724,48 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
             {
                 RoutedDelta.X = 0.0f;
             }
+            else if (bNonDropTimecode)
+            {
+                // Keep non-drop timecode on the integral selected-digit tick
+                // grid. Shift/Ctrl alter cursor sensitivity, never create a
+                // fractional frame or bypass Sequencer's native mouse-up
+                // commit. Sum movement from the original value so reversal
+                // does not accumulate floating-point rounding error.
+                TimecodeAccumulatedTickChange += RequestedChange;
+                std::int64_t NativeTickOffset = 0;
+                const bool bExactStep = DigitTemporalQuantize::TryWholeSelectedSteps(
+                    TimecodeAccumulatedTickChange,
+                    static_cast<std::int64_t>(TimecodeNativeTickStep),
+                    NativeTickOffset);
+                const double TargetNativeValue = InitialDigitValue
+                    + static_cast<double>(NativeTickOffset);
+                if (bExactStep && FMath::IsFinite(TargetNativeValue)
+                    && TargetNativeValue >= static_cast<double>(MIN_int32)
+                    && TargetNativeValue <= static_cast<double>(MAX_int32)
+                    && TargetNativeValue >= MinValueAsDouble
+                    && TargetNativeValue <= MaxValueAsDouble)
+                {
+                    const NumericType TargetNative = static_cast<NumericType>(TargetNativeValue);
+                    if (TargetNative != *LastWrittenNative)
+                    {
+                        PinnedSpinBox->SetDelta(NumericType(0));
+                        PinnedSpinBox->SetValue(TAttribute<NumericType>(TargetNative));
+                        *LastWrittenNative = TargetNative;
+                        *bDirectValueAssigned = true;
+                        if (bMonitorSpecializedSource)
+                        {
+                            RecentDirectWrites->Add(TargetNative);
+                            if (RecentDirectWrites->Num() > 8)
+                            {
+                                RecentDirectWrites->RemoveAt(0);
+                            }
+                        }
+                    }
+                }
+                RoutedDelta.X = 0.0f;
+                *WorkingDelta = NumericType(0);
+                return true;
+            }
             else if (bRouteValueDirectly)
             {
                 // Avoid the float-valued slider fraction for integers and
@@ -2364,6 +2801,8 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
                     TargetValue -= 180.0;
                     TargetValue = DigitPrivate::StabilizeRotatorWholeDegree(
                         TargetValue, bCleanInitialRotatorDisplay);
+                    TargetValue = DigitPrivate::StabilizeRotatorDecimalGrid(
+                        TargetValue, bCleanInitialRotatorDisplay, RotatorDisplayGrid);
                     TargetValue = FMath::Clamp(TargetValue, MinValueAsDouble, MaxValueAsDouble);
                 }
                 else
@@ -2420,6 +2859,33 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
                     }
 
                     const NumericType TargetNative = static_cast<NumericType>(TargetValue);
+                    if (bRouteRotatorsDirectly)
+                    {
+                        // A float conversion can remove more of the selected
+                        // digit than the UI can convey, despite a large enough
+                        // nominal ULP step. Reject that write and preserve the
+                        // native source until a coarser place is chosen.
+                        const double StorageError = FMath::Abs(
+                            static_cast<double>(TargetNative) - TargetValue);
+                        const double SelectedPlaceTolerance = FMath::Abs(NativeStep) * 0.10;
+                        const FNumberFormattingOptions FormattingOptions = FNumberFormattingOptions()
+                            .SetUseGrouping(false)
+                            .SetMinimumFractionalDigits(PinnedSpinBox->GetMinFractionalDigits())
+                            .SetMaximumFractionalDigits(PinnedSpinBox->GetMaxFractionalDigits())
+                            .SetIndicateNearlyInteger(true);
+                        const FString Preview = FastDecimalFormat::NumberToString(
+                            TargetNative, ExpressionParser::GetLocalizedNumberFormattingRules(),
+                            FormattingOptions);
+                        if (StorageError > SelectedPlaceTolerance
+                            || Preview.Contains(TEXT("..."))
+                            || Preview.Contains(TEXT("e+"), ESearchCase::IgnoreCase)
+                            || Preview.Contains(TEXT("e-"), ESearchCase::IgnoreCase))
+                        {
+                            RoutedDelta.X = 0.0f;
+                            *WorkingDelta = NumericType(0);
+                            return true;
+                        }
+                    }
                     if (TargetNative != *LastWrittenNative)
                     {
                         PinnedSpinBox->SetDelta(NumericType(0));
@@ -2522,6 +2988,16 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         return true;
     };
 
+    if (bPinFractionalDisplayWidth)
+    {
+        // Do this only after the whole arm path succeeds. The native
+        // type interface can be shared by the owner. Never overwrite its
+        // maximum or leave the temporary minimum installed after capture.
+        SpinBox->SetMinFractionalDigits(
+            TAttribute<TOptional<int32>>(TOptional<int32>(DisplayFractionDigits)));
+        *bPinnedFractionalDisplayWidth = true;
+    }
+
     UE_LOG(LogDigit, Log,
         TEXT("Armed digit place %d%s: display step %.9g, native/display scale %.9g, original Delta %.9g, sensitivity %.3g, bounded %s, slider [%.9g, %.9g], exponent %.9g, direct route %s, rotator %s"),
         Hit.DigitPlace,
@@ -2584,7 +3060,18 @@ void FDigitInputProcessor::RefreshActiveHighlight(FSlateApplication& SlateApp)
     const FString DisplayString = TextWidget->GetText().ToString();
     const int32 HighlightPlace = bLadderModeActive ? LadderOriginDigitPlace : ActiveDigitPlace;
     int32 CharacterIndex = INDEX_NONE;
-    if (!FindCharacterIndexForDigitPlace(DisplayString, HighlightPlace, CharacterIndex))
+    if (bActiveNonDropTimecode)
+    {
+        CharacterIndex = HighlightPlace;
+        if (!DisplayString.IsValidIndex(CharacterIndex)
+            || !DigitPrivate::IsDigitCharacter(DisplayString[CharacterIndex])
+            || !DisplayString.StartsWith(TEXT("[")))
+        {
+            ClearHighlight();
+            return;
+        }
+    }
+    else if (!FindCharacterIndexForDigitPlace(DisplayString, HighlightPlace, CharacterIndex))
     {
         // The selected place can temporarily disappear, for example the hundreds place
         // when scrubbing 123 down below 100. Keep the place locked and hide only the marker.
@@ -2626,8 +3113,10 @@ void FDigitInputProcessor::ShowHighlight(FSlateApplication& SlateApp, const FWid
     }
 
     const TSharedPtr<SWindow> Window = SlateApp.FindWidgetWindow(Hit.SpinBoxWidget.ToSharedRef());
-    if (!Window.IsValid() || Path.Widgets.Num() == 0)
+    if (!Window.IsValid() || !Window->HasOverlay() || Path.Widgets.Num() == 0)
     {
+        // SWindow::AddOverlaySlot ensures on windows without an overlay.
+        // A missing overlay is normal for some temporary Slate windows.
         ClearHighlight();
         return;
     }
@@ -2658,7 +3147,16 @@ void FDigitInputProcessor::ShowHighlight(FSlateApplication& SlateApp, const FWid
     // highlighted. Preserve and restore any tooltip the widget already owned.
     OriginalToolTip = Hit.TextWidget->GetToolTip();
     DigitToolTipWidget = Hit.TextWidget;
-    Hit.TextWidget->SetToolTipText(DigitPrivate::MakeDigitToolTip(Hit.DisplayString, Hit.DigitPlace));
+    if (DigitPrivate::HasStructuredTimeDisplay(Hit.DisplayString))
+    {
+        // The decimal-tooltip magnitudes and Value Ladder do not describe
+        // hours/minutes/seconds/frames. Preserve the native tooltip instead.
+    }
+    else
+    {
+        Hit.TextWidget->SetToolTipText(
+            DigitPrivate::MakeDigitToolTip(Hit.DisplayString, Hit.DigitPlace));
+    }
 
     // The nested text widget gets first chance to answer the cursor query. Keep its
     // persistent override synchronized with the current interaction state so rebuilding
@@ -2750,7 +3248,7 @@ void FDigitInputProcessor::UpdateActiveDragOutline(FSlateApplication& SlateApp, 
     }
 
     const TSharedPtr<SWindow> Window = SlateApp.FindWidgetWindow(SpinBoxWidget.ToSharedRef());
-    if (!Window.IsValid())
+    if (!Window.IsValid() || !Window->HasOverlay())
     {
         ClearActiveDragOutline();
         return;
@@ -2868,7 +3366,10 @@ void FDigitInputProcessor::ClearActiveDragOutline()
     {
         if (const TSharedPtr<SWindow> Window = ActiveDragOutlineWindow.Pin())
         {
-            Window->RemoveOverlaySlot(ActiveDragOutlineWidget.ToSharedRef());
+            if (Window->HasOverlay())
+            {
+                Window->RemoveOverlaySlot(ActiveDragOutlineWidget.ToSharedRef());
+            }
         }
     }
 
@@ -2890,7 +3391,10 @@ void FDigitInputProcessor::ClearHighlight()
     {
         if (const TSharedPtr<SWindow> Window = HighlightWindow.Pin())
         {
-            Window->RemoveOverlaySlot(HighlightWidget.ToSharedRef());
+            if (Window->HasOverlay())
+            {
+                Window->RemoveOverlaySlot(HighlightWidget.ToSharedRef());
+            }
         }
     }
 
@@ -2910,7 +3414,7 @@ void FDigitInputProcessor::ClearHighlight()
 
 void FDigitInputProcessor::ShowLadderFromCurrentHighlight(FSlateApplication& SlateApp)
 {
-    if (bLadderModeActive)
+    if (bLadderModeActive || DigitPrivate::HasStructuredTimeDisplay(HighlightDisplayString))
     {
         return;
     }
@@ -2937,14 +3441,15 @@ void FDigitInputProcessor::ShowLadderFromCurrentHighlight(FSlateApplication& Sla
 
 void FDigitInputProcessor::ShowLadder(FSlateApplication& SlateApp, const FNumericHit& Hit)
 {
-    if (!Hit.SpinBoxWidget.IsValid() || !Hit.TextWidget.IsValid())
+    if (!Hit.SpinBoxWidget.IsValid() || !Hit.TextWidget.IsValid()
+        || DigitPrivate::HasStructuredTimeDisplay(Hit.DisplayString))
     {
         ClearLadder();
         return;
     }
 
     const TSharedPtr<SWindow> Window = SlateApp.FindWidgetWindow(Hit.SpinBoxWidget.ToSharedRef());
-    if (!Window.IsValid())
+    if (!Window.IsValid() || !Window->HasOverlay())
     {
         ClearLadder();
         return;
@@ -2952,7 +3457,8 @@ void FDigitInputProcessor::ShowLadder(FSlateApplication& SlateApp, const FNumeri
 
     if (!bLadderModeActive
         && LadderWidget.IsValid()
-        && LadderSpinBoxWidget.Pin() == Hit.SpinBoxWidget
+        && LadderWindow.Pin() == Window
+        && LadderSpinBoxIdentity == Hit.SpinBoxWidget.Get()
         && LadderOriginDigitPlace == Hit.DigitPlace)
     {
         return;
@@ -3003,6 +3509,17 @@ void FDigitInputProcessor::ShowLadder(FSlateApplication& SlateApp, const FNumeri
     float LadderY = FieldCenterY - (LadderHeight * 0.5f);
     LadderY = FMath::Clamp(LadderY, WindowMargin, FMath::Max(WindowMargin, WindowSize.Y - LadderHeight - WindowMargin));
 
+    // The overlay belongs to its original SWindow, not to the newly hovered
+    // spin box. Detach it BEFORE changing owners. Otherwise RebuildLadderVisual
+    // tries to remove an old overlay slot from the new window, leaving a stale
+    // slot in the old one (notably when editor tabs/windows are torn down).
+    // Clear before initializing new preview state: ClearLadder resets the
+    // origin and selected magnitude in non-active (Alt-hover) mode.
+    if (LadderWidget.IsValid() && LadderWindow.Pin() != Window)
+    {
+        ClearLadder();
+    }
+
     if (!bLadderModeActive)
     {
         LadderOriginDigitPlace = Hit.DigitPlace;
@@ -3012,7 +3529,7 @@ void FDigitInputProcessor::ShowLadder(FSlateApplication& SlateApp, const FNumeri
     }
 
     LadderWindow = Window;
-    LadderSpinBoxWidget = Hit.SpinBoxWidget;
+    LadderSpinBoxIdentity = Hit.SpinBoxWidget.Get();
     LadderWindowPosition = FVector2D(LadderX, LadderY);
     RebuildLadderVisual();
 }
@@ -3020,16 +3537,18 @@ void FDigitInputProcessor::ShowLadder(FSlateApplication& SlateApp, const FNumeri
 void FDigitInputProcessor::RebuildLadderVisual()
 {
     const TSharedPtr<SWindow> Window = LadderWindow.Pin();
-    if (!Window.IsValid())
+    if (!Window.IsValid() || !Window->HasOverlay())
     {
         ClearLadder();
         return;
     }
 
-    if (LadderWidget.IsValid())
+    // Release processor ownership before calling back into Slate. Widget
+    // teardown may synchronously process more input or invalidate descendants.
+    const TSharedPtr<SWidget> PreviousWidget = MoveTemp(LadderWidget);
+    if (PreviousWidget.IsValid())
     {
-        Window->RemoveOverlaySlot(LadderWidget.ToSharedRef());
-        LadderWidget.Reset();
+        Window->RemoveOverlaySlot(PreviousWidget.ToSharedRef());
     }
 
     const UDigitSettings* Settings = UDigitSettings::Get();
@@ -3149,17 +3668,13 @@ void FDigitInputProcessor::RebuildLadderVisual()
 
 void FDigitInputProcessor::ClearLadder()
 {
-    if (LadderWidget.IsValid())
-    {
-        if (const TSharedPtr<SWindow> Window = LadderWindow.Pin())
-        {
-            Window->RemoveOverlaySlot(LadderWidget.ToSharedRef());
-        }
-    }
-
+    // Capture the actual owner and hold the overlay alive locally. Reset our
+    // state BEFORE RemoveOverlaySlot: removing an overlay can synchronously
+    // tear down Slate children or re-enter Digit's input processor.
+    const TSharedPtr<SWindow> Window = LadderWindow.Pin();
+    const TSharedPtr<SWidget> PreviousWidget = MoveTemp(LadderWidget);
     LadderWindow.Reset();
-    LadderWidget.Reset();
-    LadderSpinBoxWidget.Reset();
+    LadderSpinBoxIdentity = nullptr;
     LadderWindowPosition = FVector2D::ZeroVector;
 
     if (!bLadderModeActive)
@@ -3168,6 +3683,13 @@ void FDigitInputProcessor::ClearLadder()
         LadderSelectedDigitPlace = 0;
         LadderVerticalTravel = 0.0f;
         bLadderIntegral = false;
+    }
+
+    // Closing a window can invalidate its overlay before we receive capture
+    // loss. Never attempt removal from a different or overlay-less window.
+    if (PreviousWidget.IsValid() && Window.IsValid() && Window->HasOverlay())
+    {
+        Window->RemoveOverlaySlot(PreviousWidget.ToSharedRef());
     }
 }
 
@@ -3294,6 +3816,7 @@ void FDigitInputProcessor::RestoreActiveDelta()
     PendingCapturePostTicks = 0;
     bAwaitingNativeCapture = false;
     bActiveSpinBoxIsIntegral = false;
+    bActiveNonDropTimecode = false;
     bLadderModeActive = false;
     bLadderIntegral = false;
     LadderOriginDigitPlace = 0;

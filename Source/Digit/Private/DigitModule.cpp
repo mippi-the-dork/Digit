@@ -2,6 +2,7 @@
 
 #include "DigitModule.h"
 #include "DigitInputProcessor.h"
+#include "DigitSequencerContext.h"
 
 #include "Framework/Application/SlateApplication.h"
 
@@ -16,6 +17,8 @@ void FDigitModule::StartupModule()
 
     FSlateApplication& SlateApp = FSlateApplication::Get();
 
+    FDigitSequencerContext::Initialize();
+
     InputProcessor = MakeShared<FDigitInputProcessor>();
     SlateApp.RegisterInputPreProcessor(InputProcessor, EInputPreProcessorType::Editor);
     PostTickHandle = SlateApp.OnPostTick().AddRaw(this, &FDigitModule::HandleSlatePostTick);
@@ -23,11 +26,8 @@ void FDigitModule::StartupModule()
 
 void FDigitModule::ShutdownModule()
 {
-    if (InputProcessor.IsValid())
-    {
-        InputProcessor->Shutdown();
-    }
-
+    // Disconnect Slate callbacks BEFORE touching overlay/widget state, so
+    // shutdown cleanup cannot receive another input or post-tick callback.
     if (FSlateApplication::IsInitialized())
     {
         FSlateApplication& SlateApp = FSlateApplication::Get();
@@ -44,7 +44,12 @@ void FDigitModule::ShutdownModule()
         }
     }
 
+    if (InputProcessor.IsValid())
+    {
+        InputProcessor->Shutdown();
+    }
     InputProcessor.Reset();
+    FDigitSequencerContext::Shutdown();
 }
 
 void FDigitModule::HandleSlatePostTick(float DeltaTime)

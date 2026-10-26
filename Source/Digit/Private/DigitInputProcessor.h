@@ -6,8 +6,10 @@
 #include "Framework/Application/IInputProcessor.h"
 #include "Layout/Geometry.h"
 #include "InputCoreTypes.h"
+#include "DigitSequencerContext.h"
 
 class STextBlock;
+class SEditableText;
 class SWidget;
 class SWindow;
 class FWidgetPath;
@@ -60,6 +62,7 @@ private:
         bool bRotatorComponent = false;
         bool bCurveKeyTimeField = false;
         ENumericOwner Owner = ENumericOwner::General;
+        TOptional<FDigitTemporalSpinContext> TemporalContext;
         FString DisplayString;
     };
 
@@ -97,6 +100,11 @@ private:
     bool IsSupportedSpinBox(const TSharedRef<SWidget>& Widget) const;
 
 private:
+    // The public SEditableText API does not expose its uncommitted buffer or
+    // edit transactions. Never re-step stale bound text within the same edit.
+    TWeakPtr<SEditableText> LastStagedEditable;
+    FString LastStagedSource;
+
     TWeakPtr<SWidget> ActiveSpinBox;
     TWeakPtr<STextBlock> ActiveTextWidget;
     TFunction<void()> ApplySelectedDeltaFunction;
@@ -115,6 +123,7 @@ private:
     int32 PendingCapturePostTicks = 0;
     bool bAwaitingNativeCapture = false;
     bool bActiveSpinBoxIsIntegral = false;
+    bool bActiveNonDropTimecode = false;
 
     TWeakPtr<SWindow> HighlightWindow;
     TSharedPtr<SWidget> HighlightWidget;
@@ -134,7 +143,11 @@ private:
 
     TWeakPtr<SWindow> LadderWindow;
     TSharedPtr<SWidget> LadderWidget;
-    TWeakPtr<SWidget> LadderSpinBoxWidget;
+    // Identity only. Never dereference: the host may destroy its SSpinBox
+    // before Digit receives capture-loss / window-teardown notification.
+    // Avoid holding a second Slate weak-reference control block solely for
+    // comparing the currently highlighted field.
+    const SWidget* LadderSpinBoxIdentity = nullptr;
     FVector2D LadderWindowPosition = FVector2D::ZeroVector;
     int32 LadderOriginDigitPlace = 0;
     int32 LadderSelectedDigitPlace = 0;

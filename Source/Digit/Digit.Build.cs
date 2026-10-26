@@ -24,7 +24,9 @@ public class Digit : ModuleRules
                 "Engine",
                 "InputCore",
                 "Slate",
-                "SlateCore"
+                "SlateCore",
+                "TimeManagement",
+                "Sequencer"
             }
         );
     }

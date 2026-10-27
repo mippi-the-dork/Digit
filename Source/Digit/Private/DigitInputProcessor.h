@@ -7,6 +7,7 @@
 #include "Layout/Geometry.h"
 #include "InputCoreTypes.h"
 #include "Input/Events.h"
+#include "Input/Reply.h"
 #include "DigitSequencerContext.h"
 
 class STextBlock;
@@ -95,7 +96,9 @@ private:
     void ClearLadder();
     bool IsOverLadder(const FVector2D& ScreenPosition, int32* OutDigitPlace = nullptr) const;
     void UpdateLadderHover(const FVector2D& ScreenPosition);
-    bool BeginLadderRowDrag(FSlateApplication& SlateApp, const FPointerEvent& MouseEvent, int32 DigitPlace);
+    FReply HandleLadderRowMouseDown(const FGeometry& RowGeometry, const FPointerEvent& MouseEvent, int32 DigitPlace);
+    bool IsOverLadderSourceField(FSlateApplication& SlateApp, const FVector2D& ScreenPosition) const;
+    bool BuildLadderSourceHit(FSlateApplication& SlateApp, int32 DigitPlace, FNumericHit& OutHit) const;
     bool IsLadderToggleEnabled() const;
     bool IsLadderRowSelectionEnabled() const;
     bool ShouldKeepLadderPreview() const;
@@ -141,6 +144,13 @@ private:
     int32 HighlightCharacterIndex = INDEX_NONE;
     int32 HighlightDigitPlace = 0;
     FString HighlightDisplayString;
+    // Preserve native owner/temporal conversion when Alt opens a ladder from
+    // hover. Ordinary mouse-down recomputes this, but the ladder begins from
+    // the cached highlight, including frame/tick and rotator semantics.
+    bool HighlightSourceRotator = false;
+    bool HighlightSourceCurveTime = false;
+    ENumericOwner HighlightSourceOwner = ENumericOwner::General;
+    TOptional<FDigitTemporalSpinContext> HighlightSourceTemporalContext;
 
     TWeakPtr<SWidget> DigitToolTipWidget;
     TSharedPtr<IToolTip> OriginalToolTip;
@@ -156,10 +166,8 @@ private:
     // a row must not detach a Slate widget during pointer dispatch.
     TWeakPtr<SBorder> LadderRowBackgrounds[9];
     TWeakPtr<STextBlock> LadderRowLabels[9];
-    // Mouse-down on a ladder row is forwarded after the current Slate input
-    // dispatch, never recursively from the input preprocessor.
-    TOptional<FPointerEvent> PendingLadderDownEvent;
-    int32 PendingLadderDownPlace = INDEX_NONE;
+    // Ladder rows are native mouse targets in optional click modes. They
+    // forward the host SSpinBox's FReply through normal Slate dispatch.
     // Identity only. Never dereference: the host may destroy its SSpinBox
     // before Digit receives capture-loss / window-teardown notification.
     // Avoid holding a second Slate weak-reference control block solely for
@@ -173,6 +181,7 @@ private:
     bool bLadderModeActive = false;
     bool bLadderIntegral = false;
     bool bLadderToggledOn = false;
+    bool bLadderDismissQueued = false;
     bool bCtrlMagnitudeWasLocked = false;
     int32 LadderHoveredDigitPlace = INDEX_NONE;
     TWeakPtr<SWidget> LadderSourceSpinBox;

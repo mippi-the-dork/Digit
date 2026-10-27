@@ -9,7 +9,7 @@ Hover the hundreds place to work in hundreds. Hover the tenths place to make fin
 ![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.8.x-black?logo=unrealengine)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2064--bit-blue)
 ![Type](https://img.shields.io/badge/Plugin-Editor%20Only-green)
-![Version](https://img.shields.io/badge/Version-1.0.32-blue)
+![Version](https://img.shields.io/badge/Version-1.0.33-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 ![Digit targeting a numeric place value in Unreal Engine](Doc/Images/Digit-Hero.png)
@@ -132,10 +132,10 @@ Hold **Ctrl** during a ladder drag to lock the currently active magnitude. Horiz
 
 Two optional, independent settings add different input styles:
 
-- **Toggle Ladder with Alt:** Tap Alt to open/close the ladder. Clicking outside also closes it. A drag must start on the ladder, not the source field. Horizontal and vertical drags work normally. The ladder rows retain stable Slate geometry during hover. Start the drag on a valid row; a click outside is intentionally a dismiss action.
+- **Toggle Ladder with Alt:** Tap Alt to open/close the ladder. Without holding Alt, start scrubbing anywhere in the **original numeric field** or click a valid ladder row. Horizontal adjustment and vertical magnitude switching work normally. Clicking anywhere outside both the original numeric field and the ladder dismisses the toggle, while preserving the editor's normal click. The ladder center remains anchored to the digit that opened it.
 - **Select Magnitude from Ladder:** Hover to highlight a ladder row, then click and drag horizontally from that row. The row determines the magnitude for the whole drag; vertical movement does not switch it. A drag cannot start on the source field while the ladder is open.
 
-All four combinations preserve the native numeric field's mouse-capture, commit, and Undo/Redo handling. A magnitude is never automatically re-centered after the ladder opens.
+All four combinations are designed to retain the original numeric field as owner of mouse capture, value commits, and Undo/Redo. Confirm this with the live UE 5.8.3 regression workflow before release. A magnitude is never automatically re-centered after the ladder opens.
 
 ### Nine Ladder Magnitudes
 
@@ -579,7 +579,7 @@ For example:
 
 You do not need to end the drag and target another digit. While **Ctrl** is held (with its default option enabled), the active magnitude stays fixed. Release Ctrl to resume vertical selection.
 
-With **Select Magnitude from Ladder** enabled, vertical magnitude changes are disabled. Hover a ladder row to highlight it, then begin a new horizontal drag from that row. With **Toggle Ladder with Alt** enabled, all scrubs also begin inside the ladder; outside clicks dismiss it.
+With **Select Magnitude from Ladder** enabled, vertical magnitude changes are disabled. Hover a ladder row to highlight it, then begin a new horizontal drag from that row. With **Toggle Ladder with Alt** enabled alone, you can begin on either the ladder or the original numeric field; clicks outside both dismiss the ladder. With both options enabled, only ladder-row drags edit the value and clicking the original field leaves the ladder visible without scrubbing.
 
 ### Ladder Magnitude Sensitivity
 
@@ -784,7 +784,7 @@ Available settings are:
 |---|---|
 | **Scrub Sensitivity** | Scales horizontal scrubbing. `1.0` is the default. Lower values require more mouse movement; higher values require less. |
 | **Ladder Magnitude Sensitivity** | Scales vertical Value Ladder magnitude selection. `1.0` is the default. Lower values require more deliberate vertical movement; higher values switch magnitudes more quickly. |
-| **Toggle Ladder with Alt** | Off by default. Tap Alt to toggle ladder visibility. Clicking outside dismisses it. Begin scrubbing on the ladder. |
+| **Toggle Ladder with Alt** | Off by default. Tap Alt to toggle ladder visibility. Begin scrubbing on either the original numeric field or a ladder row. Clicking outside both dismisses it. Row-selection mode can additionally restrict scrubs to ladder rows. |
 | **Select Magnitude from Ladder** | Off by default. Hover a row for feedback and click/drag horizontally from it. Vertical rung selection during a drag is disabled. |
 | **Lock Magnitude with Ctrl** | On by default. Ctrl holds the currently active magnitude during ladder scrubbing while retaining fine horizontal control. Releasing Ctrl restores vertical rung selection without a jump. |
 | **Highlight Color** | Background color displayed behind the targeted digit. |
@@ -1028,7 +1028,7 @@ Digit is configured for:
 
 | | |
 |---|---|
-| **Digit Version** | 1.0.32 |
+| **Digit Version** | 1.0.33 |
 | **Unreal Engine** | 5.8.x |
 | **Platform** | Windows 64-bit |
 | **Plugin Type** | Editor |

@@ -1115,6 +1115,10 @@ void FDigitInputProcessor::Tick(const float DeltaTime, FSlateApplication& SlateA
         LastStagedEditable.Reset();
         LastStagedSource.Reset();
     }
+    if (LadderWidget.IsValid() && (!LadderSourceSpinBox.IsValid() || !LadderSourceText.IsValid()))
+    {
+        ClearLadder();
+    }
     if (!HasActiveSession() || bRestorePending)
     {
         return;
@@ -1284,10 +1288,27 @@ bool FDigitInputProcessor::HandleKeyDownEvent(FSlateApplication& SlateApp, const
     }
 
     if ((InKeyEvent.GetKey() == EKeys::LeftAlt || InKeyEvent.GetKey() == EKeys::RightAlt)
-        && !HasActiveSession()
-        && !bRestorePending)
+        && !InKeyEvent.IsRepeat())
     {
-        ShowLadderFromCurrentHighlight(SlateApp);
+        // A new Alt press is the ONLY opportunity to choose a new origin.
+        // Moving across digits with Alt held must never re-anchor the ladder.
+        if (IsLadderToggleEnabled())
+        {
+            if (LadderWidget.IsValid())
+            {
+                ClearLadder();
+                bLadderModeActive = false;
+            }
+            else if (!HasActiveSession() && !bRestorePending)
+            {
+                ShowLadderFromCurrentHighlight(SlateApp);
+                bLadderToggledOn = LadderWidget.IsValid();
+            }
+        }
+        else if (!HasActiveSession() && !bRestorePending)
+        {
+            ShowLadderFromCurrentHighlight(SlateApp);
+        }
     }
 
     return false;
@@ -1296,9 +1317,12 @@ bool FDigitInputProcessor::HandleKeyDownEvent(FSlateApplication& SlateApp, const
 bool FDigitInputProcessor::HandleKeyUpEvent(FSlateApplication& SlateApp, const FKeyEvent& InKeyEvent)
 {
     if ((InKeyEvent.GetKey() == EKeys::LeftAlt || InKeyEvent.GetKey() == EKeys::RightAlt)
-        && !bLadderModeActive)
+        && !IsLadderToggleEnabled())
     {
         ClearLadder();
+        // The numerical drag itself may still be captured by its native spin box.
+        // Closing its ladder disables magnitude switching, not native release.
+        bLadderModeActive = false;
     }
 
     return false;
@@ -1350,6 +1374,7 @@ bool FDigitInputProcessor::HandleMouseMoveEvent(FSlateApplication& SlateApp, con
         // Crossing into another rung changes the magnitude, and that same mouse event does
         // not also change the value. The next horizontal motion starts from the current value.
         const bool bMagnitudeChangedThisMove = bLadderModeActive
+            && !IsLadderRowSelectionEnabled()
             ? UpdateLadderSelection(MouseEvent)
             : false;
 
@@ -1400,15 +1425,22 @@ bool FDigitInputProcessor::HandleMouseMoveEvent(FSlateApplication& SlateApp, con
 
     if (!bRestorePending)
     {
-        UpdateHoverHighlight(SlateApp, MouseEvent);
-
-        if (MouseEvent.IsAltDown())
+        if (LadderWidget.IsValid())
         {
-            ShowLadderFromCurrentHighlight(SlateApp);
+            // Do not retarget the source field when moving from the digit into
+            // the ladder. A disappearing source window closes its own overlay.
+            if (!LadderSourceSpinBox.IsValid() || !LadderSourceText.IsValid())
+            {
+                ClearLadder();
+            }
+            else
+            {
+                UpdateLadderHover(MouseEvent.GetScreenSpacePosition());
+            }
         }
         else
         {
-            ClearLadder();
+            UpdateHoverHighlight(SlateApp, MouseEvent);
         }
     }
 
@@ -1417,7 +1449,44 @@ bool FDigitInputProcessor::HandleMouseMoveEvent(FSlateApplication& SlateApp, con
 
 bool FDigitInputProcessor::HandleMouseButtonDownEvent(FSlateApplication& SlateApp, const FPointerEvent& MouseEvent)
 {
-    if (MouseEvent.GetEffectingButton() != EKeys::LeftMouseButton || HasActiveSession() || bRestorePending)
+    if (HasActiveSession() || bRestorePending)
+    {
+        return false;
+    }
+
+    if (LadderWidget.IsValid())
+    {
+        int32 RowPlace = INDEX_NONE;
+        const bool bInsideLadder = IsOverLadder(MouseEvent.GetScreenSpacePosition(), &RowPlace);
+        if (IsLadderToggleEnabled() && !bInsideLadder)
+        {
+            // Outside clicks dismiss a toggled ladder but retain the host's
+            // original mouse action. This includes right-click and middle-click.
+            ClearLadder();
+            ClearHighlight();
+            return false;
+        }
+        if (bInsideLadder)
+        {
+            if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton
+                && RowPlace != INDEX_NONE
+                && (IsLadderToggleEnabled() || IsLadderRowSelectionEnabled()))
+            {
+                // NEVER call RoutePointerDownEvent from an input preprocessor.
+                // Slate is currently walking the original mouse-down widget
+                // path; nested event routing/ProcessReply can invalidate it.
+                // Complete the handoff once the outer event has unwound.
+                PendingLadderDownEvent = MouseEvent;
+                PendingLadderDownPlace = RowPlace;
+                return true;
+            }
+            // The overlay is visually hit-test-invisible; never let a click on
+            // its border accidentally reach whatever happens to be underneath.
+            return true;
+        }
+    }
+
+    if (MouseEvent.GetEffectingButton() != EKeys::LeftMouseButton)
     {
         return false;
     }
@@ -1466,29 +1535,46 @@ bool FDigitInputProcessor::HandleMouseButtonDownEvent(FSlateApplication& SlateAp
         return false;
     }
 
-    const bool bUseLadder = MouseEvent.IsAltDown();
-    if (ArmSpinBox(Hit, MouseEvent.GetPointerIndex(), bUseLadder))
+    const bool bOverOriginalField = !LadderWidget.IsValid()
+        || LadderSpinBoxIdentity == Hit.SpinBoxWidget.Get();
+    if (LadderWidget.IsValid() && !bOverOriginalField)
+    {
+        // Alt belongs to the source that originally opened the ladder.
+        // An unrelated spin box must not silently inherit its magnitude.
+        return false;
+    }
+    if (LadderWidget.IsValid() && IsLadderRowSelectionEnabled())
+    {
+        // In row-selection mode only a ladder-row mouse-down starts a scrub.
+        return true;
+    }
+    const bool bUseLadder = LadderWidget.IsValid() && MouseEvent.IsAltDown();
+    FNumericHit EffectiveHit = Hit;
+    if (bUseLadder)
+    {
+        // Clicking a different digit in the SAME field must not change which
+        // magnitude is being scrubbed. Pass the locked ladder selection into
+        // the native arm path, including its representable-step checks.
+        EffectiveHit.DigitPlace = LadderSelectedDigitPlace;
+    }
+    if (ArmSpinBox(EffectiveHit, MouseEvent.GetPointerIndex(), bUseLadder))
     {
         ActiveUserIndex = MouseEvent.GetUserIndex();
-        FWidgetPath Path = SlateApp.LocateWindowUnderMouse(
-            MouseEvent.GetScreenSpacePosition(),
-            SlateApp.GetInteractiveTopLevelWindows(),
-            false,
-            MouseEvent.GetUserIndex());
-
-        if (Path.IsValid())
+        if (!bUseLadder)
         {
-            ShowHighlight(SlateApp, Path, Hit);
-        }
-
-        if (bUseLadder)
-        {
-            ShowLadder(SlateApp, Hit);
-        }
-        else
-        {
+            FWidgetPath Path = SlateApp.LocateWindowUnderMouse(
+                MouseEvent.GetScreenSpacePosition(),
+                SlateApp.GetInteractiveTopLevelWindows(),
+                false,
+                MouseEvent.GetUserIndex());
+            if (Path.IsValid())
+            {
+                ShowHighlight(SlateApp, Path, Hit);
+            }
             ClearLadder();
         }
+        // In ladder mode, retain the initial digit marker and origin.
+        // The active drag refresh will update that same origin's highlight.
     }
 
     return false;
@@ -1496,6 +1582,15 @@ bool FDigitInputProcessor::HandleMouseButtonDownEvent(FSlateApplication& SlateAp
 
 bool FDigitInputProcessor::HandleMouseButtonUpEvent(FSlateApplication& SlateApp, const FPointerEvent& MouseEvent)
 {
+    if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton
+        && PendingLadderDownEvent.IsSet())
+    {
+        // A very short click may finish before the deferred native down.
+        // Never generate a delayed press after the physical button is up.
+        PendingLadderDownEvent.Reset();
+        PendingLadderDownPlace = INDEX_NONE;
+        return true;
+    }
     if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton
         && HasActiveSession()
         && MouseEvent.GetPointerIndex() == ActivePointerIndex
@@ -1519,7 +1614,7 @@ bool FDigitInputProcessor::HandleMouseButtonUpEvent(FSlateApplication& SlateApp,
         {
             ApplySelectedDeltaFunction();
         }
-        QueueRestore();
+        QueueRestore(true);
     }
 
     return false;
@@ -1527,6 +1622,22 @@ bool FDigitInputProcessor::HandleMouseButtonUpEvent(FSlateApplication& SlateApp,
 
 void FDigitInputProcessor::HandlePostSlateTick()
 {
+    if (PendingLadderDownEvent.IsSet())
+    {
+        // The physical mouse-down has finished routing. Revalidate the
+        // original field before delivering ONE native down outside input
+        // preprocessing. Clear the pending state before reentrant callbacks.
+        const FPointerEvent DownEvent = PendingLadderDownEvent.GetValue();
+        const int32 DownPlace = PendingLadderDownPlace;
+        PendingLadderDownEvent.Reset();
+        PendingLadderDownPlace = INDEX_NONE;
+        if (LadderWidget.IsValid() && !HasActiveSession() && !bRestorePending
+            && DownPlace != INDEX_NONE)
+        {
+            BeginLadderRowDrag(FSlateApplication::Get(), DownEvent, DownPlace);
+        }
+    }
+
     if (HasActiveSession() && !bRestorePending)
     {
         const TSharedPtr<SWidget> PinnedSpinBox = ActiveSpinBox.Pin();
@@ -1617,6 +1728,8 @@ void FDigitInputProcessor::HandlePostSlateTick()
 
 void FDigitInputProcessor::Shutdown()
 {
+    PendingLadderDownEvent.Reset();
+    PendingLadderDownPlace = INDEX_NONE;
     ClearLadder();
     RestoreActiveDelta();
     ClearHighlight();
@@ -2107,9 +2220,14 @@ bool FDigitInputProcessor::ArmSpinBox(const FNumericHit& Hit, int32 PointerIndex
         PendingCapturePostTicks = 0;
         bAwaitingNativeCapture = true;
         bLadderModeActive = bUseLadder && !bActiveNonDropTimecode;
-        LadderOriginDigitPlace = Hit.DigitPlace;
-        LadderSelectedDigitPlace = Hit.DigitPlace;
+        if (!LadderWidget.IsValid())
+        {
+            LadderOriginDigitPlace = Hit.DigitPlace;
+            LadderSelectedDigitPlace = Hit.DigitPlace;
+        }
+        ActiveDigitPlace = bLadderModeActive ? LadderSelectedDigitPlace : Hit.DigitPlace;
         LadderVerticalTravel = 0.0f;
+        bCtrlMagnitudeWasLocked = false;
 
         const UDigitSettings* DigitSettings = UDigitSettings::Get();
         const float ConfiguredLadderSensitivity =
@@ -3455,12 +3573,10 @@ void FDigitInputProcessor::ShowLadder(FSlateApplication& SlateApp, const FNumeri
         return;
     }
 
-    if (!bLadderModeActive
-        && LadderWidget.IsValid()
-        && LadderWindow.Pin() == Window
-        && LadderSpinBoxIdentity == Hit.SpinBoxWidget.Get()
-        && LadderOriginDigitPlace == Hit.DigitPlace)
+    if (LadderWidget.IsValid())
     {
+        // During a single Alt hold / toggle, the origin must be immutable.
+        // A later hit on another digit must not move the preview or re-center it.
         return;
     }
 
@@ -3509,17 +3625,6 @@ void FDigitInputProcessor::ShowLadder(FSlateApplication& SlateApp, const FNumeri
     float LadderY = FieldCenterY - (LadderHeight * 0.5f);
     LadderY = FMath::Clamp(LadderY, WindowMargin, FMath::Max(WindowMargin, WindowSize.Y - LadderHeight - WindowMargin));
 
-    // The overlay belongs to its original SWindow, not to the newly hovered
-    // spin box. Detach it BEFORE changing owners. Otherwise RebuildLadderVisual
-    // tries to remove an old overlay slot from the new window, leaving a stale
-    // slot in the old one (notably when editor tabs/windows are torn down).
-    // Clear before initializing new preview state: ClearLadder resets the
-    // origin and selected magnitude in non-active (Alt-hover) mode.
-    if (LadderWidget.IsValid() && LadderWindow.Pin() != Window)
-    {
-        ClearLadder();
-    }
-
     if (!bLadderModeActive)
     {
         LadderOriginDigitPlace = Hit.DigitPlace;
@@ -3528,6 +3633,15 @@ void FDigitInputProcessor::ShowLadder(FSlateApplication& SlateApp, const FNumeri
         bLadderIntegral = IsIntegralSpinBox(Hit.SpinBoxWidget);
     }
 
+    // A preview stores only weak widget references. Unlike owning an SSpinBox,
+    // this cannot prevent Details/Sequencer tabs from being destroyed.
+    LadderSourceSpinBox = Hit.SpinBoxWidget;
+    LadderSourceText = Hit.TextWidget;
+    bLadderSourceRotator = Hit.bRotatorComponent;
+    bLadderSourceCurveTime = Hit.bCurveKeyTimeField;
+    LadderSourceOwner = Hit.Owner;
+    LadderSourceTemporalContext = Hit.TemporalContext;
+    LadderHoveredDigitPlace = INDEX_NONE;
     LadderWindow = Window;
     LadderSpinBoxIdentity = Hit.SpinBoxWidget.Get();
     LadderWindowPosition = FVector2D(LadderX, LadderY);
@@ -3546,6 +3660,11 @@ void FDigitInputProcessor::RebuildLadderVisual()
     // Release processor ownership before calling back into Slate. Widget
     // teardown may synchronously process more input or invalidate descendants.
     const TSharedPtr<SWidget> PreviousWidget = MoveTemp(LadderWidget);
+    for (int32 Index = 0; Index < 9; ++Index)
+    {
+        LadderRowBackgrounds[Index].Reset();
+        LadderRowLabels[Index].Reset();
+    }
     if (PreviousWidget.IsValid())
     {
         Window->RemoveOverlaySlot(PreviousWidget.ToSharedRef());
@@ -3582,21 +3701,27 @@ void FDigitInputProcessor::RebuildLadderVisual()
         const bool bSelected = DigitPlace == LadderSelectedDigitPlace;
         const bool bOrigin = DigitPlace == LadderOriginDigitPlace;
 
-        const FLinearColor RowBackground = bSelected && bValidPlace
-            ? AccentColor
-            : FLinearColor::Transparent;
+        const bool bHovered = IsLadderRowSelectionEnabled()
+            && DigitPlace == LadderHoveredDigitPlace && bValidPlace;
+        FLinearColor HoverColor = AccentColor;
+        HoverColor.A *= 0.48f;
+        const FLinearColor RowBackground = bHovered
+            ? (bSelected ? OriginColor : HoverColor)
+            : (bSelected && bValidPlace ? AccentColor : FLinearColor::Transparent);
         const FLinearColor TextColor = bValidPlace
-            ? (bSelected ? FLinearColor::White : NormalTextColor)
+            ? ((bSelected || bHovered) ? FLinearColor::White : NormalTextColor)
             : DisabledTextColor;
         const FLinearColor MarkerColor = bOrigin ? OriginColor : FLinearColor::Transparent;
 
+        TSharedPtr<SBorder> Background;
+        TSharedPtr<STextBlock> Label;
         Rows->AddSlot()
         .AutoHeight()
         [
             SNew(SBox)
             .HeightOverride(17.0f)
             [
-                SNew(SBorder)
+                SAssignNew(Background, SBorder)
                 .BorderImage(WhiteBrush)
                 .BorderBackgroundColor(RowBackground)
                 .Padding(FMargin(4.0f, 0.0f, 5.0f, 0.0f))
@@ -3624,7 +3749,7 @@ void FDigitInputProcessor::RebuildLadderVisual()
                     .VAlign(VAlign_Center)
                     .Padding(FMargin(5.0f, 0.0f, 0.0f, 0.0f))
                     [
-                        SNew(STextBlock)
+                        SAssignNew(Label, STextBlock)
                         .Text(FText::FromString(DigitPrivate::FormatMagnitudeForLadder(DigitPlace)))
                         .Font(LadderFont)
                         .ColorAndOpacity(TextColor)
@@ -3633,6 +3758,8 @@ void FDigitInputProcessor::RebuildLadderVisual()
                 ]
             ]
         ];
+        LadderRowBackgrounds[RowIndex] = Background;
+        LadderRowLabels[RowIndex] = Label;
     }
 
     TSharedRef<SBox> LadderRoot =
@@ -3666,6 +3793,44 @@ void FDigitInputProcessor::RebuildLadderVisual()
     LadderWidget = LadderRoot;
 }
 
+void FDigitInputProcessor::RefreshLadderRowVisuals()
+{
+    // Do not remove and re-add the overlay in response to pointer movement.
+    // The previous implementation could destroy a widget while Slate was
+    // dispatching input through that same overlay, and invalidate hit tests.
+    const UDigitSettings* Settings = UDigitSettings::Get();
+    FLinearColor AccentColor = Settings
+        ? Settings->DigitHighlightColor
+        : FLinearColor(0.0f, 0.162029f, 0.745404f, 0.38f);
+    AccentColor.A = FMath::Max(AccentColor.A, 0.62f);
+    FLinearColor HoverColor = AccentColor;
+    HoverColor.A *= 0.48f;
+    const FLinearColor NormalTextColor(0.78f, 0.78f, 0.78f, 1.0f);
+    const FLinearColor DisabledTextColor(0.34f, 0.34f, 0.34f, 1.0f);
+
+    for (int32 Index = 0; Index < 9; ++Index)
+    {
+        const int32 Place = LadderOriginDigitPlace + 4 - Index;
+        const bool bValid = !bLadderIntegral || Place >= 0;
+        const bool bSelected = Place == LadderSelectedDigitPlace;
+        const bool bHovered = IsLadderRowSelectionEnabled()
+            && Place == LadderHoveredDigitPlace && bValid;
+        const FLinearColor RowColor = bHovered
+            ? (bSelected ? FLinearColor(AccentColor.R, AccentColor.G, AccentColor.B, 1.0f) : HoverColor)
+            : (bSelected && bValid ? AccentColor : FLinearColor::Transparent);
+        if (const TSharedPtr<SBorder> Border = LadderRowBackgrounds[Index].Pin())
+        {
+            Border->SetBorderBackgroundColor(FSlateColor(RowColor));
+        }
+        if (const TSharedPtr<STextBlock> Label = LadderRowLabels[Index].Pin())
+        {
+            Label->SetColorAndOpacity(FSlateColor(bValid
+                ? ((bSelected || bHovered) ? FLinearColor::White : NormalTextColor)
+                : DisabledTextColor));
+        }
+    }
+}
+
 void FDigitInputProcessor::ClearLadder()
 {
     // Capture the actual owner and hold the overlay alive locally. Reset our
@@ -3673,10 +3838,26 @@ void FDigitInputProcessor::ClearLadder()
     // tear down Slate children or re-enter Digit's input processor.
     const TSharedPtr<SWindow> Window = LadderWindow.Pin();
     const TSharedPtr<SWidget> PreviousWidget = MoveTemp(LadderWidget);
+    for (int32 Index = 0; Index < 9; ++Index)
+    {
+        LadderRowBackgrounds[Index].Reset();
+        LadderRowLabels[Index].Reset();
+    }
+    PendingLadderDownEvent.Reset();
+    PendingLadderDownPlace = INDEX_NONE;
     LadderWindow.Reset();
     LadderSpinBoxIdentity = nullptr;
     LadderWindowPosition = FVector2D::ZeroVector;
 
+    bLadderToggledOn = false;
+    bCtrlMagnitudeWasLocked = false;
+    LadderHoveredDigitPlace = INDEX_NONE;
+    LadderSourceSpinBox.Reset();
+    LadderSourceText.Reset();
+    bLadderSourceRotator = false;
+    bLadderSourceCurveTime = false;
+    LadderSourceOwner = ENumericOwner::General;
+    LadderSourceTemporalContext.Reset();
     if (!bLadderModeActive)
     {
         LadderOriginDigitPlace = 0;
@@ -3697,6 +3878,24 @@ bool FDigitInputProcessor::UpdateLadderSelection(const FPointerEvent& MouseEvent
 {
     if (!bLadderModeActive)
     {
+        return false;
+    }
+
+    const UDigitSettings* Settings = UDigitSettings::Get();
+    const bool bShouldLock = Settings && Settings->bLockLadderMagnitudeWithCtrl
+        && MouseEvent.IsControlDown();
+    if (bShouldLock)
+    {
+        bCtrlMagnitudeWasLocked = true;
+        LadderVerticalTravel = 0.0f;
+        return false;
+    }
+    if (bCtrlMagnitudeWasLocked)
+    {
+        // The first motion after Ctrl release becomes the new vertical origin.
+        // No jump from movement accumulated during a locked drag.
+        bCtrlMagnitudeWasLocked = false;
+        LadderVerticalTravel = 0.0f;
         return false;
     }
 
@@ -3740,10 +3939,192 @@ bool FDigitInputProcessor::UpdateLadderSelection(const FPointerEvent& MouseEvent
     {
         ActiveDigitPlace = LadderSelectedDigitPlace;
         ClearActiveDragOutline();
-        RebuildLadderVisual();
+        RefreshLadderRowVisuals();
     }
 
     return bChanged;
+}
+
+bool FDigitInputProcessor::IsLadderToggleEnabled() const
+{
+    const UDigitSettings* Settings = UDigitSettings::Get();
+    return Settings && Settings->bToggleLadderWithAlt;
+}
+
+bool FDigitInputProcessor::IsLadderRowSelectionEnabled() const
+{
+    const UDigitSettings* Settings = UDigitSettings::Get();
+    return Settings && Settings->bSelectMagnitudeFromLadder;
+}
+
+bool FDigitInputProcessor::ShouldKeepLadderPreview() const
+{
+    return LadderWidget.IsValid()
+        && LadderSourceSpinBox.IsValid()
+        && LadderSourceText.IsValid()
+        && ((IsLadderToggleEnabled() && bLadderToggledOn)
+            || (!IsLadderToggleEnabled() && FSlateApplication::IsInitialized()
+                && FSlateApplication::Get().GetModifierKeys().IsAltDown()));
+}
+
+bool FDigitInputProcessor::IsOverLadder(const FVector2D& ScreenPosition, int32* OutDigitPlace) const
+{
+    if (OutDigitPlace)
+    {
+        *OutDigitPlace = INDEX_NONE;
+    }
+    const TSharedPtr<SWindow> Window = LadderWindow.Pin();
+    if (!Window.IsValid() || !Window->HasOverlay() || !LadderWidget.IsValid())
+    {
+        return false;
+    }
+    // The overlay's actual arranged geometry is authoritative. Reconstructing
+    // it from SWindow geometry and slot padding produces incorrect hit tests
+    // on DPI-scaled or inset editor windows. The overlay is no longer rebuilt
+    // every time hover changes, so its geometry remains stable during clicks.
+    const FGeometry& Geometry = LadderWidget->GetTickSpaceGeometry();
+    const FVector2D Size = Geometry.GetLocalSize();
+    if (Size.X <= 0.0f || Size.Y <= 0.0f)
+    {
+        return false;
+    }
+    const FVector2D Local = Geometry.AbsoluteToLocal(ScreenPosition);
+    const float Width = Size.X;
+    const float Height = Size.Y;
+    if (Local.X < 0.0f || Local.X >= Width || Local.Y < 0.0f || Local.Y >= Height)
+    {
+        return false;
+    }
+    if (OutDigitPlace)
+    {
+        constexpr float ContentTop = 3.0f;
+        constexpr float RowHeight = 17.0f;
+        const int32 RowIndex = FMath::FloorToInt((Local.Y - ContentTop) / RowHeight);
+        if (RowIndex >= 0 && RowIndex < 9)
+        {
+            const int32 Place = LadderOriginDigitPlace + 4 - RowIndex;
+            if (!bLadderIntegral || Place >= 0)
+            {
+                *OutDigitPlace = Place;
+            }
+        }
+    }
+    return true;
+}
+
+void FDigitInputProcessor::UpdateLadderHover(const FVector2D& ScreenPosition)
+{
+    int32 Hovered = INDEX_NONE;
+    if (IsLadderRowSelectionEnabled())
+    {
+        IsOverLadder(ScreenPosition, &Hovered);
+    }
+    if (Hovered != LadderHoveredDigitPlace)
+    {
+        LadderHoveredDigitPlace = Hovered;
+        RefreshLadderRowVisuals();
+    }
+}
+
+bool FDigitInputProcessor::BeginLadderRowDrag(
+    FSlateApplication& SlateApp, const FPointerEvent& MouseEvent, int32 DigitPlace)
+{
+    const TSharedPtr<SWidget> Source = LadderSourceSpinBox.Pin();
+    const TSharedPtr<STextBlock> SourceText = LadderSourceText.Pin();
+    if (!Source.IsValid() || !SourceText.IsValid()
+        || (bLadderIntegral && DigitPlace < 0))
+    {
+        ClearLadder();
+        return true;
+    }
+    FWidgetPath FieldPath;
+    if (!SlateApp.GeneratePathToWidgetUnchecked(Source.ToSharedRef(), FieldPath)
+        || FieldPath.Widgets.Num() == 0)
+    {
+        ClearLadder();
+        return true;
+    }
+
+    FNumericHit Hit;
+    Hit.SpinBoxWidget = Source;
+    Hit.TextWidget = SourceText;
+    Hit.TextGeometry = SourceText->GetTickSpaceGeometry();
+    Hit.DigitPlace = DigitPlace;
+    // A toggle can survive several edits. Use the source's CURRENT text for
+    // decimal precision, not the text displayed before the previous drag.
+    // Converted temporal fields additionally revalidate their actual owning
+    // Sequencer, display rate, and tick resolution before a new native edit.
+    const FString CurrentDisplay = SourceText->GetText().ToString();
+    if (!Source->IsEnabled() || !SourceText->IsEnabled()
+        || SlateApp.FindWidgetWindow(Source.ToSharedRef()) != LadderWindow.Pin()
+        || DigitPrivate::HasStructuredTimeDisplay(CurrentDisplay)
+        || CurrentDisplay.Contains(TEXT("..."))
+        || !DigitPrivate::HasCanonicalNumericPrefix(CurrentDisplay)
+        || (LadderSourceTemporalContext.IsSet()
+            && !FDigitSequencerContext::IsStillCurrent(LadderSourceTemporalContext.GetValue())))
+    {
+        ClearLadder();
+        return true;
+    }
+    int32 CurrentCharacterIndex = INDEX_NONE;
+    if (!FindCharacterIndexForDigitPlace(CurrentDisplay, LadderOriginDigitPlace, CurrentCharacterIndex))
+    {
+        // A carry or compact float formatter may remove the original digit.
+        // The ladder magnitude stays fixed; only the text probe falls back
+        // to a currently visible digit to measure fractional precision.
+        for (int32 Index = 0; Index < CurrentDisplay.Len(); ++Index)
+        {
+            if (DigitPrivate::IsDigitCharacter(CurrentDisplay[Index]))
+            {
+                CurrentCharacterIndex = Index;
+                break;
+            }
+        }
+    }
+    if (CurrentCharacterIndex == INDEX_NONE)
+    {
+        ClearLadder();
+        return true;
+    }
+    Hit.CharacterIndex = CurrentCharacterIndex;
+    Hit.DisplayString = CurrentDisplay;
+    Hit.bRotatorComponent = bLadderSourceRotator;
+    Hit.bCurveKeyTimeField = bLadderSourceCurveTime;
+    Hit.Owner = LadderSourceOwner;
+    Hit.TemporalContext = LadderSourceTemporalContext;
+
+    // A ladder click is physically outside the numeric field, but it must
+    // still start the NATIVE SSpinBox mouse transaction. Route a single native
+    // pointer-down to its original Slate widget path and apply its FReply so
+    // native capture/commit/Undo retain their existing ownership.
+    // Keep the actual cursor location where the row was clicked. The native
+    // SSpinBox uses this as its drag origin; substituting the SOURCE field's
+    // center would introduce a huge bogus movement before the first real
+    // drag delta. The target widget is selected by FieldPath, not by XY.
+    const FVector2D NativeDownPosition = MouseEvent.GetScreenSpacePosition();
+    const FPointerEvent NativeDownEvent(MouseEvent, NativeDownPosition, NativeDownPosition);
+
+    // Arm first, just as for an ordinary down event. Failure falls back to
+    // ignoring the overlay click; never route an unowned synthetic edit.
+    if (!ArmSpinBox(Hit, MouseEvent.GetPointerIndex(), true))
+    {
+        return true;
+    }
+    ActiveUserIndex = MouseEvent.GetUserIndex();
+    ActiveDigitPlace = DigitPlace;
+    LadderSelectedDigitPlace = DigitPlace;
+    LadderVerticalTravel = 0.0f;
+    RebuildLadderVisual();
+
+    const FReply NativeReply = SlateApp.RoutePointerDownEvent(FieldPath, NativeDownEvent);
+    if (!NativeReply.IsEventHandled())
+    {
+        QueueRestore();
+        return true;
+    }
+    SlateApp.ProcessReply(FieldPath, NativeReply, nullptr, &NativeDownEvent,
+        MouseEvent.GetUserIndex());
+    return true;
 }
 
 bool FDigitInputProcessor::IsIntegralSpinBox(const TSharedPtr<SWidget>& Widget) const
@@ -3771,14 +4152,19 @@ bool FDigitInputProcessor::HasActiveSession() const
     return ActivePointerIndex != INDEX_NONE || static_cast<bool>(RestoreDeltaFunction);
 }
 
-void FDigitInputProcessor::QueueRestore()
+void FDigitInputProcessor::QueueRestore(bool bPreserveLadderPreview)
 {
+    // A normal mouse-up should leave the preview anchored while Alt remains
+    // held (or a toggle is still open). Capture loss / teardown never does.
+    if (!bPreserveLadderPreview || !ShouldKeepLadderPreview())
+    {
+        ClearLadder();
+    }
     // Any path that ends an active interaction, including lost mouse capture, must
     // transition the persistent cursor override out of the drag state before cleanup.
     bDigitDragStarted = false;
     ApplyDigitCursor();
     ClearActiveDragOutline();
-    ClearLadder();
 
     if (HasActiveSession())
     {
@@ -3818,9 +4204,13 @@ void FDigitInputProcessor::RestoreActiveDelta()
     bActiveSpinBoxIsIntegral = false;
     bActiveNonDropTimecode = false;
     bLadderModeActive = false;
-    bLadderIntegral = false;
-    LadderOriginDigitPlace = 0;
-    LadderSelectedDigitPlace = 0;
+    bCtrlMagnitudeWasLocked = false;
+    if (!LadderWidget.IsValid())
+    {
+        bLadderIntegral = false;
+        LadderOriginDigitPlace = 0;
+        LadderSelectedDigitPlace = 0;
+    }
     LadderVerticalTravel = 0.0f;
     ActiveLadderMagnitudeSensitivity = 0.5f;
     if (RestoreFunction)

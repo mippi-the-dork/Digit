@@ -23,6 +23,15 @@ public:
     UPROPERTY(EditAnywhere, Config, Category = "Scrubbing", meta = (DisplayName = "Ladder Magnitude Sensitivity", ClampMin = "0.1", ClampMax = "10.0", UIMin = "0.25", UIMax = "4.0", ToolTip = "Scales vertical Value Ladder magnitude selection. 1.0 is the default and is 50% less sensitive than Digit's original ladder behavior. Lower values require more vertical movement to change magnitude; higher values require less. 2.0 matches the original ladder sensitivity. Does not affect horizontal scrubbing."))
     float LadderMagnitudeSensitivity;
 
+    UPROPERTY(EditAnywhere, Config, Category = "Value Ladder", meta = (DisplayName = "Toggle Ladder with Alt", ToolTip = "Press Alt once over a digit to show the Value Ladder, and press Alt again anywhere to dismiss it. Clicking outside the ladder also dismisses it. Drags must begin inside the ladder."))
+    bool bToggleLadderWithAlt;
+
+    UPROPERTY(EditAnywhere, Config, Category = "Value Ladder", meta = (DisplayName = "Select Magnitude from Ladder", ToolTip = "Hover a ladder row to highlight it, then start a horizontal scrub by clicking that row. Vertical movement does not change magnitude during this drag."))
+    bool bSelectMagnitudeFromLadder;
+
+    UPROPERTY(EditAnywhere, Config, Category = "Value Ladder", meta = (DisplayName = "Lock Magnitude with Ctrl", ToolTip = "Hold Ctrl while scrubbing with the Value Ladder to freeze the current magnitude. Release Ctrl to resume vertical magnitude selection. Ctrl still applies its normal fine-scrub multiplier."))
+    bool bLockLadderMagnitudeWithCtrl;
+
     UPROPERTY(EditAnywhere, Config, Category = "Appearance|Digit Highlight", meta = (DisplayName = "Highlight Color", ToolTip = "Background color drawn behind the numeric digit currently targeted by Digit scrubbing."))
     FLinearColor DigitHighlightColor;
 

@@ -6,9 +6,11 @@
 #include "Framework/Application/IInputProcessor.h"
 #include "Layout/Geometry.h"
 #include "InputCoreTypes.h"
+#include "Input/Events.h"
 #include "DigitSequencerContext.h"
 
 class STextBlock;
+class SBorder;
 class SEditableText;
 class SWidget;
 class SWindow;
@@ -89,12 +91,19 @@ private:
     void ShowLadder(FSlateApplication& SlateApp, const FNumericHit& Hit);
     void ShowLadderFromCurrentHighlight(FSlateApplication& SlateApp);
     void RebuildLadderVisual();
+    void RefreshLadderRowVisuals();
     void ClearLadder();
+    bool IsOverLadder(const FVector2D& ScreenPosition, int32* OutDigitPlace = nullptr) const;
+    void UpdateLadderHover(const FVector2D& ScreenPosition);
+    bool BeginLadderRowDrag(FSlateApplication& SlateApp, const FPointerEvent& MouseEvent, int32 DigitPlace);
+    bool IsLadderToggleEnabled() const;
+    bool IsLadderRowSelectionEnabled() const;
+    bool ShouldKeepLadderPreview() const;
     bool UpdateLadderSelection(const FPointerEvent& MouseEvent);
     bool IsIntegralSpinBox(const TSharedPtr<SWidget>& Widget) const;
 
     bool HasActiveSession() const;
-    void QueueRestore();
+    void QueueRestore(bool bPreserveLadderPreview = false);
     void RestoreActiveDelta();
 
     bool IsSupportedSpinBox(const TSharedRef<SWidget>& Widget) const;
@@ -143,6 +152,14 @@ private:
 
     TWeakPtr<SWindow> LadderWindow;
     TSharedPtr<SWidget> LadderWidget;
+    // Keep overlay geometry stable across hover and rung selection. Changing
+    // a row must not detach a Slate widget during pointer dispatch.
+    TWeakPtr<SBorder> LadderRowBackgrounds[9];
+    TWeakPtr<STextBlock> LadderRowLabels[9];
+    // Mouse-down on a ladder row is forwarded after the current Slate input
+    // dispatch, never recursively from the input preprocessor.
+    TOptional<FPointerEvent> PendingLadderDownEvent;
+    int32 PendingLadderDownPlace = INDEX_NONE;
     // Identity only. Never dereference: the host may destroy its SSpinBox
     // before Digit receives capture-loss / window-teardown notification.
     // Avoid holding a second Slate weak-reference control block solely for
@@ -155,4 +172,13 @@ private:
     float ActiveLadderMagnitudeSensitivity = 0.5f;
     bool bLadderModeActive = false;
     bool bLadderIntegral = false;
+    bool bLadderToggledOn = false;
+    bool bCtrlMagnitudeWasLocked = false;
+    int32 LadderHoveredDigitPlace = INDEX_NONE;
+    TWeakPtr<SWidget> LadderSourceSpinBox;
+    TWeakPtr<STextBlock> LadderSourceText;
+    bool bLadderSourceRotator = false;
+    bool bLadderSourceCurveTime = false;
+    ENumericOwner LadderSourceOwner = ENumericOwner::General;
+    TOptional<FDigitTemporalSpinContext> LadderSourceTemporalContext;
 };

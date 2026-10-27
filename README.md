@@ -4,12 +4,12 @@
 
 Digit lets you scrub Unreal Editor number fields based on the exact digit beneath your cursor.
 
-Hover the hundreds place to work in hundreds. Hover the tenths place to make fine decimal adjustments. Hold Alt to open a Value Ladder and change the active magnitude while you drag.
+Hover the hundreds place to work in hundreds. Hover the tenths place to make fine decimal adjustments. Hold Alt to open a Value Ladder centered on that digit, change magnitude while dragging, or select a magnitude directly from the ladder using optional settings.
 
 ![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.8.x-black?logo=unrealengine)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2064--bit-blue)
 ![Type](https://img.shields.io/badge/Plugin-Editor%20Only-green)
-![Version](https://img.shields.io/badge/Version-1.0.30-blue)
+![Version](https://img.shields.io/badge/Version-1.0.32-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 ![Digit targeting a numeric place value in Unreal Engine](Doc/Images/Digit-Hero.png)
@@ -124,9 +124,18 @@ Hold **Ctrl** while scrubbing for finer adjustment.
 
 ### Alt Value Ladder
 
-Hold **Alt** to display a vertical ladder of nearby numeric magnitudes.
+Hover a digit and hold **Alt** to open a vertical ladder of nearby numeric magnitudes. Its center magnitude stays fixed to the **original digit** until the ladder is closed. Moving over another digit never retargets the open ladder.
 
-While dragging, move vertically through the ladder to change the active magnitude without starting another interaction.
+With default settings, begin a drag anywhere inside the original numeric field. Drag horizontally to change value and vertically to change the active magnitude in the same gesture. Release Alt to close the ladder.
+
+Hold **Ctrl** during a ladder drag to lock the currently active magnitude. Horizontal scrubbing (including Ctrl's usual fine multiplier) continues, but vertical movement cannot switch magnitudes until Ctrl is released. The vertical movement baseline resets on release, avoiding sudden rung jumps. Disable this behavior with **Lock Magnitude with Ctrl** in Project Settings.
+
+Two optional, independent settings add different input styles:
+
+- **Toggle Ladder with Alt:** Tap Alt to open/close the ladder. Clicking outside also closes it. A drag must start on the ladder, not the source field. Horizontal and vertical drags work normally. The ladder rows retain stable Slate geometry during hover. Start the drag on a valid row; a click outside is intentionally a dismiss action.
+- **Select Magnitude from Ladder:** Hover to highlight a ladder row, then click and drag horizontally from that row. The row determines the magnitude for the whole drag; vertical movement does not switch it. A drag cannot start on the source field while the ladder is open.
+
+All four combinations preserve the native numeric field's mouse-capture, commit, and Undo/Redo handling. A magnitude is never automatically re-centered after the ladder opens.
 
 ### Nine Ladder Magnitudes
 
@@ -538,7 +547,7 @@ For example, targeting the ones place can produce:
 0.0001
 ```
 
-The original magnitude is marked so you can always see where the interaction began.
+The original magnitude is marked so you can always see where the interaction began. Hovering another digit does not change the center magnitude; close the ladder and open it again over a new digit to recenter it.
 ---
 
 ## Using the Value Ladder
@@ -568,7 +577,9 @@ For example:
 5. Fine-tune the result.
 6. Release.
 
-You do not need to end the drag and target another digit.
+You do not need to end the drag and target another digit. While **Ctrl** is held (with its default option enabled), the active magnitude stays fixed. Release Ctrl to resume vertical selection.
+
+With **Select Magnitude from Ladder** enabled, vertical magnitude changes are disabled. Hover a ladder row to highlight it, then begin a new horizontal drag from that row. With **Toggle Ladder with Alt** enabled, all scrubs also begin inside the ladder; outside clicks dismiss it.
 
 ### Ladder Magnitude Sensitivity
 
@@ -773,6 +784,9 @@ Available settings are:
 |---|---|
 | **Scrub Sensitivity** | Scales horizontal scrubbing. `1.0` is the default. Lower values require more mouse movement; higher values require less. |
 | **Ladder Magnitude Sensitivity** | Scales vertical Value Ladder magnitude selection. `1.0` is the default. Lower values require more deliberate vertical movement; higher values switch magnitudes more quickly. |
+| **Toggle Ladder with Alt** | Off by default. Tap Alt to toggle ladder visibility. Clicking outside dismisses it. Begin scrubbing on the ladder. |
+| **Select Magnitude from Ladder** | Off by default. Hover a row for feedback and click/drag horizontally from it. Vertical rung selection during a drag is disabled. |
+| **Lock Magnitude with Ctrl** | On by default. Ctrl holds the currently active magnitude during ladder scrubbing while retaining fine horizontal control. Releasing Ctrl restores vertical rung selection without a jump. |
 | **Highlight Color** | Background color displayed behind the targeted digit. |
 | **Highlighted Text Color** | Text color used for the targeted digit. |
 | **Log Numeric Widget Diagnostics** | Optional logging for a numeric spin box Digit cannot recognize or arm. Disabled by default. |
@@ -1014,7 +1028,7 @@ Digit is configured for:
 
 | | |
 |---|---|
-| **Digit Version** | 1.0.30 |
+| **Digit Version** | 1.0.32 |
 | **Unreal Engine** | 5.8.x |
 | **Platform** | Windows 64-bit |
 | **Plugin Type** | Editor |

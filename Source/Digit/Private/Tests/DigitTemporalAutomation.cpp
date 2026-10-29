@@ -1,4 +1,4 @@
-﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
+// Copyright Mippithedork 2026, Inc. All Rights Reserved.
 
 #if WITH_DEV_AUTOMATION_TESTS
 
@@ -9,6 +9,8 @@
 #include "DigitTemporalTimecode.h"
 #include "DigitTemporalQuantize.h"
 #include "DigitTemporalEditable.h"
+#include "DigitTemporalDropFrame.h"
+#include "DigitTemporalSubframe.h"
 #include "Widgets/Input/SEditableText.h"
 #include "Widgets/Input/NumericTypeInterface.h"
 
@@ -368,6 +370,80 @@ bool FDigitTemporalTimecodeSpinQuantizationTest::RunTest(const FString& Paramete
 }
 
 
+// Curve Editor text-only Time can present ordinary frame or seconds labels
+// instead of bracketed timecode. Check place selection and the REAL engine
+// numeric interfaces; host ownership and commit remain editor QA concerns.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitTemporalEditablePlainNumberTest,
+    "Digit.Temporal.EditableFrameSecondsPlaces",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitTemporalEditablePlainNumberTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    double Step = 0.0;
+    TestTrue(TEXT("Frame tens place"),
+        DigitTemporalEditable::TryGetPlainNumericDigitStep(TEXT("0024"), 2, Step));
+    TestEqual(TEXT("Frame tens increment"), Step, 10.0);
+    TestTrue(TEXT("Seconds thousandths"),
+        DigitTemporalEditable::TryGetPlainNumericDigitStep(TEXT("12.375s"), 5, Step));
+    TestTrue(TEXT("Seconds thousandth increment"), FMath::IsNearlyEqual(Step, 0.001));
+    TestTrue(TEXT("Negative seconds tenths"),
+        DigitTemporalEditable::TryGetPlainNumericDigitStep(TEXT("-12.375"), 4, Step));
+    TestTrue(TEXT("Negative seconds tenths increment"), FMath::IsNearlyEqual(Step, 0.1));
+    TestFalse(TEXT("Do not parse non-drop timecode as a decimal number"),
+        DigitTemporalEditable::TryGetPlainNumericDigitStep(TEXT("[00:00:01:00]"), 11, Step));
+    TestFalse(TEXT("Do not parse drop-frame timecode"),
+        DigitTemporalEditable::TryGetPlainNumericDigitStep(TEXT("[00:00:01;00]"), 11, Step));
+    TestFalse(TEXT("Do not parse subframes"),
+        DigitTemporalEditable::TryGetPlainNumericDigitStep(TEXT("0024*0.5"), 2, Step));
+    TestFalse(TEXT("Do not parse thousands separators"),
+        DigitTemporalEditable::TryGetPlainNumericDigitStep(TEXT("1,000"), 2, Step));
+    TestFalse(TEXT("Do not parse exponential notation"),
+        DigitTemporalEditable::TryGetPlainNumericDigitStep(TEXT("1e+05"), 0, Step));
+    TestFalse(TEXT("Do not select decimal point"),
+        DigitTemporalEditable::TryGetPlainNumericDigitStep(TEXT("12.375"), 2, Step));
+    TestFalse(TEXT("Reject excessive precision"),
+        DigitTemporalEditable::TryGetPlainNumericDigitStep(TEXT("1.00000000001"), 12, Step));
+
+    const TAttribute<uint8> Padding(static_cast<uint8>(4));
+    const TAttribute<FFrameRate> TickRate(FFrameRate(24000, 1));
+    const TAttribute<FFrameRate> DisplayRate(FFrameRate(24, 1));
+    FFrameNumberInterface Frames(
+        TAttribute<EFrameNumberDisplayFormats>(EFrameNumberDisplayFormats::Frames),
+        Padding, TickRate, DisplayRate);
+    const FString FrameText = Frames.ToString(24000.0);
+    const int32 UnitsIndex = FrameText.Len() - 1;
+    TestTrue(TEXT("Native frame display exposes a decimal digit"),
+        DigitTemporalEditable::TryGetPlainNumericDigitStep(FrameText, UnitsIndex, Step));
+    if (Step > 0.0)
+    {
+        const double TargetTicks = 24000.0 + Step * 1000.0;
+        const FString NextFrames = Frames.ToString(TargetTicks);
+        const TOptional<double> Parsed = Frames.FromString(NextFrames, 24000.0);
+        TestTrue(TEXT("Frame step round-trips through native parser"), Parsed.IsSet()
+            && FMath::IsNearlyEqual(Parsed.GetValue(), TargetTicks, 1e-7));
+    }
+
+    FFrameNumberInterface Seconds(
+        TAttribute<EFrameNumberDisplayFormats>(EFrameNumberDisplayFormats::Seconds),
+        Padding, TickRate, DisplayRate);
+    const FString SecondsText = Seconds.ToString(24000.0);
+    const int32 SecondsUnitsIndex = SecondsText.Find(TEXT("1"));
+    TestTrue(TEXT("Native seconds display has selectable unit digit"),
+        DigitTemporalEditable::TryGetPlainNumericDigitStep(
+            SecondsText, SecondsUnitsIndex, Step));
+    if (Step > 0.0)
+    {
+        const double TargetTicks = 24000.0 + Step * 24000.0;
+        const FString NextSeconds = Seconds.ToString(TargetTicks);
+        const TOptional<double> Parsed = Seconds.FromString(NextSeconds, 24000.0);
+        TestTrue(TEXT("Seconds step round-trips through native parser"), Parsed.IsSet()
+            && FMath::IsNearlyEqual(Parsed.GetValue(), TargetTicks, 1e-7));
+    }
+    return true;
+}
+
 // Test the *actual* Slate editable-text staging API and Digit's explicit
 // one-digit selection requirement. There is no synthetic property commit:
 // Unreal's owning editor must perform its ordinary Enter/focus-loss callback.
@@ -414,8 +490,21 @@ bool FDigitTemporalEditableTextStageTest::RunTest(const FString& Parameters)
     Field->SelectText(FTextLocation(0, 6), FTextLocation(0, 7));
     TestEqual(TEXT("Selection reads the actual staged text buffer"),
         Field->GetSelectedText().ToString(), FString(TEXT("0")));
-    TestEqual(TEXT("Staging must not synthesize a native property commit"),
+    const FTextSelection SavedSelection = Field->GetSelection();
+    Field->SelectAllText();
+    TestEqual(TEXT("Select-all exposes the entire LIVE staged buffer"),
+        Field->GetSelectedText().ToString(), FString(TEXT("[00:01:00:00]")));
+    Field->SelectText(SavedSelection.GetBeginning(), SavedSelection.GetEnd());
+    TestEqual(TEXT("Single-digit selection survives a live-buffer read"),
+        Field->GetSelectedText().ToString(), FString(TEXT("0")));
+    TestEqual(TEXT("Staging must not synthesize a native property commit, including live-buffer reads"),
         Commits, 0);
+    TestTrue(TEXT("A second keyboard step can stage without a host commit"),
+        Field->SetEditableText(FText::FromString(TEXT("[00:01:00:01]"))));
+    Field->SelectAllText();
+    TestEqual(TEXT("A second staged edit reads the latest live text"),
+        Field->GetSelectedText().ToString(), FString(TEXT("[00:01:00:01]")));
+    TestEqual(TEXT("Neither staged step commits a property"), Commits, 0);
     return true;
 }
 
@@ -483,6 +572,112 @@ bool FDigitFloatingDragDecimalWidthTest::RunTest(const FString& Parameters)
     FloatFormatter.SetMinFractionalDigits(TAttribute<TOptional<int32>>(TOptional<int32>(1)));
     TestEqual(TEXT("Float Scale returns to native formatting"),
         FloatFormatter.ToString(1.230f), FloatOrdinary);
+    return true;
+}
+
+// Drop-frame timecode has no fixed per-component tick magnitude across
+// skipped-minute boundaries. Validate the pure label stepping and the ACTUAL
+// engine formatter/parser at both supported NTSC display rates.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitTemporalDropFrameLabelTest,
+    "Digit.Temporal.DropFrameLabels",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitTemporalDropFrameLabelTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    const auto CheckBoundary = [this](const FFrameRate& Rate,
+        int32 Nominal, int32 Skipped, const FString& Label,
+        const FString& ExpectedNext)
+    {
+        DigitTemporalDropFrame::FLabelStep Step;
+        TestTrue(TEXT("DF label advances across skipped minute"),
+            DigitTemporalDropFrame::TryStepLabel(Label, 11, 1, Rate, Step));
+        TestEqual(TEXT("DF step skips missing labels"), Step.TargetLabel, ExpectedNext);
+        TestEqual(TEXT("DF boundary advances one actual frame"),
+            Step.TargetFrame - Step.SourceFrame, static_cast<int64>(1));
+        DigitTemporalDropFrame::FLabelStep Reverse;
+        TestTrue(TEXT("DF boundary reverses to previous visible label"),
+            DigitTemporalDropFrame::TryStepLabel(ExpectedNext, 11, -1, Rate, Reverse));
+        TestEqual(TEXT("DF reverse returns to source"), Reverse.TargetLabel, Label);
+        TestEqual(TEXT("DF reverse moves one physical frame"),
+            Reverse.TargetFrame - Reverse.SourceFrame, static_cast<int64>(-1));
+
+        const TAttribute<uint8> Padding(static_cast<uint8>(4));
+        const FFrameRate TickRate(Nominal * 1000, 1);
+        const double TicksPerFrame = TickRate.AsDecimal() / Rate.AsDecimal();
+        FFrameNumberInterface Native(
+            TAttribute<EFrameNumberDisplayFormats>(EFrameNumberDisplayFormats::DropFrameTimecode),
+            Padding, TAttribute<FFrameRate>(TickRate), TAttribute<FFrameRate>(Rate));
+        const FString Before = Native.ToString(Step.SourceFrame * TicksPerFrame);
+        const FString After = Native.ToString(Step.TargetFrame * TicksPerFrame);
+        TestEqual(TEXT("Native UE DF source matches label mapping"), Before, Label);
+        TestEqual(TEXT("Native UE DF target matches label mapping"), After, ExpectedNext);
+        const TOptional<double> Parsed = Native.FromString(ExpectedNext, 0.0);
+        TestTrue(TEXT("Native UE DF target parses"), Parsed.IsSet());
+        if (Parsed.IsSet())
+        {
+            TestTrue(TEXT("Native UE DF parsed target ticks match"),
+                FMath::IsNearlyEqual(Parsed.GetValue(), Step.TargetFrame * TicksPerFrame, 1e-7));
+        }
+        const FString Invalid = FString::Printf(TEXT("[00:01:00;%02d]"), Skipped - 1);
+        TestFalse(TEXT("Cannot select skipped timecode labels"),
+            DigitTemporalDropFrame::TryStepLabel(Invalid, 11, 1, Rate, Step));
+    };
+    CheckBoundary(FFrameRate(30000, 1001), 30, 2,
+        TEXT("[00:00:59;29]"), TEXT("[00:01:00;02]"));
+    CheckBoundary(FFrameRate(60000, 1001), 60, 4,
+        TEXT("[00:00:59;59]"), TEXT("[00:01:00;04]"));
+    DigitTemporalDropFrame::FLabelStep Step;
+    TestTrue(TEXT("Ten-minute boundary does not drop labels"),
+        DigitTemporalDropFrame::TryStepLabel(
+            TEXT("[00:09:59;29]"), 11, 1, FFrameRate(30000, 1001), Step));
+    TestEqual(TEXT("Ten-minute boundary target"), Step.TargetLabel,
+        FString(TEXT("[00:10:00;00]")));
+    TestFalse(TEXT("Reject drop-frame on non-NTSC rate"),
+        DigitTemporalDropFrame::TryStepLabel(
+            TEXT("[00:00:59;29]"), 11, 1, FFrameRate(24, 1), Step));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitTemporalFrameSubframeTest,
+    "Digit.Temporal.SubframePlaces",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitTemporalFrameSubframeTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    const TAttribute<uint8> Padding(static_cast<uint8>(4));
+    FFrameNumberInterface Frames(
+        TAttribute<EFrameNumberDisplayFormats>(EFrameNumberDisplayFormats::Frames),
+        Padding, TAttribute<FFrameRate>(FFrameRate(24000, 1)),
+        TAttribute<FFrameRate>(FFrameRate(24, 1)));
+    const FString NativeText = Frames.ToString(1.0);
+    const int32 Marker = NativeText.Find(TEXT("*"));
+    TestTrue(TEXT("Native fractional frame carries a marker"), Marker > 0);
+    if (Marker > 0)
+    {
+        double Step = 0.0;
+        const int32 SelectedFractionDigit = Marker + 3;
+        TestTrue(TEXT("Native fractional frame has a selectable 0.x digit"),
+            DigitTemporalSubframe::TryGetFrameDigitStep(
+                NativeText, SelectedFractionDigit, Step));
+        TestFalse(TEXT("Cannot select subframe separator"),
+            DigitTemporalSubframe::TryGetFrameDigitStep(NativeText, Marker, Step));
+        const TOptional<double> Parsed = Frames.FromString(NativeText, 0.0);
+        TestTrue(TEXT("Host parses its fractional frame label"), Parsed.IsSet());
+        if (Parsed.IsSet())
+        {
+            TestTrue(TEXT("Host round trips a single native tick"),
+                FMath::IsNearlyEqual(Parsed.GetValue(), 1.0, 1e-7));
+        }
+    }
+    double Step = 0.0;
+    TestFalse(TEXT("Reject subframe glyph with ambiguous fractional suffix"),
+        DigitTemporalSubframe::TryGetFrameDigitStep(TEXT("0024*3.5"), 6, Step));
+    TestFalse(TEXT("Reject a plain decimal without subframe marker"),
+        DigitTemporalSubframe::TryGetFrameDigitStep(TEXT("12.375"), 3, Step));
     return true;
 }
 

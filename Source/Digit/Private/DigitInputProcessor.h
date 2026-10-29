@@ -114,8 +114,6 @@ private:
 private:
     // The public SEditableText API does not expose its uncommitted buffer or
     // edit transactions. Never re-step stale bound text within the same edit.
-    TWeakPtr<SEditableText> LastStagedEditable;
-    FString LastStagedSource;
 
     TWeakPtr<SWidget> ActiveSpinBox;
     TWeakPtr<STextBlock> ActiveTextWidget;

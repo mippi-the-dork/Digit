@@ -1,6 +1,9 @@
 // Copyright Mippithedork 2026, Inc. All Rights Reserved.
 #include "DigitSequencerContext.h"
 #include "DigitTemporalTimecode.h"
+#include "DigitTemporalEditable.h"
+#include "DigitTemporalDropFrame.h"
+#include "DigitTemporalSubframe.h"
 
 #include "Framework/Application/SlateApplication.h"
 #include "ISequencer.h"
@@ -345,6 +348,317 @@ bool FDigitSequencerContext::TryStepEditableNonDropTimecode(
         }
         // Do not try a different Sequencer or infer units when a matching
         // owner has a custom formatter that we cannot verify.
+        return false;
+    }
+    return false;
+}
+
+bool FDigitSequencerContext::TryStepEditableFrameOrSeconds(
+    const FWidgetPath& Path, const FString& DisplayText, int32 CharacterIndex,
+    int32 Direction, FString& OutDisplayText)
+{
+    OutDisplayText.Reset();
+    double DisplayedDigitStep = 0.0;
+    if ((Direction != -1 && Direction != 1)
+        || !DigitTemporalEditable::TryGetPlainNumericDigitStep(
+            DisplayText, CharacterIndex, DisplayedDigitStep))
+    {
+        return false;
+    }
+
+    for (int32 Index = KnownSequencers.Num() - 1; Index >= 0; --Index)
+    {
+        const TSharedPtr<ISequencer> Sequencer = KnownSequencers[Index].Pin();
+        if (!Sequencer.IsValid())
+        {
+            KnownSequencers.RemoveAtSwap(Index);
+            continue;
+        }
+        if (!OwnsWidgetPath(*Sequencer, Path))
+        {
+            continue;
+        }
+
+        const FFrameRate Tick = Sequencer->GetFocusedTickResolution();
+        const FFrameRate Display = Sequencer->GetFocusedDisplayRate();
+        if (Tick.Numerator <= 0 || Tick.Denominator <= 0
+            || Display.Numerator <= 0 || Display.Denominator <= 0)
+        {
+            return false;
+        }
+        const double TicksPerSecond = Tick.AsDecimal();
+        const double TicksPerFrame = TicksPerSecond / Display.AsDecimal();
+        if (!FMath::IsFinite(TicksPerFrame) || TicksPerFrame <= 0.0)
+        {
+            return false;
+        }
+
+        for (int32 IntentIndex = 0; IntentIndex < 2; ++IntentIndex)
+        {
+            const auto Intent = IntentIndex == 0
+                ? UE::Sequencer::ENumericIntent::Position
+                : UE::Sequencer::ENumericIntent::Duration;
+            const TSharedPtr<INumericTypeInterface<double>> Interface =
+                Sequencer->GetNumericTypeInterface(Intent);
+            if (!Interface.IsValid())
+            {
+                continue;
+            }
+            // The displayed text MUST be the canonical rendering of the
+            // native tick count. Do not accept a parser that happens to
+            // understand a string belonging to another display format.
+            const TOptional<double> Parsed = Interface->FromString(DisplayText, 0.0);
+            if (!Parsed.IsSet() || !FMath::IsFinite(Parsed.GetValue())
+                || Parsed.GetValue() < static_cast<double>(MIN_int32)
+                || Parsed.GetValue() > static_cast<double>(MAX_int32))
+            {
+                continue;
+            }
+            const double NativeValue = Parsed.GetValue();
+            if (FMath::Abs(NativeValue - std::round(NativeValue)) > 1e-7
+                || Interface->ToString(NativeValue) != DisplayText)
+            {
+                continue;
+            }
+
+            double VerifiedUnit = 0.0;
+            FString ZeroSignature;
+            FString OneSignature;
+            if (!TryHostNumericInterface(Interface, DisplayText, NativeValue,
+                    TicksPerFrame, TicksPerSecond, VerifiedUnit,
+                    ZeroSignature, OneSignature))
+            {
+                continue;
+            }
+
+            const double NativeChange = static_cast<double>(Direction)
+                * DisplayedDigitStep * VerifiedUnit;
+            if (!FMath::IsFinite(NativeChange)
+                || FMath::Abs(NativeChange - std::round(NativeChange)) > 1e-7)
+            {
+                // A fractional native tick is not representable in the
+                // FFrameNumber property that ultimately receives this text.
+                continue;
+            }
+            const int64 NativeInteger = static_cast<int64>(NativeValue);
+            const double NewNativeDouble = NativeValue + NativeChange;
+            if (!FMath::IsFinite(NewNativeDouble)
+                || NewNativeDouble < static_cast<double>(MIN_int32)
+                || NewNativeDouble > static_cast<double>(MAX_int32)
+                || FMath::Abs(NewNativeDouble - std::round(NewNativeDouble)) > 1e-7)
+            {
+                continue;
+            }
+            const int64 Proposed = static_cast<int64>(std::round(NewNativeDouble));
+            if (Proposed == NativeInteger)
+            {
+                continue;
+            }
+            const FString Candidate = Interface->ToString(static_cast<double>(Proposed));
+            // Disallow format transitions into timecode, subframe, or
+            // truncated/scientific representations. Leave the original
+            // property editor in charge if the requested place disappears.
+            double CandidateStep = 0.0;
+            if (!DigitTemporalEditable::TryGetPlainNumericDigitStep(
+                    Candidate, FMath::Min(CharacterIndex, Candidate.Len() - 1), CandidateStep))
+            {
+                // Leading/sign character changes may move the selected
+                // digit. The *format* must still be a canonical scalar.
+                const int32 FirstDigit = Candidate.StartsWith(TEXT("-")) ? 1 : 0;
+                if (!DigitTemporalEditable::TryGetPlainNumericDigitStep(
+                        Candidate, FirstDigit, CandidateStep))
+                {
+                    continue;
+                }
+            }
+            const TOptional<double> Reparsed = Interface->FromString(Candidate, NativeValue);
+            if (!Reparsed.IsSet() || !FMath::IsFinite(Reparsed.GetValue())
+                || FMath::Abs(Reparsed.GetValue() - static_cast<double>(Proposed)) > 1e-7)
+            {
+                continue;
+            }
+            OutDisplayText = Candidate;
+            return true;
+        }
+        // This is the correct owning Sequencer. A failed host conversion is
+        // a hard rejection, not permission to try another editor's rates.
+        return false;
+    }
+    return false;
+}
+
+bool FDigitSequencerContext::TryStepEditableDropFrameTimecode(
+    const FWidgetPath& Path, const FString& DisplayText, int32 CharacterIndex,
+    int32 Direction, FString& OutDisplayText)
+{
+    OutDisplayText.Reset();
+    for (int32 Index = KnownSequencers.Num() - 1; Index >= 0; --Index)
+    {
+        const TSharedPtr<ISequencer> Sequencer = KnownSequencers[Index].Pin();
+        if (!Sequencer.IsValid())
+        {
+            KnownSequencers.RemoveAtSwap(Index);
+            continue;
+        }
+        if (!OwnsWidgetPath(*Sequencer, Path))
+        {
+            continue;
+        }
+        const FFrameRate Tick = Sequencer->GetFocusedTickResolution();
+        const FFrameRate Display = Sequencer->GetFocusedDisplayRate();
+        DigitTemporalDropFrame::FLabelStep LabelStep;
+        if (!DigitTemporalDropFrame::TryStepLabel(
+                DisplayText, CharacterIndex, Direction, Display, LabelStep)
+            || Tick.Numerator <= 0 || Tick.Denominator <= 0)
+        {
+            return false;
+        }
+        const double TicksPerFrame = Tick.AsDecimal() / Display.AsDecimal();
+        const double RoundedTicks = std::round(TicksPerFrame);
+        if (!FMath::IsFinite(TicksPerFrame) || RoundedTicks < 1.0
+            || FMath::Abs(TicksPerFrame - RoundedTicks) > 1e-7)
+        {
+            return false;
+        }
+        for (int32 IntentIndex = 0; IntentIndex < 2; ++IntentIndex)
+        {
+            const auto Intent = IntentIndex == 0
+                ? UE::Sequencer::ENumericIntent::Position
+                : UE::Sequencer::ENumericIntent::Duration;
+            const TSharedPtr<INumericTypeInterface<double>> Interface =
+                Sequencer->GetNumericTypeInterface(Intent);
+            if (!Interface.IsValid())
+            {
+                continue;
+            }
+            const TOptional<double> Parsed = Interface->FromString(DisplayText, 0.0);
+            if (!Parsed.IsSet() || !FMath::IsFinite(Parsed.GetValue())
+                || Parsed.GetValue() < static_cast<double>(MIN_int32)
+                || Parsed.GetValue() > static_cast<double>(MAX_int32)
+                || FMath::Abs(Parsed.GetValue() - std::round(Parsed.GetValue())) > 1e-7
+                || Interface->ToString(Parsed.GetValue()) != DisplayText)
+            {
+                continue;
+            }
+            // Verify that the native source actually represents the same
+            // SMPTE label arithmetic. A host duration formatter may parse
+            // the label differently and must not silently qualify.
+            const double SourceTicks = static_cast<double>(LabelStep.SourceFrame) * RoundedTicks;
+            if (FMath::Abs(Parsed.GetValue() - SourceTicks) > 1e-7)
+            {
+                continue;
+            }
+            const double CandidateTicks = static_cast<double>(LabelStep.TargetFrame) * RoundedTicks;
+            if (CandidateTicks < static_cast<double>(MIN_int32)
+                || CandidateTicks > static_cast<double>(MAX_int32)
+                || Interface->ToString(CandidateTicks) != LabelStep.TargetLabel)
+            {
+                continue;
+            }
+            const TOptional<double> Reparsed = Interface->FromString(LabelStep.TargetLabel,
+                Parsed.GetValue());
+            if (!Reparsed.IsSet() || !FMath::IsFinite(Reparsed.GetValue())
+                || FMath::Abs(Reparsed.GetValue() - CandidateTicks) > 1e-7)
+            {
+                continue;
+            }
+            OutDisplayText = LabelStep.TargetLabel;
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+bool FDigitSequencerContext::TryStepEditableFrameSubframe(
+    const FWidgetPath& Path, const FString& DisplayText, int32 CharacterIndex,
+    int32 Direction, FString& OutDisplayText)
+{
+    OutDisplayText.Reset();
+    double FrameStep = 0.0;
+    if ((Direction != -1 && Direction != 1)
+        || !DigitTemporalSubframe::TryGetFrameDigitStep(
+            DisplayText, CharacterIndex, FrameStep))
+    {
+        return false;
+    }
+    for (int32 Index = KnownSequencers.Num() - 1; Index >= 0; --Index)
+    {
+        const TSharedPtr<ISequencer> Sequencer = KnownSequencers[Index].Pin();
+        if (!Sequencer.IsValid())
+        {
+            KnownSequencers.RemoveAtSwap(Index);
+            continue;
+        }
+        if (!OwnsWidgetPath(*Sequencer, Path))
+        {
+            continue;
+        }
+        const FFrameRate Tick = Sequencer->GetFocusedTickResolution();
+        const FFrameRate Display = Sequencer->GetFocusedDisplayRate();
+        if (Tick.Numerator <= 0 || Tick.Denominator <= 0
+            || Display.Numerator <= 0 || Display.Denominator <= 0)
+        {
+            return false;
+        }
+        const double TicksPerFrame = Tick.AsDecimal() / Display.AsDecimal();
+        const double Change = Direction * FrameStep * TicksPerFrame;
+        if (!FMath::IsFinite(Change) || !FMath::IsFinite(TicksPerFrame)
+            || TicksPerFrame <= 0.0 || FMath::Abs(Change) < 1.0
+            || FMath::Abs(Change - std::round(Change)) > 1e-7)
+        {
+            return false;
+        }
+        for (int32 IntentIndex = 0; IntentIndex < 2; ++IntentIndex)
+        {
+            const auto Intent = IntentIndex == 0
+                ? UE::Sequencer::ENumericIntent::Position
+                : UE::Sequencer::ENumericIntent::Duration;
+            const TSharedPtr<INumericTypeInterface<double>> Interface =
+                Sequencer->GetNumericTypeInterface(Intent);
+            if (!Interface.IsValid())
+            {
+                continue;
+            }
+            const TOptional<double> Parsed = Interface->FromString(DisplayText, 0.0);
+            if (!Parsed.IsSet() || !FMath::IsFinite(Parsed.GetValue())
+                || Parsed.GetValue() < static_cast<double>(MIN_int32)
+                || Parsed.GetValue() > static_cast<double>(MAX_int32)
+                || FMath::Abs(Parsed.GetValue() - std::round(Parsed.GetValue())) > 1e-7
+                || Interface->ToString(Parsed.GetValue()) != DisplayText)
+            {
+                continue;
+            }
+            const double CandidateNative = Parsed.GetValue() + Change;
+            if (!FMath::IsFinite(CandidateNative)
+                || CandidateNative < static_cast<double>(MIN_int32)
+                || CandidateNative > static_cast<double>(MAX_int32)
+                || FMath::Abs(CandidateNative - std::round(CandidateNative)) > 1e-7)
+            {
+                continue;
+            }
+            const FString Candidate = Interface->ToString(CandidateNative);
+            // If the formatter collapses to a whole frame, that is still
+            // valid. Reject any other conversion to a different time format.
+            double CandidateStep = 0.0;
+            const int32 FirstDigit = Candidate.StartsWith(TEXT("-")) ? 1 : 0;
+            if (!DigitTemporalSubframe::TryGetFrameDigitStep(
+                    Candidate, FirstDigit, CandidateStep)
+                && !DigitTemporalEditable::TryGetPlainNumericDigitStep(
+                    Candidate, FirstDigit, CandidateStep))
+            {
+                continue;
+            }
+            const TOptional<double> Reparsed = Interface->FromString(Candidate,
+                Parsed.GetValue());
+            if (!Reparsed.IsSet() || !FMath::IsFinite(Reparsed.GetValue())
+                || FMath::Abs(Reparsed.GetValue() - CandidateNative) > 1e-7)
+            {
+                continue;
+            }
+            OutDisplayText = Candidate;
+            return true;
+        }
         return false;
     }
     return false;

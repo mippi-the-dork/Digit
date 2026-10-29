@@ -1,4 +1,4 @@
-﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
+// Copyright Mippithedork 2026, Inc. All Rights Reserved.
 
 #include "DigitInputProcessor.h"
 #include "DigitSettings.h"
@@ -1109,12 +1109,6 @@ void FDigitInputProcessor::ApplyDigitCursor()
 
 void FDigitInputProcessor::Tick(const float DeltaTime, FSlateApplication& SlateApp, TSharedRef<ICursor> Cursor)
 {
-    if (LastStagedEditable.IsValid()
-        && SlateApp.GetKeyboardFocusedWidget().Get() != LastStagedEditable.Pin().Get())
-    {
-        LastStagedEditable.Reset();
-        LastStagedSource.Reset();
-    }
     if (LadderWidget.IsValid() && (!LadderSourceSpinBox.IsValid() || !LadderSourceText.IsValid()))
     {
         ClearLadder();
@@ -1167,10 +1161,15 @@ bool FDigitInputProcessor::HandleKeyDownEvent(FSlateApplication& SlateApp, const
         if (FocusedWidget.IsValid()
             && FocusedWidget->GetType() == FName(TEXT("SEditableText")))
         {
-            const FWidgetPath Path = SlateApp.LocateWindowUnderMouse(
-                SlateApp.GetCursorPos(),
-                SlateApp.GetInteractiveTopLevelWindows(),
-                false, InKeyEvent.GetUserIndex());
+            FWidgetPath Path;
+            // The selected digit owns keyboard focus; the pointer may be
+            // elsewhere after selection. Never resolve a different editor's
+            // temporal context from an unrelated cursor location.
+            if (!SlateApp.FindPathToWidget(
+                    FocusedWidget.ToSharedRef(), Path, EVisibility::Visible))
+            {
+                return false;
+            }
             int32 CurvePanelIndex = INDEX_NONE;
             int32 TextBoxIndex = INDEX_NONE;
             int32 EditableIndex = INDEX_NONE;
@@ -1232,32 +1231,52 @@ bool FDigitInputProcessor::HandleKeyDownEvent(FSlateApplication& SlateApp, const
                     }
                     if (bHostEnabled)
                     {
-                        // Require exactly one explicitly selected digit.
-                        // Never reinterpret a caret or multi-digit selection.
-                        const FString DisplayText = TextBox->GetText().ToString();
+                        // Read the LIVE edit buffer, not GetText's bound
+                        // attribute. Slate does not expose the current plain
+                        // edit buffer on SEditableText, but selecting all and
+                        // reading GetSelectedText returns its actual content.
+                        // Restore the user's exact single-digit selection in
+                        // the same callback before staging anything. This
+                        // allows repeated Ctrl+Alt steps without applying a
+                        // stale change, synthesizing commits, or owning a
+                        // duplicate keyframe value cache.
+                        const FTextSelection Selection = Editable->GetSelection();
                         int32 CharacterIndex = INDEX_NONE;
-                        if (DigitTemporalEditable::TryGetSingleSelectedDigit(
-                            Editable->GetSelection(), DisplayText, CharacterIndex))
+                        if (Selection.GetBeginning().IsValid()
+                            && Selection.GetEnd().IsValid()
+                            && Selection.GetBeginning().GetLineIndex() == 0
+                            && Selection.GetEnd().GetLineIndex() == 0
+                            && Selection.GetEnd().GetOffset()
+                                == Selection.GetBeginning().GetOffset() + 1)
                         {
-                            // SEditableText::GetText reports its BOUND source,
-                            // not necessarily the uncommitted edit buffer.
-                            // Do not calculate another step from stale source
-                            // text after SetEditableText has staged a change.
-                            // Clear the guard when focus exits or the host
-                            // genuinely updates its bound property.
-                            if (LastStagedEditable.Pin().Get() == &Editable.Get()
-                                && DisplayText == LastStagedSource)
+                            Editable->SelectAllText();
+                            const FString DisplayText = Editable->GetSelectedText().ToString();
+                            Editable->SelectText(Selection.GetBeginning(), Selection.GetEnd());
+                            if (DisplayText.Len() > 128
+                                || !DigitTemporalEditable::TryGetSingleSelectedDigit(
+                                    Selection, DisplayText, CharacterIndex))
                             {
                                 return false;
                             }
                             FString NextDisplay;
                             const int32 Direction = InKeyEvent.GetKey() == EKeys::Up ? 1 : -1;
-                            if (FDigitSequencerContext::TryStepEditableNonDropTimecode(
+                            // Resolve only against the owning Sequencer. Drop-frame
+                            // steps account for skipped labels; explicit
+                            // subframes require integral native ticks.
+                            // These paths stage text only: the host retains
+                            // Enter/Escape and Undo/Redo transaction ownership.
+                            const bool bVerifiedStep =
+                                FDigitSequencerContext::TryStepEditableNonDropTimecode(
                                     Path, DisplayText, CharacterIndex, Direction, NextDisplay)
+                                || FDigitSequencerContext::TryStepEditableDropFrameTimecode(
+                                    Path, DisplayText, CharacterIndex, Direction, NextDisplay)
+                                || FDigitSequencerContext::TryStepEditableFrameSubframe(
+                                    Path, DisplayText, CharacterIndex, Direction, NextDisplay)
+                                || FDigitSequencerContext::TryStepEditableFrameOrSeconds(
+                                    Path, DisplayText, CharacterIndex, Direction, NextDisplay);
+                            if (bVerifiedStep
                                 && Editable->SetEditableText(FText::FromString(NextDisplay)))
                             {
-                                LastStagedEditable = Editable;
-                                LastStagedSource = DisplayText;
                                 Editable->SelectText(
                                     FTextLocation(0, CharacterIndex),
                                     FTextLocation(0, CharacterIndex + 1));

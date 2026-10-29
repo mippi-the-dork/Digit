@@ -49,5 +49,20 @@ public:
     static bool TryStepEditableNonDropTimecode(const FWidgetPath& Path,
         const FString& DisplayText, int32 CharacterIndex, int32 Direction,
         FString& OutDisplayText);
+    // Also support the text-only Curve Key Time field when the native numeric
+    // interface proves a canonical frames/seconds mapping with integral ticks.
+    // As with timecode, this returns staged *text*, not a property mutation.
+    static bool TryStepEditableFrameOrSeconds(const FWidgetPath& Path,
+        const FString& DisplayText, int32 CharacterIndex, int32 Direction,
+        FString& OutDisplayText);
+    // Drop-frame digits are not constant-tick magnitudes at minute boundaries.
+    // Support text staging only; mouse scrubbing remains intentionally disabled.
+    static bool TryStepEditableDropFrameTimecode(const FWidgetPath& Path,
+        const FString& DisplayText, int32 CharacterIndex, int32 Direction,
+        FString& OutDisplayText);
+    // Native frame/subframe text, e.g. 0024*0.250, needs exact tick proof.
+    static bool TryStepEditableFrameSubframe(const FWidgetPath& Path,
+        const FString& DisplayText, int32 CharacterIndex, int32 Direction,
+        FString& OutDisplayText);
     static bool IsStillCurrent(const FDigitTemporalSpinContext& Context);
 };

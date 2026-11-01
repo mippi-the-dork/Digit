@@ -105,6 +105,20 @@ private:
     bool UpdateLadderSelection(const FPointerEvent& MouseEvent);
     bool IsIntegralSpinBox(const TSharedPtr<SWidget>& Widget) const;
 
+    // An explicitly selected Curve Editor Time/Value digit may be dragged in
+    // the original editable field. No synthetic native mouse-down, external
+    // OnTextCommitted, or property transactions are generated.
+    bool ResolveCurveTextTarget(const FWidgetPath& Path,
+        const SWidget* FocusedWidget, bool& bOutTime) const;
+    bool TryBeginCurveTextDrag(FSlateApplication& SlateApp, const FPointerEvent& Event);
+    bool UpdateCurveTextDrag(FSlateApplication& SlateApp, const FPointerEvent& Event);
+    // Always release only Digit's captured pointer before discarding the weak
+    // source. Native text commits are a separate, optional mouse-up action.
+    void EndCurveTextDrag();
+    bool CanFinishCurveTextDrag(FSlateApplication& SlateApp) const;
+    void FlushDeferredCurveTextCommit(FSlateApplication& SlateApp);
+    void ClearDeferredCurveTextCommit();
+
     bool HasActiveSession() const;
     void QueueRestore(bool bPreserveLadderPreview = false);
     void RestoreActiveDelta();
@@ -114,6 +128,32 @@ private:
 private:
     // The public SEditableText API does not expose its uncommitted buffer or
     // edit transactions. Never re-step stale bound text within the same edit.
+
+    TWeakPtr<SEditableText> CurveTextDragEditable;
+    int32 CurveTextDragPointer = INDEX_NONE;
+    int32 CurveTextDragUser = INDEX_NONE;
+    double CurveTextDragPendingPixels = 0.0;
+    bool bCurveTextDragActive = false;
+    bool bCurveTextDragTime = false;
+    bool bCurveTextDragChanged = false;
+    bool bCurveTextDragOwnsCapture = false;
+    // Selected place is an invariant even if formatting carries add digits.
+    int32 CurveTextDragExpectedIndex = INDEX_NONE;
+    FString CurveTextDragInitialText;
+    FString CurveTextDragLastStaged;
+
+    // The mouse-up input preprocessor must not dispatch native Enter while
+    // Slate is still processing the pointer event. One-shot, weak source
+    // identity, and text snapshot are revalidated on the next post-tick.
+    struct FDeferredCurveTextCommit
+    {
+        TWeakPtr<SEditableText> Editable;
+        FString ExpectedText;
+        int32 ExpectedIndex = INDEX_NONE;
+        int32 UserIndex = INDEX_NONE;
+        bool bTime = false;
+    };
+    TOptional<FDeferredCurveTextCommit> DeferredCurveTextCommit;
 
     TWeakPtr<SWidget> ActiveSpinBox;
     TWeakPtr<STextBlock> ActiveTextWidget;

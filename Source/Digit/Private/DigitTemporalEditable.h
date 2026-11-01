@@ -1,8 +1,9 @@
-// Copyright Mippithedork 2026, Inc. All Rights Reserved.
+﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
 #pragma once
 
 #include "CoreMinimal.h"
 #include "Framework/Text/TextLayout.h"
+#include <initializer_list>
 
 // An opt-in keyboard interaction, deliberately separate from native SSpinBox
 // slider capture. Select exactly one digit in the original editor text field.
@@ -98,4 +99,106 @@ namespace DigitTemporalEditable
         OutDisplayedStep = FMath::Pow(10.0, static_cast<double>(Place));
         return FMath::IsFinite(OutDisplayedStep) && OutDisplayedStep > 0.0;
     }
+
+    // Move among digits of the SAME native editor text buffer. Do not
+    // reinterpret punctuation, timecode separators, or marker-only subframes
+    // as numeric positions. Native value commits are not involved.
+    inline bool TryNavigateSelectedDigit(const FString& DisplayText,
+        int32 CurrentIndex, int32 Direction, int32& OutIndex)
+    {
+        OutIndex = INDEX_NONE;
+        if ((Direction != 1 && Direction != -1)
+            || DisplayText.IsEmpty() || DisplayText.Len() > 128
+            || !DisplayText.IsValidIndex(CurrentIndex)
+            || DisplayText[CurrentIndex] < TEXT('0')
+            || DisplayText[CurrentIndex] > TEXT('9'))
+        {
+            return false;
+        }
+        for (int32 Index = CurrentIndex + Direction;
+             DisplayText.IsValidIndex(Index); Index += Direction)
+        {
+            if (DisplayText[Index] >= TEXT('0') && DisplayText[Index] <= TEXT('9'))
+            {
+                OutIndex = Index;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Native Time formatting can widen a frame number (0009 -> 0010 or
+    // 9 -> 10), or change its sign. A stale character offset then selects
+    // the WRONG magnitude on the next keypress. Track the ordinal digit from
+    // the right, as the Value adapter already does. Refuse remapping if the
+    // native formatter changed the fractional precision or token type.
+    inline bool TryRemapSelectedDigit(const FString& Source,
+        int32 SourceIndex, const FString& Target, int32& OutIndex)
+    {
+        OutIndex = INDEX_NONE;
+        if (Source.IsEmpty() || Target.IsEmpty()
+            || Source.Len() > 128 || Target.Len() > 128
+            || !Source.IsValidIndex(SourceIndex)
+            || Source[SourceIndex] < TEXT('0')
+            || Source[SourceIndex] > TEXT('9'))
+        {
+            return false;
+        }
+        // Do not cross between seconds, timecode, and subframe display
+        // families during a staged edit. Their decimal places are distinct.
+        for (const TCHAR* Punctuation : {TEXT("."), TEXT("*"), TEXT(":"),
+                 TEXT(";"), TEXT("["), TEXT("]"), TEXT("s")})
+        {
+            if (Source.Contains(Punctuation) != Target.Contains(Punctuation))
+            {
+                return false;
+            }
+        }
+        const int32 SourcePoint = Source.Find(TEXT("."));
+        const int32 TargetPoint = Target.Find(TEXT("."));
+        if ((SourcePoint != INDEX_NONE || TargetPoint != INDEX_NONE))
+        {
+            int32 SourceFractionDigits = 0;
+            int32 TargetFractionDigits = 0;
+            for (int32 Index = SourcePoint + 1; Index < Source.Len(); ++Index)
+            {
+                if (Source[Index] >= TEXT('0') && Source[Index] <= TEXT('9'))
+                {
+                    ++SourceFractionDigits;
+                }
+            }
+            for (int32 Index = TargetPoint + 1; Index < Target.Len(); ++Index)
+            {
+                if (Target[Index] >= TEXT('0') && Target[Index] <= TEXT('9'))
+                {
+                    ++TargetFractionDigits;
+                }
+            }
+            if (SourceFractionDigits != TargetFractionDigits)
+            {
+                return false;
+            }
+        }
+        int32 DigitsToRight = 0;
+        for (int32 Index = SourceIndex + 1; Index < Source.Len(); ++Index)
+        {
+            if (Source[Index] >= TEXT('0') && Source[Index] <= TEXT('9'))
+            {
+                ++DigitsToRight;
+            }
+        }
+        for (int32 Index = Target.Len() - 1; Index >= 0; --Index)
+        {
+            if (Target[Index] >= TEXT('0') && Target[Index] <= TEXT('9'))
+            {
+                if (DigitsToRight-- == 0)
+                {
+                    OutIndex = Index;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
 }

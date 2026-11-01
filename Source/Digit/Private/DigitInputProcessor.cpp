@@ -1,4 +1,4 @@
-// Copyright Mippithedork 2026, Inc. All Rights Reserved.
+﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
 
 #include "DigitInputProcessor.h"
 #include "DigitSettings.h"
@@ -9,6 +9,9 @@
 #include "DigitTemporalTimecode.h"
 #include "DigitTemporalQuantize.h"
 #include "DigitTemporalEditable.h"
+#include "DigitCurveEditableValue.h"
+#include "DigitCurveTextMouse.h"
+#include "DigitScrubDisplayPolicy.h"
 #include "Input/Events.h"
 #include "InputCoreTypes.h"
 #include "Layout/Children.h"
@@ -686,17 +689,8 @@ namespace DigitPrivate
 
     static double GetDefaultInputEventMultiplier(const FInputEvent& InputEvent)
     {
-        if (InputEvent.IsShiftDown())
-        {
-            return InputEvent.IsAltDown() ? 100.0 : 10.0;
-        }
-
-        if (InputEvent.IsControlDown())
-        {
-            return InputEvent.IsAltDown() ? 0.01 : 0.1;
-        }
-
-        return 1.0;
+        return DigitScrubDisplayPolicy::NativeModifierMultiplier(
+            InputEvent.IsShiftDown(), InputEvent.IsControlDown(), InputEvent.IsAltDown());
     }
 
     static double ApplySliderExponent(double Fraction, double SliderExponent)
@@ -1107,8 +1101,529 @@ void FDigitInputProcessor::ApplyDigitCursor()
             : EMouseCursor::Default);
 }
 
+bool FDigitInputProcessor::ResolveCurveTextTarget(const FWidgetPath& Path,
+    const SWidget* FocusedWidget, bool& bOutTime) const
+{
+    bOutTime = false;
+    if (!FocusedWidget || FocusedWidget->GetType() != FName(TEXT("SEditableText")))
+    {
+        return false;
+    }
+    int32 Panel = INDEX_NONE;
+    int32 Box = INDEX_NONE;
+    int32 Editable = INDEX_NONE;
+    for (int32 Index = 0; Index < Path.Widgets.Num(); ++Index)
+    {
+        const TSharedRef<SWidget>& Widget = Path.Widgets[Index].Widget;
+        if (Widget->GetType() == FName(TEXT("SCurveKeyDetailPanel")))
+        {
+            Panel = Index;
+        }
+        if (Widget->GetType() == FName(TEXT("SEditableTextBox")))
+        {
+            Box = Index;
+        }
+        if (&Widget.Get() == FocusedWidget)
+        {
+            Editable = Index;
+        }
+    }
+    if (Panel == INDEX_NONE || Box <= Panel || Editable <= Box)
+    {
+        return false;
+    }
+    const TSharedRef<SEditableTextBox> TextBox =
+        StaticCastSharedRef<SEditableTextBox>(Path.Widgets[Box].Widget);
+    const TSharedRef<SEditableText> Edit =
+        StaticCastSharedRef<SEditableText>(Path.Widgets[Editable].Widget);
+    if (TextBox->IsReadOnly() || TextBox->IsPassword()
+        || Edit->IsTextReadOnly())
+    {
+        return false;
+    }
+    for (int32 Index = Panel; Index <= Editable; ++Index)
+    {
+        const TSharedRef<SWidget>& Widget = Path.Widgets[Index].Widget;
+        if (!Widget->IsEnabled()
+            || Widget->GetVisibility() == EVisibility::Collapsed
+            || Widget->GetVisibility() == EVisibility::Hidden)
+        {
+            return false;
+        }
+    }
+    // Use the same exact two-child structural proof as the existing
+    // keyboard integration. Never infer field identity from a localized
+    // label or a digit-looking text widget in a different editor panel.
+    for (int32 Index = Panel + 1; Index < Box; ++Index)
+    {
+        const TSharedRef<SWidget>& Widget = Path.Widgets[Index].Widget;
+        if (Widget->GetType() == FName(TEXT("SHorizontalBox")))
+        {
+            FChildren* Children = Widget->GetChildren();
+            if (!Children || Children->Num() != 2 || Index + 1 >= Path.Widgets.Num())
+            {
+                return false;
+            }
+            const SWidget* Branch = &Path.Widgets[Index + 1].Widget.Get();
+            if (&Children->GetChildAt(0).Get() == Branch)
+            {
+                bOutTime = true;
+                return true;
+            }
+            if (&Children->GetChildAt(1).Get() == Branch)
+            {
+                bOutTime = false;
+                return true;
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
+void FDigitInputProcessor::EndCurveTextDrag()
+{
+    // A preprocessor consumes mouse-down for its own gesture. Requesting a
+    // genuine Slate capture (rather than replaying native OnMouseButtonDown)
+    // means ALL exit paths must release that exact captured widget/pointer.
+    // Never release another editor's mouse capture or clear all users.
+    const TSharedPtr<SEditableText> Edit = CurveTextDragEditable.Pin();
+    if (bCurveTextDragActive && bCurveTextDragOwnsCapture
+        && Edit.IsValid() && Edit->HasMouseCapture()
+        && FSlateApplication::IsInitialized())
+    {
+        FSlateApplication& SlateApp = FSlateApplication::Get();
+        FWidgetPath Path;
+        if (SlateApp.FindPathToWidget(Edit.ToSharedRef(), Path, EVisibility::Visible))
+        {
+            SlateApp.ProcessExternalReply(Path,
+                FReply::Handled().ReleaseMouseCapture(),
+                CurveTextDragUser, CurveTextDragPointer);
+        }
+        // If the widget was detached, Slate will release its capture as the
+        // widget path is torn down. Never issue a global capture release.
+    }
+    bCurveTextDragActive = false;
+    bCurveTextDragTime = false;
+    bCurveTextDragChanged = false;
+    bCurveTextDragOwnsCapture = false;
+    CurveTextDragInitialText.Reset();
+    CurveTextDragLastStaged.Reset();
+    CurveTextDragEditable.Reset();
+    CurveTextDragExpectedIndex = INDEX_NONE;
+    CurveTextDragPointer = INDEX_NONE;
+    CurveTextDragUser = INDEX_NONE;
+    CurveTextDragPendingPixels = 0.0;
+}
+
+bool FDigitInputProcessor::CanFinishCurveTextDrag(FSlateApplication& SlateApp) const
+{
+    const TSharedPtr<SEditableText> Edit = CurveTextDragEditable.Pin();
+    if (!bCurveTextDragActive || !bCurveTextDragChanged
+        || !bCurveTextDragOwnsCapture || !Edit.IsValid()
+        || !Edit->HasMouseCapture()
+        || SlateApp.GetKeyboardFocusedWidget().Get() != Edit.Get())
+    {
+        return false;
+    }
+    FWidgetPath Path;
+    bool bTime = false;
+    if (!SlateApp.FindPathToWidget(Edit.ToSharedRef(), Path, EVisibility::Visible)
+        || !ResolveCurveTextTarget(Path, Edit.Get(), bTime)
+        || bTime != bCurveTextDragTime)
+    {
+        return false;
+    }
+    // Check the LIVE edit buffer, not the attribute bound to the keyframe.
+    // If the editor changed the text or selection during drag, do not commit.
+    const FTextSelection Selection = Edit->GetSelection();
+    if (!Selection.GetBeginning().IsValid() || !Selection.GetEnd().IsValid()
+        || Selection.GetBeginning().GetLineIndex() != 0
+        || Selection.GetEnd().GetLineIndex() != 0
+        || Selection.GetEnd().GetOffset() != Selection.GetBeginning().GetOffset() + 1)
+    {
+        return false;
+    }
+    Edit->SelectAllText();
+    const FString LiveText = Edit->GetSelectedText().ToString();
+    Edit->SelectText(Selection.GetBeginning(), Selection.GetEnd());
+    int32 SelectedIndex = INDEX_NONE;
+    return DigitTemporalEditable::TryGetSingleSelectedDigit(
+            Selection, LiveText, SelectedIndex)
+        && DigitCurveTextMouse::IsUninterruptedEdit(
+            LiveText, CurveTextDragInitialText, CurveTextDragLastStaged,
+            SelectedIndex, CurveTextDragExpectedIndex)
+        && LiveText != CurveTextDragInitialText;
+}
+
+void FDigitInputProcessor::ClearDeferredCurveTextCommit()
+{
+    DeferredCurveTextCommit.Reset();
+}
+
+void FDigitInputProcessor::FlushDeferredCurveTextCommit(FSlateApplication& SlateApp)
+{
+    if (!DeferredCurveTextCommit.IsSet())
+    {
+        return;
+    }
+
+    // Consume before calling back into Slate. Synthetic key dispatch may
+    // reenter our input processor and must never schedule a second commit.
+    const FDeferredCurveTextCommit Pending = DeferredCurveTextCommit.GetValue();
+    ClearDeferredCurveTextCommit();
+
+    const UDigitSettings* Settings = UDigitSettings::Get();
+    const TSharedPtr<SEditableText> Edit = Pending.Editable.Pin();
+    if (!Edit.IsValid())
+    {
+        return;
+    }
+
+    const bool bFocused = SlateApp.GetKeyboardFocusedWidget().Get() == Edit.Get();
+    const bool bCaptureReleased = !Edit->HasMouseCapture()
+        && !SlateApp.HasUserMouseCapture(Pending.UserIndex);
+    FWidgetPath Path;
+    bool bTime = false;
+    const bool bAttached = SlateApp.FindPathToWidget(
+        Edit.ToSharedRef(), Path, EVisibility::Visible)
+        && ResolveCurveTextTarget(Path, Edit.Get(), bTime)
+        && bTime == Pending.bTime;
+
+    bool bSelectionStable = false;
+    bool bBufferUnchanged = false;
+    if (bAttached && bFocused)
+    {
+        const FTextSelection Selection = Edit->GetSelection();
+        if (Selection.GetBeginning().IsValid() && Selection.GetEnd().IsValid()
+            && Selection.GetBeginning().GetLineIndex() == 0
+            && Selection.GetEnd().GetLineIndex() == 0
+            && Selection.GetBeginning().GetOffset() == Pending.ExpectedIndex
+            && Selection.GetEnd().GetOffset() == Pending.ExpectedIndex + 1)
+        {
+            // Bound Text is not the currently staged edit. GetSelectedText
+            // reads the real buffer, using the original SEditableText widget.
+            Edit->SelectAllText();
+            const FString LiveText = Edit->GetSelectedText().ToString();
+            Edit->SelectText(Selection.GetBeginning(), Selection.GetEnd());
+            int32 CurrentIndex = INDEX_NONE;
+            bSelectionStable = DigitTemporalEditable::TryGetSingleSelectedDigit(
+                Selection, LiveText, CurrentIndex)
+                && CurrentIndex == Pending.ExpectedIndex;
+            bBufferUnchanged = LiveText == Pending.ExpectedText;
+        }
+    }
+    const bool bReady = DigitCurveTextMouse::CanDispatchDeferredCommit(
+        Settings && Settings->bCurveEditorTextDrag
+            && Settings->bCurveEditorTextDragUseNativeCapture
+            && Settings->bCurveEditorTextDragCommitOnRelease,
+        bFocused, bAttached, bSelectionStable, bBufferUnchanged, bCaptureReleased);
+    if (!bReady)
+    {
+        if (Settings && Settings->bLogWidgetDiagnostics)
+        {
+            UE_LOG(LogDigit, Display,
+                TEXT("CurveEditor mouse release: native commit cancelled (focus=%d attached=%d selection=%d buffer=%d released=%d)"),
+                bFocused, bAttached, bSelectionStable, bBufferUnchanged, bCaptureReleased);
+        }
+        return;
+    }
+
+    // This requests the ORIGINAL Slate host's Enter path after pointer
+    // dispatch. Digit does not call any property handler or begin a second
+    // transaction; actual host commit/Undo must still be tested in-editor.
+    const FKeyEvent CommitKey(EKeys::Enter, FModifierKeysState(),
+        static_cast<uint32>(Pending.UserIndex), false, 0, 0);
+    SlateApp.ProcessKeyDownEvent(CommitKey);
+    if (Settings && Settings->bLogWidgetDiagnostics)
+    {
+        UE_LOG(LogDigit, Display,
+            TEXT("CurveEditor mouse release: native Enter dispatched to original Time/Value field (host owns transaction)"));
+    }
+}
+
+bool FDigitInputProcessor::TryBeginCurveTextDrag(FSlateApplication& SlateApp,
+    const FPointerEvent& Event)
+{
+    const UDigitSettings* Settings = UDigitSettings::Get();
+    if (!Settings || !Settings->bCurveEditorTextDrag
+        || Event.GetEffectingButton() != EKeys::LeftMouseButton
+        || !Event.IsControlDown() || !Event.IsAltDown()
+        || HasActiveSession() || bRestorePending || LadderWidget.IsValid()
+        || (Settings->bCurveEditorTextDragUseNativeCapture
+            && SlateApp.HasUserMouseCapture(Event.GetUserIndex())))
+    {
+        return false;
+    }
+    const TSharedPtr<SWidget> Focused = SlateApp.GetKeyboardFocusedWidget();
+    if (!Focused.IsValid() || Focused->GetType() != FName(TEXT("SEditableText")))
+    {
+        return false;
+    }
+    FWidgetPath FocusedPath;
+    if (!SlateApp.FindPathToWidget(Focused.ToSharedRef(), FocusedPath, EVisibility::Visible))
+    {
+        return false;
+    }
+    bool bTime = false;
+    if (!ResolveCurveTextTarget(FocusedPath, Focused.Get(), bTime))
+    {
+        return false;
+    }
+    // A drag may only begin physically inside the SAME original host text
+    // box. An off-widget Ctrl+Alt click must never change a selected key.
+    FWidgetPath PointerPath = SlateApp.LocateWindowUnderMouse(
+        Event.GetScreenSpacePosition(), SlateApp.GetInteractiveTopLevelWindows(),
+        false, Event.GetUserIndex());
+    const SWidget* SourceTextBox = nullptr;
+    // FWidgetPath::Widgets is FArrangedChildren, not a range-iterable array.
+    // Use its native indexed access so this compiles in UE 5.8.
+    for (int32 WidgetIndex = 0; WidgetIndex < FocusedPath.Widgets.Num(); ++WidgetIndex)
+    {
+        const TSharedRef<SWidget>& Widget = FocusedPath.Widgets[WidgetIndex].Widget;
+        if (Widget->GetType() == FName(TEXT("SEditableTextBox")))
+        {
+            SourceTextBox = &Widget.Get();
+        }
+    }
+    bool bOverOriginalTextBox = false;
+    for (int32 WidgetIndex = 0; WidgetIndex < PointerPath.Widgets.Num(); ++WidgetIndex)
+    {
+        if (&PointerPath.Widgets[WidgetIndex].Widget.Get() == SourceTextBox)
+        {
+            bOverOriginalTextBox = true;
+            break;
+        }
+    }
+    if (!bOverOriginalTextBox || !SourceTextBox)
+    {
+        return false;
+    }
+    const TSharedRef<SEditableText> Edit = StaticCastSharedRef<SEditableText>(Focused.ToSharedRef());
+    const FTextSelection Selection = Edit->GetSelection();
+    if (!Selection.GetBeginning().IsValid() || !Selection.GetEnd().IsValid()
+        || Selection.GetBeginning().GetLineIndex() != 0
+        || Selection.GetEnd().GetLineIndex() != 0
+        || Selection.GetEnd().GetOffset() != Selection.GetBeginning().GetOffset() + 1)
+    {
+        return false;
+    }
+    Edit->SelectAllText();
+    const FString CurrentText = Edit->GetSelectedText().ToString();
+    Edit->SelectText(Selection.GetBeginning(), Selection.GetEnd());
+    int32 Index = INDEX_NONE;
+    if (!DigitTemporalEditable::TryGetSingleSelectedDigit(Selection, CurrentText, Index))
+    {
+        return false;
+    }
+    // Prove that at least one step is representable before consuming native
+    // mouse-down. Otherwise let the host edit normally (marker-only subframe,
+    // read-only panel, invalid native frame tick, unsupported Value string).
+    // A field at its upper numeric limit can still move LEFT. Preflight
+    // both directions before consuming mouse-down; only a completely
+    // uneditable source should fall back to the host's native input.
+    const auto CanStepInDirection = [&](int32 Direction) -> bool
+    {
+        FString Candidate;
+        int32 Remapped = INDEX_NONE;
+        if (bTime)
+        {
+            return (FDigitSequencerContext::TryStepEditableNonDropTimecode(
+                FocusedPath, CurrentText, Index, Direction, Candidate)
+                || FDigitSequencerContext::TryStepEditableDropFrameTimecode(
+                FocusedPath, CurrentText, Index, Direction, Candidate)
+                || FDigitSequencerContext::TryStepEditableFrameSubframe(
+                FocusedPath, CurrentText, Index, Direction, Candidate)
+                || FDigitSequencerContext::TryStepEditableFrameOrSeconds(
+                FocusedPath, CurrentText, Index, Direction, Candidate))
+                && DigitTemporalEditable::TryRemapSelectedDigit(
+                    CurrentText, Index, Candidate, Remapped);
+        }
+        return DigitCurveEditableValue::TryStepSelectedPlace(
+            CurrentText, Index, Direction, Candidate, Remapped);
+    };
+    const bool bCanStep = CanStepInDirection(1) || CanStepInDirection(-1);
+    if (!bCanStep)
+    {
+        return false;
+    }
+    // Capture is a preview setting, OFF by default to preserve the
+    // v1.0.39.1 workflow until verified with real Slate windows. The original
+    // no-capture text drag remains available and unchanged otherwise.
+    if (Settings->bCurveEditorTextDragUseNativeCapture)
+    {
+        SlateApp.ProcessExternalReply(FocusedPath,
+            FReply::Handled().CaptureMouse(Edit),
+            Event.GetUserIndex(), Event.GetPointerIndex());
+        if (!Edit->HasMouseCapture())
+        {
+            // An editor may reject capture (e.g. teardown/focus transition).
+            return false;
+        }
+    }
+    bCurveTextDragActive = true;
+    bCurveTextDragTime = bTime;
+    bCurveTextDragChanged = false;
+    bCurveTextDragOwnsCapture = Settings->bCurveEditorTextDragUseNativeCapture;
+    CurveTextDragInitialText = CurrentText;
+    CurveTextDragLastStaged.Reset();
+    CurveTextDragEditable = Edit;
+    CurveTextDragExpectedIndex = Index;
+    CurveTextDragPointer = Event.GetPointerIndex();
+    CurveTextDragUser = Event.GetUserIndex();
+    CurveTextDragPendingPixels = 0.0;
+    return true; // Only this opt-in mouse-down is consumed.
+}
+
+bool FDigitInputProcessor::UpdateCurveTextDrag(FSlateApplication& SlateApp,
+    const FPointerEvent& Event)
+{
+    if (!bCurveTextDragActive)
+    {
+        return false;
+    }
+    if (Event.GetPointerIndex() != CurveTextDragPointer
+        || Event.GetUserIndex() != CurveTextDragUser)
+    {
+        return false;
+    }
+    const TSharedPtr<SEditableText> Edit = CurveTextDragEditable.Pin();
+    if (!Edit.IsValid()
+        || (bCurveTextDragOwnsCapture && !Edit->HasMouseCapture())
+        || !Event.IsMouseButtonDown(EKeys::LeftMouseButton)
+        || SlateApp.GetKeyboardFocusedWidget().Get() != Edit.Get())
+    {
+        EndCurveTextDrag();
+        return false;
+    }
+    FWidgetPath Path;
+    bool bCurrentTime = false;
+    if (!SlateApp.FindPathToWidget(Edit.ToSharedRef(), Path, EVisibility::Visible)
+        || !ResolveCurveTextTarget(Path, Edit.Get(), bCurrentTime)
+        || bCurrentTime != bCurveTextDragTime)
+    {
+        EndCurveTextDrag();
+        return false;
+    }
+    // Require an explicit one-digit selection on every event. If the host
+    // changes it or replaces the edit buffer while dragging, do nothing.
+    const FTextSelection Selection = Edit->GetSelection();
+    if (!Selection.GetBeginning().IsValid() || !Selection.GetEnd().IsValid()
+        || Selection.GetEnd().GetOffset() != Selection.GetBeginning().GetOffset() + 1
+        || Selection.GetBeginning().GetLineIndex() != 0
+        || Selection.GetEnd().GetLineIndex() != 0)
+    {
+        EndCurveTextDrag();
+        return false;
+    }
+    Edit->SelectAllText();
+    const FString CurrentText = Edit->GetSelectedText().ToString();
+    Edit->SelectText(Selection.GetBeginning(), Selection.GetEnd());
+    int32 Index = INDEX_NONE;
+    if (!DigitTemporalEditable::TryGetSingleSelectedDigit(Selection, CurrentText, Index))
+    {
+        EndCurveTextDrag();
+        return false;
+    }
+    // Another editor event may modify the uncommitted buffer or move the
+    // selected digit while this pointer is held. Do not reinterpret that
+    // external edit at Digit's old place value.
+    if (!DigitCurveTextMouse::IsUninterruptedEdit(CurrentText,
+        CurveTextDragInitialText, CurveTextDragLastStaged,
+        Index, CurveTextDragExpectedIndex))
+    {
+        EndCurveTextDrag();
+        return false;
+    }
+    const UDigitSettings* Settings = UDigitSettings::Get();
+    const double Sensitivity = Settings && FMath::IsFinite(Settings->ScrubSensitivity)
+        ? FMath::Clamp(static_cast<double>(Settings->ScrubSensitivity), 0.1, 10.0)
+        : 1.0;
+    const double PixelsPerStep = DigitCurveTextMouse::GetPixelsPerStep(
+        Sensitivity, Event.IsShiftDown());
+    const double CursorDelta = static_cast<double>(Event.GetCursorDelta().X);
+    if (!FMath::IsFinite(CursorDelta))
+    {
+        EndCurveTextDrag();
+        return true;
+    }
+    CurveTextDragPendingPixels += CursorDelta;
+    double Remaining = CurveTextDragPendingPixels;
+    const int32 SignedSteps = DigitCurveTextMouse::ConsumeSteps(Remaining, PixelsPerStep);
+    if (SignedSteps == 0)
+    {
+        return true;
+    }
+    FString Next = CurrentText;
+    int32 NextIndex = Index;
+    bool bValid = false;
+    if (!bCurveTextDragTime)
+    {
+        bValid = DigitCurveTextMouse::TryStageValueSteps(
+            CurrentText, Index, SignedSteps, Next, NextIndex);
+    }
+    else
+    {
+        bValid = true;
+        for (int32 Step = 0; Step < FMath::Abs(SignedSteps); ++Step)
+        {
+            const FString Prior = Next;
+            const int32 PriorIndex = NextIndex;
+            FString Candidate;
+            const int32 Direction = SignedSteps > 0 ? 1 : -1;
+            const bool bVerified =
+                FDigitSequencerContext::TryStepEditableNonDropTimecode(
+                    Path, Prior, PriorIndex, Direction, Candidate)
+                || FDigitSequencerContext::TryStepEditableDropFrameTimecode(
+                    Path, Prior, PriorIndex, Direction, Candidate)
+                || FDigitSequencerContext::TryStepEditableFrameSubframe(
+                    Path, Prior, PriorIndex, Direction, Candidate)
+                || FDigitSequencerContext::TryStepEditableFrameOrSeconds(
+                    Path, Prior, PriorIndex, Direction, Candidate);
+            int32 Remapped = INDEX_NONE;
+            if (!bVerified || !DigitTemporalEditable::TryRemapSelectedDigit(
+                Prior, PriorIndex, Candidate, Remapped))
+            {
+                bValid = false;
+                break;
+            }
+            Next = MoveTemp(Candidate);
+            NextIndex = Remapped;
+        }
+    }
+    if (!bValid || Next == CurrentText)
+    {
+        // No partial staging if any tick or numeric boundary rejects a step.
+        CurveTextDragPendingPixels = 0.0;
+        return true;
+    }
+    if (!Edit->SetEditableText(FText::FromString(Next)))
+    {
+        EndCurveTextDrag();
+        return true;
+    }
+    Edit->SelectText(FTextLocation(0, NextIndex), FTextLocation(0, NextIndex + 1));
+    CurveTextDragPendingPixels = Remaining;
+    bCurveTextDragChanged = Next != CurveTextDragInitialText;
+    CurveTextDragLastStaged = Next;
+    CurveTextDragExpectedIndex = NextIndex;
+    // This is an edit-buffer stage. Native Enter/Escape/focus loss retains
+    // full ownership of keyframe commits, cancel, and eventual Undo/Redo.
+    return true;
+}
+
 void FDigitInputProcessor::Tick(const float DeltaTime, FSlateApplication& SlateApp, TSharedRef<ICursor> Cursor)
 {
+    if (bCurveTextDragActive)
+    {
+        const TSharedPtr<SEditableText> Text = CurveTextDragEditable.Pin();
+        if (!Text.IsValid()
+            || (bCurveTextDragOwnsCapture && !Text->HasMouseCapture())
+            || SlateApp.GetKeyboardFocusedWidget().Get() != Text.Get())
+        {
+            EndCurveTextDrag();
+        }
+    }
     if (LadderWidget.IsValid() && (!LadderSourceSpinBox.IsValid() || !LadderSourceText.IsValid()))
     {
         ClearLadder();
@@ -1147,15 +1662,25 @@ void FDigitInputProcessor::Tick(const float DeltaTime, FSlateApplication& SlateA
 
 bool FDigitInputProcessor::HandleKeyDownEvent(FSlateApplication& SlateApp, const FKeyEvent& InKeyEvent)
 {
-    // An explicit keyboard-only path for Curve Editor Time's text editor.
+    ClearDeferredCurveTextCommit(); // Escape/typing/host Enter wins over pending auto-commit.
+    // Let the native text field handle Enter, Escape, and focus changes.
+    // Neither drag staging nor cancellation generates a second property commit.
+    if (bCurveTextDragActive)
+    {
+        EndCurveTextDrag();
+    }
+    // An explicit keyboard staging path for Curve Editor key Time and Value text.
     // Keep this separate from SSpinBox capture: SEditableTextBox has no
     // public numeric slider transaction or external OnTextCommitted call.
     // Stage a valid formatted edit, then let Enter / focus loss invoke the
     // original FFrameNumberDetailsCustomization property-handle callback.
+    const bool bCurveTextStep = InKeyEvent.GetKey() == EKeys::Up
+        || InKeyEvent.GetKey() == EKeys::Down;
+    const bool bCurveTextNavigate = InKeyEvent.GetKey() == EKeys::Left
+        || InKeyEvent.GetKey() == EKeys::Right;
     if (!HasActiveSession() && !bRestorePending
         && InKeyEvent.IsControlDown() && InKeyEvent.IsAltDown()
-        && !InKeyEvent.IsShiftDown()
-        && (InKeyEvent.GetKey() == EKeys::Up || InKeyEvent.GetKey() == EKeys::Down))
+        && (bCurveTextStep || (bCurveTextNavigate && !InKeyEvent.IsShiftDown())))
     {
         const TSharedPtr<SWidget> FocusedWidget = SlateApp.GetKeyboardFocusedWidget();
         if (FocusedWidget.IsValid()
@@ -1196,8 +1721,9 @@ bool FDigitInputProcessor::HandleKeyDownEvent(FSlateApplication& SlateApp, const
             {
                 // UE 5.8.3 SCurveKeyDetailPanel uses an SHorizontalBox:
                 // child 0 is Time, child 1 is Value. The temporary loading
-                // placeholder must not qualify as a frame editor.
+                // placeholder must not qualify as a numeric editor.
                 bool bInsideTimeBranch = false;
+                bool bInsideValueBranch = false;
                 for (int32 Index = CurvePanelIndex + 1; Index < TextBoxIndex; ++Index)
                 {
                     const TSharedRef<SWidget>& Item = Path.Widgets[Index].Widget;
@@ -1207,13 +1733,14 @@ bool FDigitInputProcessor::HandleKeyDownEvent(FSlateApplication& SlateApp, const
                         if (Children && Children->Num() == 2
                             && Index + 1 < Path.Widgets.Num())
                         {
-                            bInsideTimeBranch = &Children->GetChildAt(0).Get()
-                                == &Path.Widgets[Index + 1].Widget.Get();
+                            const SWidget* Branch = &Path.Widgets[Index + 1].Widget.Get();
+                            bInsideTimeBranch = &Children->GetChildAt(0).Get() == Branch;
+                            bInsideValueBranch = &Children->GetChildAt(1).Get() == Branch;
                         }
                         break;
                     }
                 }
-                if (bInsideTimeBranch)
+                if (bInsideTimeBranch || bInsideValueBranch)
                 {
                     const TSharedRef<SEditableTextBox> TextBox =
                         StaticCastSharedRef<SEditableTextBox>(Path.Widgets[TextBoxIndex].Widget);
@@ -1258,28 +1785,79 @@ bool FDigitInputProcessor::HandleKeyDownEvent(FSlateApplication& SlateApp, const
                             {
                                 return false;
                             }
-                            FString NextDisplay;
+                            if (bCurveTextNavigate)
+                            {
+                                const int32 Direction = InKeyEvent.GetKey() == EKeys::Right ? 1 : -1;
+                                int32 AdjacentDigit = INDEX_NONE;
+                                if (DigitTemporalEditable::TryNavigateSelectedDigit(
+                                    DisplayText, CharacterIndex, Direction, AdjacentDigit))
+                                {
+                                    Editable->SelectText(FTextLocation(0, AdjacentDigit),
+                                        FTextLocation(0, AdjacentDigit + 1));
+                                    return true;
+                                }
+                                return false;
+                            }
+                            // Shift accelerates by ten *individually validated*
+                            // place-value steps. This matters at drop-frame
+                            // boundaries, where a single delta of 10 ticks
+                            // would not describe the native timecode label.
                             const int32 Direction = InKeyEvent.GetKey() == EKeys::Up ? 1 : -1;
-                            // Resolve only against the owning Sequencer. Drop-frame
-                            // steps account for skipped labels; explicit
-                            // subframes require integral native ticks.
-                            // These paths stage text only: the host retains
-                            // Enter/Escape and Undo/Redo transaction ownership.
-                            const bool bVerifiedStep =
-                                FDigitSequencerContext::TryStepEditableNonDropTimecode(
-                                    Path, DisplayText, CharacterIndex, Direction, NextDisplay)
-                                || FDigitSequencerContext::TryStepEditableDropFrameTimecode(
-                                    Path, DisplayText, CharacterIndex, Direction, NextDisplay)
-                                || FDigitSequencerContext::TryStepEditableFrameSubframe(
-                                    Path, DisplayText, CharacterIndex, Direction, NextDisplay)
-                                || FDigitSequencerContext::TryStepEditableFrameOrSeconds(
-                                    Path, DisplayText, CharacterIndex, Direction, NextDisplay);
-                            if (bVerifiedStep
+                            const int32 StepCount = InKeyEvent.IsShiftDown() ? 10 : 1;
+                            FString NextDisplay = DisplayText;
+                            int32 NextCharacterIndex = CharacterIndex;
+                            bool bAllStepsValid = true;
+                            for (int32 Step = 0; Step < StepCount; ++Step)
+                            {
+                                const FString CurrentDisplay = NextDisplay;
+                                const int32 CurrentIndex = NextCharacterIndex;
+                                if (bInsideTimeBranch)
+                                {
+                                    FString Candidate;
+                                    const bool bVerifiedTimeStep =
+                                        FDigitSequencerContext::TryStepEditableNonDropTimecode(
+                                            Path, CurrentDisplay, CurrentIndex, Direction, Candidate)
+                                        || FDigitSequencerContext::TryStepEditableDropFrameTimecode(
+                                            Path, CurrentDisplay, CurrentIndex, Direction, Candidate)
+                                        || FDigitSequencerContext::TryStepEditableFrameSubframe(
+                                            Path, CurrentDisplay, CurrentIndex, Direction, Candidate)
+                                        || FDigitSequencerContext::TryStepEditableFrameOrSeconds(
+                                            Path, CurrentDisplay, CurrentIndex, Direction, Candidate);
+                                    int32 RemappedIndex = INDEX_NONE;
+                                    if (!bVerifiedTimeStep
+                                        || !DigitTemporalEditable::TryRemapSelectedDigit(
+                                            CurrentDisplay, CurrentIndex, Candidate, RemappedIndex))
+                                    {
+                                        bAllStepsValid = false;
+                                        break;
+                                    }
+                                    NextDisplay = MoveTemp(Candidate);
+                                    NextCharacterIndex = RemappedIndex;
+                                }
+                                else
+                                {
+                                    FString Candidate;
+                                    int32 RemappedIndex = INDEX_NONE;
+                                    if (!DigitCurveEditableValue::TryStepSelectedPlace(
+                                        CurrentDisplay, CurrentIndex, Direction,
+                                        Candidate, RemappedIndex))
+                                    {
+                                        bAllStepsValid = false;
+                                        break;
+                                    }
+                                    NextDisplay = MoveTemp(Candidate);
+                                    NextCharacterIndex = RemappedIndex;
+                                }
+                            }
+                            // All-or-nothing: a failed tenth step must not
+                            // partially stage a value or create a transaction.
+                            if (bAllStepsValid
+                                && NextDisplay != DisplayText
                                 && Editable->SetEditableText(FText::FromString(NextDisplay)))
                             {
                                 Editable->SelectText(
-                                    FTextLocation(0, CharacterIndex),
-                                    FTextLocation(0, CharacterIndex + 1));
+                                    FTextLocation(0, NextCharacterIndex),
+                                    FTextLocation(0, NextCharacterIndex + 1));
                                 return true;
                             }
                         }
@@ -1335,6 +1913,18 @@ bool FDigitInputProcessor::HandleKeyDownEvent(FSlateApplication& SlateApp, const
 
 bool FDigitInputProcessor::HandleKeyUpEvent(FSlateApplication& SlateApp, const FKeyEvent& InKeyEvent)
 {
+    if (DeferredCurveTextCommit.IsSet())
+    {
+        ClearDeferredCurveTextCommit(); // Modifier release cancels still-pending Enter.
+    }
+    if (bCurveTextDragActive
+        && (InKeyEvent.GetKey() == EKeys::LeftAlt
+            || InKeyEvent.GetKey() == EKeys::RightAlt
+            || InKeyEvent.GetKey() == EKeys::LeftControl
+            || InKeyEvent.GetKey() == EKeys::RightControl))
+    {
+        EndCurveTextDrag(); // Release modifiers: stop staging, do not commit.
+    }
     if ((InKeyEvent.GetKey() == EKeys::LeftAlt || InKeyEvent.GetKey() == EKeys::RightAlt)
         && !IsLadderToggleEnabled())
     {
@@ -1349,6 +1939,10 @@ bool FDigitInputProcessor::HandleKeyUpEvent(FSlateApplication& SlateApp, const F
 
 bool FDigitInputProcessor::HandleMouseMoveEvent(FSlateApplication& SlateApp, const FPointerEvent& MouseEvent)
 {
+    if (bCurveTextDragActive)
+    {
+        return UpdateCurveTextDrag(SlateApp, MouseEvent);
+    }
     if (HasActiveSession() && !bRestorePending)
     {
         const TSharedPtr<SWidget> PinnedSpinBox = ActiveSpinBox.Pin();
@@ -1468,6 +2062,15 @@ bool FDigitInputProcessor::HandleMouseMoveEvent(FSlateApplication& SlateApp, con
 
 bool FDigitInputProcessor::HandleMouseButtonDownEvent(FSlateApplication& SlateApp, const FPointerEvent& MouseEvent)
 {
+    ClearDeferredCurveTextCommit(); // New input supersedes pending mouse-up Enter.
+    if (bCurveTextDragActive)
+    {
+        EndCurveTextDrag();
+    }
+    if (TryBeginCurveTextDrag(SlateApp, MouseEvent))
+    {
+        return true;
+    }
     if (HasActiveSession() || bRestorePending)
     {
         return false;
@@ -1580,6 +2183,21 @@ bool FDigitInputProcessor::HandleMouseButtonDownEvent(FSlateApplication& SlateAp
     if (ArmSpinBox(EffectiveHit, MouseEvent.GetPointerIndex(), bUseLadder))
     {
         ActiveUserIndex = MouseEvent.GetUserIndex();
+        // Instrument the actual native widget path rather than guessing a
+        // tangent field from a localized label. This opt-in one-line trace
+        // makes Curve Editor tangent and multi-key QA actionable in UE 5.8.
+        const UDigitSettings* Diagnostics = UDigitSettings::Get();
+        if (Diagnostics && Diagnostics->bLogWidgetDiagnostics
+            && (EffectiveHit.Owner == ENumericOwner::CurveEditorKeyDetail
+                || EffectiveHit.Owner == ENumericOwner::CurveEditorToolOptions))
+        {
+            UE_LOG(LogDigit, Display,
+                TEXT("CurveEditor numeric drag: owner=%s widget=%s display='%s' digitPlace=%d nativeCallbacks=preserved"),
+                EffectiveHit.Owner == ENumericOwner::CurveEditorKeyDetail
+                    ? TEXT("KeyDetail") : TEXT("ToolProperties"),
+                *EffectiveHit.SpinBoxWidget->GetTypeAsString(),
+                *EffectiveHit.DisplayString, EffectiveHit.DigitPlace);
+        }
         if (!bUseLadder)
         {
             FWidgetPath Path = SlateApp.LocateWindowUnderMouse(
@@ -1602,6 +2220,32 @@ bool FDigitInputProcessor::HandleMouseButtonDownEvent(FSlateApplication& SlateAp
 
 bool FDigitInputProcessor::HandleMouseButtonUpEvent(FSlateApplication& SlateApp, const FPointerEvent& MouseEvent)
 {
+    if (bCurveTextDragActive && MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton
+        && MouseEvent.GetPointerIndex() == CurveTextDragPointer
+        && MouseEvent.GetUserIndex() == CurveTextDragUser)
+    {
+        const UDigitSettings* Settings = UDigitSettings::Get();
+        const bool bRequestNativeCommit = DigitCurveTextMouse::ShouldRequestNativeCommit(
+            Settings && Settings->bCurveEditorTextDragCommitOnRelease,
+            bCurveTextDragChanged,
+            bCurveTextDragOwnsCapture && CurveTextDragEditable.IsValid()
+                && CurveTextDragEditable.Pin()->HasMouseCapture(),
+            CanFinishCurveTextDrag(SlateApp));
+        if (bRequestNativeCommit)
+        {
+            // Snapshot only a verified, changed edit; the next Slate post-tick
+            // rechecks focus, widget identity, selection, buffer and release.
+            FDeferredCurveTextCommit Pending;
+            Pending.Editable = CurveTextDragEditable;
+            Pending.ExpectedText = CurveTextDragLastStaged;
+            Pending.ExpectedIndex = CurveTextDragExpectedIndex;
+            Pending.UserIndex = CurveTextDragUser;
+            Pending.bTime = bCurveTextDragTime;
+            DeferredCurveTextCommit = MoveTemp(Pending);
+        }
+        EndCurveTextDrag(); // Always release our own capture on mouse-up.
+        return true;
+    }
     if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton
         && HasActiveSession()
         && MouseEvent.GetPointerIndex() == ActivePointerIndex
@@ -1633,6 +2277,12 @@ bool FDigitInputProcessor::HandleMouseButtonUpEvent(FSlateApplication& SlateApp,
 
 void FDigitInputProcessor::HandlePostSlateTick()
 {
+    // Mouse-up dispatch has ended. A pending optional release commit is now
+    // safe to revalidate and request through the host's ordinary Enter path.
+    if (DeferredCurveTextCommit.IsSet() && FSlateApplication::IsInitialized())
+    {
+        FlushDeferredCurveTextCommit(FSlateApplication::Get());
+    }
     if (bLadderDismissQueued)
     {
         // A row callback must not remove its own overlay during Slate's
@@ -1730,6 +2380,8 @@ void FDigitInputProcessor::HandlePostSlateTick()
 
 void FDigitInputProcessor::Shutdown()
 {
+    ClearDeferredCurveTextCommit();
+    EndCurveTextDrag();
     ClearLadder();
     RestoreActiveDelta();
     ClearHighlight();
@@ -2536,13 +3188,20 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
     // Only do so when the current numeric value is already aligned to the grid;
     // otherwise do not discard lower digits the user had before dragging.
 
+    // A host-driven format change must still suspend the scrub, but a finer
+    // magnitude requested by Digit itself may legitimately expand decimals.
+    // Record only the precision explicitly authorized by routed mouse input.
+    const TSharedRef<int32> MaxGeneratedFractionDigits = MakeShared<int32>(DisplayFractionDigits);
+    const TSharedRef<bool> bHasGeneratedNumericMotion = MakeShared<bool>(false);
+
     // A display change can also happen while the mouse is stationary. A
-    // changed unit, precision, or structured annotation invalidates the
-    // initial place-value meaning. Check every captured post-tick and once
+    // changed unit, unexpected precision, or structured annotation invalidates
+    // the initial place-value meaning. Check every captured post-tick and once
     // immediately before native mouse-up, not only on horizontal movement.
     VerifyActiveDisplayFunction = [
         this, WeakSpinBox, WeakDisplayText, InitialUnitSuffix,
         DisplayFractionDigits, WorkingDelta, bNonDropTimecode,
+        MaxGeneratedFractionDigits, bHasGeneratedNumericMotion,
         TimecodeCharacterIndex = Hit.CharacterIndex,
         TemporalContext = Hit.TemporalContext]()
     {
@@ -2581,7 +3240,9 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
             bUnsupportedDisplay = bUnsupportedDisplay
                 || DigitPrivate::HasStructuredTimeDisplay(CurrentDisplay)
                 || !DigitPrivate::HasCanonicalNumericPrefix(CurrentDisplay)
-                || CurrentFractionDigits != DisplayFractionDigits;
+                || !DigitScrubDisplayPolicy::IsExpectedFractionalWidth(
+                    DisplayFractionDigits, CurrentFractionDigits,
+                    *MaxGeneratedFractionDigits, *bHasGeneratedNumericMotion);
         }
         // A timecode's "suffix" would include its remaining components,
         // which naturally change as frames roll over. Only compare decimal
@@ -2674,6 +3335,9 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         bMonitorSpecializedSource,
         DisplayScale,
         DisplayFractionDigits,
+        MaxGeneratedFractionDigits,
+        bHasGeneratedNumericMotion,
+        OriginalMaxFractionalDigits,
         bNonDropTimecode,
         TimecodeNativeTickStep = bNonDropTimecode
             ? static_cast<double>(Hit.TemporalContext.GetValue().NativeTimecodeTickStep) : 0.0,
@@ -2791,6 +3455,19 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
             const bool bUnrepresentableStep = (!TIsIntegral<NumericType>::Value
                 && FMath::Abs(NativeStep * InputMultiplier) < ApproxUlp * 0.50)
                 || bRotatorDigitBelowStoragePrecision;
+            if (!bNonDropTimecode && !bUnrepresentableStep
+                && FMath::IsFinite(RequestedChange) && RequestedChange != 0.0)
+            {
+                // Authorize only expected extra decimal places produced by
+                // this actual Digit movement. The initial formatter minimum
+                // remains pinned, so selected trailing-zero places survive.
+                *bHasGeneratedNumericMotion = true;
+                *MaxGeneratedFractionDigits = FMath::Max(
+                    *MaxGeneratedFractionDigits,
+                    DigitScrubDisplayPolicy::MaximumSelfGeneratedFractionDigits(
+                        DisplayFractionDigits, OriginalMaxFractionalDigits,
+                        static_cast<double>(DesiredStep) * InputMultiplier * ScrubSensitivity));
+            }
             if (bUnrepresentableStep)
             {
                 RoutedDelta.X = 0.0;

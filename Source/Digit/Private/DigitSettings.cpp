@@ -4,6 +4,9 @@
 
 UDigitSettings::UDigitSettings()
     : ScrubSensitivity(1.0f)
+    , bCurveEditorTextDrag(true)
+    , bCurveEditorTextDragCommitOnRelease(false)
+    , bCurveEditorTextDragUseNativeCapture(false)
     , LadderMagnitudeSensitivity(1.0f)
     , bToggleLadderWithAlt(false)
     , bSelectMagnitudeFromLadder(false)

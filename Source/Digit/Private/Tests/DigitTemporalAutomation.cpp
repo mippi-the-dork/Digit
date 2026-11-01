@@ -1,8 +1,9 @@
-// Copyright Mippithedork 2026, Inc. All Rights Reserved.
+﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
 
 #if WITH_DEV_AUTOMATION_TESTS
 
 #include "Misc/AutomationTest.h"
+#include <limits>
 #include "Misc/FrameRate.h"
 #include "FrameNumberNumericInterface.h"
 #include "DigitTemporalDisplay.h"
@@ -11,7 +12,11 @@
 #include "DigitTemporalEditable.h"
 #include "DigitTemporalDropFrame.h"
 #include "DigitTemporalSubframe.h"
+#include "DigitCurveEditableValue.h"
+#include "DigitCurveTextMouse.h"
+#include "DigitScrubDisplayPolicy.h"
 #include "Widgets/Input/SEditableText.h"
+#include "Widgets/Input/SSpinBox.h"
 #include "Widgets/Input/NumericTypeInterface.h"
 
 // Exercise Unreal's REAL time conversion interface in the editor build. A
@@ -487,16 +492,19 @@ bool FDigitTemporalEditableTextStageTest::RunTest(const FString& Parameters)
     // inverted, hiding the stale-source repeated-key hazard.
     TestEqual(TEXT("Staging must not replace the bound source attribute"),
         Field->GetText().ToString(), Initial);
-    Field->SelectText(FTextLocation(0, 6), FTextLocation(0, 7));
+    // Minute units changed from '0' in the bound attribute to '1' in the
+    // staged buffer. Index 6 is a colon, not a digit; use index 5 to prove
+    // we are observing the live edited value rather than stale bound text.
+    Field->SelectText(FTextLocation(0, 5), FTextLocation(0, 6));
     TestEqual(TEXT("Selection reads the actual staged text buffer"),
-        Field->GetSelectedText().ToString(), FString(TEXT("0")));
+        Field->GetSelectedText().ToString(), FString(TEXT("1")));
     const FTextSelection SavedSelection = Field->GetSelection();
     Field->SelectAllText();
     TestEqual(TEXT("Select-all exposes the entire LIVE staged buffer"),
         Field->GetSelectedText().ToString(), FString(TEXT("[00:01:00:00]")));
     Field->SelectText(SavedSelection.GetBeginning(), SavedSelection.GetEnd());
     TestEqual(TEXT("Single-digit selection survives a live-buffer read"),
-        Field->GetSelectedText().ToString(), FString(TEXT("0")));
+        Field->GetSelectedText().ToString(), FString(TEXT("1")));
     TestEqual(TEXT("Staging must not synthesize a native property commit, including live-buffer reads"),
         Commits, 0);
     TestTrue(TEXT("A second keyboard step can stage without a host commit"),
@@ -505,6 +513,182 @@ bool FDigitTemporalEditableTextStageTest::RunTest(const FString& Parameters)
     TestEqual(TEXT("A second staged edit reads the latest live text"),
         Field->GetSelectedText().ToString(), FString(TEXT("[00:01:00:01]")));
     TestEqual(TEXT("Neither staged step commits a property"), Commits, 0);
+    return true;
+}
+
+// The Curve Editor VALUE slot can be a plain editable text field rather than
+// an SSpinBox. Verify exact decimal place stepping and selection preservation
+// across carries/sign changes without invoking native property commits.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveEditableValuePlacesTest,
+    "Digit.CurveEditor.EditableValuePlaces",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveEditableValuePlacesTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    const auto Check = [this](const TCHAR* Initial, int32 Index, int32 Direction,
+        const TCHAR* Expected, int32 ExpectedIndex)
+    {
+        FString Next;
+        int32 NextIndex = INDEX_NONE;
+        TestTrue(TEXT("Plain Value supports selected digit stepping"),
+            DigitCurveEditableValue::TryStepSelectedPlace(
+                Initial, Index, Direction, Next, NextIndex));
+        TestEqual(TEXT("Exact Value step retains decimal formatting"), Next,
+            FString(Expected));
+        TestEqual(TEXT("Selection tracks place across sign and carry"),
+            NextIndex, ExpectedIndex);
+    };
+    Check(TEXT("12.340"), 4, +1, TEXT("12.350"), 4);
+    Check(TEXT("12.340"), 4, -1, TEXT("12.330"), 4);
+    Check(TEXT("9.99"), 0, +1, TEXT("10.99"), 1);
+    Check(TEXT("-0.10"), 3, +1, TEXT("0.00"), 2);
+    Check(TEXT("0.00"), 2, -1, TEXT("-0.10"), 3);
+    Check(TEXT("0012.30"), 1, +1, TEXT("0112.30"), 1);
+    Check(TEXT("1"), 0, -1, TEXT("0"), 0);
+
+    FString Next;
+    int32 NextIndex = INDEX_NONE;
+    const auto Reject = [&Next, &NextIndex](const TCHAR* Text, int32 Index)
+    {
+        return DigitCurveEditableValue::TryStepSelectedPlace(
+            Text, Index, 1, Next, NextIndex);
+    };
+    TestFalse(TEXT("Timecode is not Curve Value"), Reject(TEXT("[00:01:00:00]"), 2));
+    TestFalse(TEXT("Subframe indicator is not a numeric Value"), Reject(TEXT("0001*"), 2));
+    TestFalse(TEXT("Scientific notation is left to host"), Reject(TEXT("1.25e-3"), 2));
+    TestFalse(TEXT("Unit annotations are left to host"), Reject(TEXT("12.5 cm"), 1));
+    TestFalse(TEXT("Expressions are left to host"), Reject(TEXT("2+3"), 0));
+    TestFalse(TEXT("No digit selection on punctuation"), Reject(TEXT("1.25"), 1));
+    TestFalse(TEXT("Never lose precision at 15-digit range"),
+        Reject(TEXT("999999999999999"), 0));
+    TestFalse(TEXT("Reject unsupported unbounded fractions"),
+        Reject(TEXT("0.1234567890"), 2));
+    TestFalse(TEXT("Never adjust empty text"), Reject(TEXT(""), 0));
+
+    int32 Commits = 0;
+    const TSharedRef<SEditableText> Field = SNew(SEditableText)
+        .Text(FText::FromString(TEXT("12.340")))
+        .OnTextCommitted(FOnTextCommitted::CreateLambda(
+            [&Commits](const FText&, ETextCommit::Type) { ++Commits; }));
+    Field->SelectText(FTextLocation(0, 4), FTextLocation(0, 5));
+    FString LiveNext;
+    int32 LiveIndex = INDEX_NONE;
+    TestTrue(TEXT("Step value in original Slate editable buffer"),
+        DigitCurveEditableValue::TryStepSelectedPlace(
+            Field->GetText().ToString(), 4, 1, LiveNext, LiveIndex));
+    TestTrue(TEXT("Stage instead of committing native value"),
+        Field->SetEditableText(FText::FromString(LiveNext)));
+    Field->SelectText(FTextLocation(0, LiveIndex), FTextLocation(0, LiveIndex + 1));
+    TestEqual(TEXT("Staged numeric Value reads updated digit"),
+        Field->GetSelectedText().ToString(), FString(TEXT("5")));
+    TestEqual(TEXT("Staging preserves original bound Value"),
+        Field->GetText().ToString(), FString(TEXT("12.340")));
+    TestEqual(TEXT("No native commit before Enter/focus loss"), Commits, 0);
+    const FTextSelection Saved = Field->GetSelection();
+    Field->SelectAllText();
+    const FString LiveBuffer = Field->GetSelectedText().ToString();
+    Field->SelectText(Saved.GetBeginning(), Saved.GetEnd());
+    TestTrue(TEXT("Second Value adjustment reads live staging, not stale bound data"),
+        DigitCurveEditableValue::TryStepSelectedPlace(
+            LiveBuffer, LiveIndex, 1, LiveNext, LiveIndex));
+    TestEqual(TEXT("Repeated Value steps accumulate before commit"),
+        LiveNext, FString(TEXT("12.360")));
+    TestTrue(TEXT("Native text widget stages repeated Value"),
+        Field->SetEditableText(FText::FromString(LiveNext)));
+    TestEqual(TEXT("No fabricated per-key transaction"), Commits, 0);
+    return true;
+}
+
+// Digit 2.0 text editing needs stable place selection across carries and
+// predictable movement between digits. These tests use the real Slate
+// selection/edit buffer. They do not pretend to test Curve Editor Undo/Redo.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveEditorTextNavigationTest,
+    "Digit.CurveEditor.TextDigitNavigation",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveEditorTextNavigationTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    const auto CheckNavigation = [this](const TCHAR* Text, int32 Index,
+        int32 Direction, int32 Expected)
+    {
+        int32 Target = INDEX_NONE;
+        TestTrue(TEXT("Navigates past punctuation to next digit"),
+            DigitTemporalEditable::TryNavigateSelectedDigit(
+                Text, Index, Direction, Target));
+        TestEqual(TEXT("Adjacent digit index"), Target, Expected);
+    };
+    CheckNavigation(TEXT("12.340"), 1, +1, 3);
+    CheckNavigation(TEXT("12.340"), 3, -1, 1);
+    CheckNavigation(TEXT("[00:01:00;02]"), 2, +1, 4);
+    CheckNavigation(TEXT("-0.250s"), 1, +1, 3);
+    CheckNavigation(TEXT("0024*0.125"), 3, +1, 5);
+    int32 OutIndex = INDEX_NONE;
+    TestFalse(TEXT("Navigation never wraps past the last digit"),
+        DigitTemporalEditable::TryNavigateSelectedDigit(TEXT("19.0"), 3, 1, OutIndex));
+    TestFalse(TEXT("Navigation rejects punctuation as its origin"),
+        DigitTemporalEditable::TryNavigateSelectedDigit(TEXT("19.0"), 2, 1, OutIndex));
+    TestFalse(TEXT("Navigation rejects invalid direction"),
+        DigitTemporalEditable::TryNavigateSelectedDigit(TEXT("19.0"), 1, 0, OutIndex));
+    TestFalse(TEXT("Navigation rejects a marker without a selected digit"),
+        DigitTemporalEditable::TryNavigateSelectedDigit(TEXT("0000*"), 4, -1, OutIndex));
+
+    const auto CheckRemap = [this](const TCHAR* Source, int32 SourceIndex,
+        const TCHAR* Target, int32 Expected)
+    {
+        int32 Remapped = INDEX_NONE;
+        TestTrue(TEXT("Native text carry preserves selected place"),
+            DigitTemporalEditable::TryRemapSelectedDigit(
+                Source, SourceIndex, Target, Remapped));
+        TestEqual(TEXT("Selected magnitude is retained"), Remapped, Expected);
+    };
+    CheckRemap(TEXT("9"), 0, TEXT("10"), 1);
+    CheckRemap(TEXT("-9"), 1, TEXT("-10"), 2);
+    CheckRemap(TEXT("-1"), 1, TEXT("0"), 0);
+    CheckRemap(TEXT("0009"), 3, TEXT("0010"), 3);
+    CheckRemap(TEXT("12.390s"), 4, TEXT("12.400s"), 4);
+    CheckRemap(TEXT("[00:00:59;29]"), 11, TEXT("[00:01:00;02]"), 11);
+    TestFalse(TEXT("Changed decimal precision cannot silently change magnitude"),
+        DigitTemporalEditable::TryRemapSelectedDigit(
+            TEXT("12.30"), 3, TEXT("12.3"), OutIndex));
+    TestFalse(TEXT("Subframe marker cannot silently appear"),
+        DigitTemporalEditable::TryRemapSelectedDigit(
+            TEXT("0024"), 2, TEXT("0024*"), OutIndex));
+    TestFalse(TEXT("A decimal cannot become a timecode"),
+        DigitTemporalEditable::TryRemapSelectedDigit(
+            TEXT("12.30"), 3, TEXT("[00:00:12:03]"), OutIndex));
+
+    int32 Commits = 0;
+    const TSharedRef<SEditableText> Field = SNew(SEditableText)
+        .Text(FText::FromString(TEXT("9.99")))
+        .OnTextCommitted(FOnTextCommitted::CreateLambda(
+            [&Commits](const FText&, ETextCommit::Type) { ++Commits; }));
+    Field->SelectText(FTextLocation(0, 0), FTextLocation(0, 1));
+    FString Current = TEXT("9.99");
+    int32 Index = 0;
+    // Ctrl+Alt+Shift+Up applies ten verified single steps. A native
+    // transaction must still be deferred until the host commits.
+    for (int32 Step = 0; Step < 10; ++Step)
+    {
+        FString Next;
+        int32 NextIndex = INDEX_NONE;
+        TestTrue(TEXT("Every accelerated decimal step is representable"),
+            DigitCurveEditableValue::TryStepSelectedPlace(
+                Current, Index, 1, Next, NextIndex));
+        Current = Next;
+        Index = NextIndex;
+    }
+    TestEqual(TEXT("Accelerated Value step"), Current, FString(TEXT("19.99")));
+    TestEqual(TEXT("Units place remains selected after carry"), Index, 1);
+    TestTrue(TEXT("Stage one finished edit, not ten native commits"),
+        Field->SetEditableText(FText::FromString(Current)));
+    Field->SelectText(FTextLocation(0, Index), FTextLocation(0, Index + 1));
+    TestEqual(TEXT("Selected units value after batch"),
+        Field->GetSelectedText().ToString(), FString(TEXT("9")));
+    TestEqual(TEXT("Native property commit remains deferred"), Commits, 0);
     return true;
 }
 
@@ -654,26 +838,66 @@ bool FDigitTemporalFrameSubframeTest::RunTest(const FString& Parameters)
         Padding, TAttribute<FFrameRate>(FFrameRate(24000, 1)),
         TAttribute<FFrameRate>(FFrameRate(24, 1)));
     const FString NativeText = Frames.ToString(1.0);
-    const int32 Marker = NativeText.Find(TEXT("*"));
-    TestTrue(TEXT("Native fractional frame carries a marker"), Marker > 0);
-    if (Marker > 0)
+    const FString Indicator = Frames.GetSubframeIndicator();
+    const int32 Marker = NativeText.Find(Indicator);
+    TestTrue(TEXT("Native fractional frame carries a subframe indicator"),
+        !Indicator.IsEmpty() && Marker > 0);
+    AddInfo(FString::Printf(TEXT("Native ToString(1 tick) = '%s', indicator = '%s'"),
+        *NativeText, *Indicator));
+    if (Marker > 0 && !Indicator.IsEmpty())
     {
         double Step = 0.0;
-        const int32 SelectedFractionDigit = Marker + 3;
-        TestTrue(TEXT("Native fractional frame has a selectable 0.x digit"),
-            DigitTemporalSubframe::TryGetFrameDigitStep(
-                NativeText, SelectedFractionDigit, Step));
-        TestFalse(TEXT("Cannot select subframe separator"),
-            DigitTemporalSubframe::TryGetFrameDigitStep(NativeText, Marker, Step));
+        const int32 SuffixStart = Marker + Indicator.Len();
+        const bool bHasExplicitFraction = NativeText.Mid(SuffixStart).StartsWith(TEXT("0."));
         const TOptional<double> Parsed = Frames.FromString(NativeText, 0.0);
-        TestTrue(TEXT("Host parses its fractional frame label"), Parsed.IsSet());
-        if (Parsed.IsSet())
+        const FString ParsedText = Parsed.IsSet()
+            ? FString::SanitizeFloat(Parsed.GetValue()) : TEXT("unset");
+        AddInfo(FString::Printf(TEXT("Native FromString(ToString(1 tick)) = %s"),
+            *ParsedText));
+        // UE 5.8's default frame formatter may display only an asterisk as
+        // a *warning* that the value is between frames, without the actual
+        // fractional digits. Such a label cannot identify any fraction
+        // digit, and its FromString result need not recreate the lost tick.
+        // We must never invent a 0.x place based solely on this marker.
+        if (!bHasExplicitFraction)
         {
-            TestTrue(TEXT("Host round trips a single native tick"),
-                FMath::IsNearlyEqual(Parsed.GetValue(), 1.0, 1e-7));
+            TestFalse(TEXT("A marker-only native label exposes no editable fractional digit"),
+                DigitTemporalSubframe::TryGetFrameDigitStep(NativeText, SuffixStart, Step));
+        }
+        else
+        {
+            const int32 SelectedFractionDigit = SuffixStart + 2;
+            TestTrue(TEXT("An explicit native 0.x digit may be selected"),
+                DigitTemporalSubframe::TryGetFrameDigitStep(
+                    NativeText, SelectedFractionDigit, Step));
+        }
+        TestFalse(TEXT("Cannot select native subframe indicator"),
+            DigitTemporalSubframe::TryGetFrameDigitStep(NativeText, Marker, Step));
+        // The real edit path additionally requires exact native tick and
+        // ToString/FromString round trips before it stages a change. Merely
+        // parsing the marker-only display must not be treated as such proof.
+        if (!Parsed.IsSet()
+            || !FMath::IsNearlyEqual(Parsed.GetValue(), 1.0, 1e-7)
+            || Frames.ToString(Parsed.GetValue()) != NativeText)
+        {
+            AddInfo(TEXT("Native subframe text does not exactly encode the source tick; "
+                "Digit's owning-Sequencer round-trip gate must reject it."));
         }
     }
     double Step = 0.0;
+    // The helper supports an explicit numeric fractional suffix if a host
+    // actually provides one. This does not imply the default UE formatter
+    // produces, parses or preserves that suffix.
+    TestTrue(TEXT("Explicit 0.x fractional tenth is selectable"),
+        DigitTemporalSubframe::TryGetFrameDigitStep(TEXT("0024*0.125"), 7, Step));
+    TestTrue(TEXT("Explicit fractional tenth is 0.1 display frames"),
+        FMath::IsNearlyEqual(Step, 0.1, 1e-9));
+    TestTrue(TEXT("Explicit fractional hundredth is selectable"),
+        DigitTemporalSubframe::TryGetFrameDigitStep(TEXT("0024*0.125"), 8, Step));
+    TestTrue(TEXT("Explicit fractional hundredth is 0.01 display frames"),
+        FMath::IsNearlyEqual(Step, 0.01, 1e-9));
+    TestFalse(TEXT("Reject suffix indicator with no fractional digits"),
+        DigitTemporalSubframe::TryGetFrameDigitStep(TEXT("0024*"), 5, Step));
     TestFalse(TEXT("Reject subframe glyph with ambiguous fractional suffix"),
         DigitTemporalSubframe::TryGetFrameDigitStep(TEXT("0024*3.5"), 6, Step));
     TestFalse(TEXT("Reject a plain decimal without subframe marker"),
@@ -681,6 +905,355 @@ bool FDigitTemporalFrameSubframeTest::RunTest(const FString& Parameters)
     return true;
 }
 
+
+// Mouse integration stages original Curve Editor text only. It must never
+// fabricate an OnTextCommitted callback, and a rejected step is atomic.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveEditorTextMouseStageTest,
+    "Digit.CurveEditor.TextMouseStage",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveEditorTextMouseStageTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    double Pixels = 7.0;
+    TestEqual(TEXT("Sub-step pixel motion is held"),
+        DigitCurveTextMouse::ConsumeSteps(Pixels, 8.0), 0);
+    TestTrue(TEXT("Sub-step remainder retained"), FMath::IsNearlyEqual(Pixels, 7.0));
+    Pixels += 18.0;
+    TestEqual(TEXT("Forward motion yields three steps"),
+        DigitCurveTextMouse::ConsumeSteps(Pixels, 8.0), 3);
+    TestTrue(TEXT("Overshoot is retained"), FMath::IsNearlyEqual(Pixels, 1.0));
+    Pixels -= 17.0;
+    TestEqual(TEXT("Reverse motion yields two steps"),
+        DigitCurveTextMouse::ConsumeSteps(Pixels, 8.0), -2);
+    TestTrue(TEXT("Negative remainder exhausted"), FMath::IsNearlyZero(Pixels));
+    Pixels = 9999.0;
+    TestEqual(TEXT("Large frame delta is bounded"),
+        DigitCurveTextMouse::ConsumeSteps(Pixels, 8.0), 12);
+    TestTrue(TEXT("Unconsumed backlog remains"), Pixels > 0.0);
+    Pixels = std::numeric_limits<double>::quiet_NaN();
+    TestEqual(TEXT("Nonfinite motion is rejected"),
+        DigitCurveTextMouse::ConsumeSteps(Pixels, 8.0), 0);
+    TestTrue(TEXT("Invalid cursor deltas are cleared"), FMath::IsNearlyZero(Pixels));
+
+    FString Next;
+    int32 NewIndex = INDEX_NONE;
+    TestTrue(TEXT("Native Curve Value stage applies exact magnitude"),
+        DigitCurveTextMouse::TryStageValueSteps(TEXT("12.340"), 4, 2,
+            Next, NewIndex));
+    TestEqual(TEXT("Two hundredth steps"), Next, FString(TEXT("12.360")));
+    TestEqual(TEXT("Selected hundredth stays selected"), NewIndex, 4);
+    TestTrue(TEXT("Magnitude survives carry"),
+        DigitCurveTextMouse::TryStageValueSteps(TEXT("9.99"), 0, 2,
+            Next, NewIndex));
+    TestEqual(TEXT("Carry results"), Next, FString(TEXT("11.99")));
+    TestEqual(TEXT("Carry selection"), NewIndex, 1);
+    TestFalse(TEXT("Atomic rejection at upper value limit"),
+        DigitCurveTextMouse::TryStageValueSteps(TEXT("999999999999998"), 14, 3,
+            Next, NewIndex));
+    TestEqual(TEXT("Rejected batch has no candidate text"), Next, FString());
+    TestEqual(TEXT("Rejected batch has no candidate selection"), NewIndex, INDEX_NONE);
+    TestFalse(TEXT("Timecode cannot be misinterpreted as Value"),
+        DigitCurveTextMouse::TryStageValueSteps(TEXT("[00:01:00;00]"), 2, 1,
+            Next, NewIndex));
+    TestFalse(TEXT("Subframe marker cannot be misinterpreted as Value"),
+        DigitCurveTextMouse::TryStageValueSteps(TEXT("0000*"), 2, 1,
+            Next, NewIndex));
+
+    int32 Commits = 0;
+    const TSharedRef<SEditableText> Field = SNew(SEditableText)
+        .Text(FText::FromString(TEXT("12.340")))
+        .OnTextCommitted(FOnTextCommitted::CreateLambda(
+            [&Commits](const FText&, ETextCommit::Type) { ++Commits; }));
+    Field->SelectText(FTextLocation(0, 4), FTextLocation(0, 5));
+    TestTrue(TEXT("Drag stages through native Slate buffer"),
+        Field->SetEditableText(FText::FromString(TEXT("12.360"))));
+    Field->SelectText(FTextLocation(0, 4), FTextLocation(0, 5));
+    TestEqual(TEXT("Selected staged digit"), Field->GetSelectedText().ToString(),
+        FString(TEXT("6")));
+    TestEqual(TEXT("Native bound source remains unchanged before commit"),
+        Field->GetText().ToString(), FString(TEXT("12.340")));
+    TestEqual(TEXT("No per-pixel native commit"), Commits, 0);
+    return true;
+}
+
+// Exercise reply construction and native-commit policy without opening a
+// second editor transaction or synthesizing a user click in an automation run.
+// Real multi-window capture and keyframe Undo/Redo require manual QA.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveEditorMouseCapturePolicyTest,
+    "Digit.CurveEditor.MouseCapturePolicy",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveEditorMouseCapturePolicyTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    const TSharedRef<SEditableText> Edit = SNew(SEditableText)
+        .Text(FText::FromString(TEXT("12.340")));
+    const FReply Capture = FReply::Handled().CaptureMouse(Edit);
+    const FReply Release = FReply::Handled().ReleaseMouseCapture();
+    TestTrue(TEXT("Native Slate capture reply is constructible"),
+        Capture.IsEventHandled());
+    TestTrue(TEXT("Native Slate release reply is constructible"),
+        Release.IsEventHandled());
+    TestTrue(TEXT("Capture reply targets original editable widget"),
+        Capture.GetMouseCaptor().Get() == &Edit.Get());
+    TestTrue(TEXT("Release reply requests pointer release"),
+        Release.ShouldReleaseMouse());
+
+    TestFalse(TEXT("Default/manual workflow never auto-commits"),
+        DigitCurveTextMouse::ShouldRequestNativeCommit(false, true, true, true));
+    TestFalse(TEXT("Click without staged movement cannot commit"),
+        DigitCurveTextMouse::ShouldRequestNativeCommit(true, false, true, true));
+    TestFalse(TEXT("Lost capture prevents auto-commit"),
+        DigitCurveTextMouse::ShouldRequestNativeCommit(true, true, false, true));
+    TestFalse(TEXT("Replaced source prevents auto-commit"),
+        DigitCurveTextMouse::ShouldRequestNativeCommit(true, true, true, false));
+    TestTrue(TEXT("Verified opt-in staged mouse-up requests native commit"),
+        DigitCurveTextMouse::ShouldRequestNativeCommit(true, true, true, true));
+    return true;
+}
+
+// Regression: a captured drag must not reinterpret another editor's newly
+// staged text or a changed digit selection as Digit's own continuation.
+// This is an engine-native test for the pure state gate, not a simulated OS
+// pointer drag, and it does not create an editor transaction.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveEditorDragBufferIsolationTest,
+    "Digit.CurveEditor.DragBufferIsolation",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveEditorDragBufferIsolationTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    using namespace DigitCurveTextMouse;
+    TestTrue(TEXT("Initial source and selected index are stable"),
+        IsUninterruptedEdit(TEXT("12.340"), TEXT("12.340"), TEXT(""), 4, 4));
+    TestFalse(TEXT("Different selection cannot silently change scrub magnitude"),
+        IsUninterruptedEdit(TEXT("12.340"), TEXT("12.340"), TEXT(""), 3, 4));
+    TestTrue(TEXT("Next event reads latest Digit-staged buffer"),
+        IsUninterruptedEdit(TEXT("12.360"), TEXT("12.340"), TEXT("12.360"), 4, 4));
+    TestFalse(TEXT("External text mutation invalidates the gesture"),
+        IsUninterruptedEdit(TEXT("88.000"), TEXT("12.340"), TEXT("12.360"), 4, 4));
+    TestFalse(TEXT("Original bound value cannot replace a staged buffer"),
+        IsUninterruptedEdit(TEXT("12.340"), TEXT("12.340"), TEXT("12.360"), 4, 4));
+    TestTrue(TEXT("Carried number remains stable at remapped digit"),
+        IsUninterruptedEdit(TEXT("10.99"), TEXT("9.99"), TEXT("10.99"), 1, 1));
+    TestFalse(TEXT("Stale pre-carry index must not be accepted"),
+        IsUninterruptedEdit(TEXT("10.99"), TEXT("9.99"), TEXT("10.99"), 0, 1));
+
+    FString Next;
+    int32 Index = INDEX_NONE;
+    TestFalse(TEXT("Upper bound prevents positive step"),
+        DigitCurveEditableValue::TryStepSelectedPlace(
+            TEXT("999999999999999"), 14, 1, Next, Index));
+    TestTrue(TEXT("Upper bound still permits negative step"),
+        DigitCurveEditableValue::TryStepSelectedPlace(
+            TEXT("999999999999999"), 14, -1, Next, Index));
+    TestEqual(TEXT("Backwards preflight preserves safe value"),
+        Next, FString(TEXT("999999999999998")));
+    TestTrue(TEXT("Shift makes Curve Editor text drag four times faster"),
+        FMath::IsNearlyEqual(GetPixelsPerStep(1.0, true), 2.0));
+    TestTrue(TEXT("Standard drag remains eight pixels per step"),
+        FMath::IsNearlyEqual(GetPixelsPerStep(1.0, false), 8.0));
+    TestTrue(TEXT("Pixel spacing has a lower bound under high sensitivity"),
+        GetPixelsPerStep(10.0, true) >= 1.0);
+    return true;
+}
+
+// Probe native SSpinBox's numeric delta lifecycle without swapping property
+// callbacks. Curve Editor tool options and weighted-tangent controls are only
+// eligible when they use the native spinbox. This test proves temporary delta
+// adjustments cannot themselves commit to a host; it does not prove every
+// tangent/multikey widget's semantics.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveEditorNativeNumericHostPolicyTest,
+    "Digit.CurveEditor.NativeNumericHostPolicy",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveEditorNativeNumericHostPolicyTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    int32 Changes = 0;
+    int32 Commits = 0;
+    const TSharedRef<SSpinBox<double>> Native = SNew(SSpinBox<double>)
+        .Value(12.34)
+        .Delta(0.25)
+        .OnValueChanged_Lambda([&Changes](double) { ++Changes; })
+        .OnValueCommitted_Lambda([&Commits](double, ETextCommit::Type) { ++Commits; });
+    const double Original = Native->GetDelta();
+    TestTrue(TEXT("Native spinbox starts with host delta"),
+        FMath::IsNearlyEqual(Original, 0.25));
+    Native->SetDelta(0.01);
+    TestTrue(TEXT("Digit may temporarily change native decimal magnitude"),
+        FMath::IsNearlyEqual(Native->GetDelta(), 0.01));
+    TestEqual(TEXT("Changing delta does not invoke host change callback"), Changes, 0);
+    TestEqual(TEXT("Changing delta does not invoke host commit callback"), Commits, 0);
+    Native->SetDelta(Original);
+    TestTrue(TEXT("Original numeric delta restored"),
+        FMath::IsNearlyEqual(Native->GetDelta(), Original));
+    TestTrue(TEXT("Native value remains host-owned"),
+        FMath::IsNearlyEqual(Native->GetValue(), 12.34));
+    return true;
+}
+
+// A native commit request must never be dispatched while Slate is still
+// processing mouse-up. Verify the one-shot post-tick policy rejects changed
+// focus, different source, changed selection/text, or renewed mouse capture.
+// This deliberately does not claim to simulate a real Sequencer transaction.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveEditorDeferredCommitPolicyTest,
+    "Digit.CurveEditor.DeferredCommitPolicy",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveEditorDeferredCommitPolicyTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    using namespace DigitCurveTextMouse;
+    TestTrue(TEXT("Stable post-release host may receive an Enter request"),
+        CanDispatchDeferredCommit(true, true, true, true, true, true));
+    TestFalse(TEXT("Default manual mode never dispatches Enter"),
+        CanDispatchDeferredCommit(false, true, true, true, true, true));
+    TestFalse(TEXT("Focus loss invalidates pending commit"),
+        CanDispatchDeferredCommit(true, false, true, true, true, true));
+    TestFalse(TEXT("Widget teardown invalidates pending commit"),
+        CanDispatchDeferredCommit(true, true, false, true, true, true));
+    TestFalse(TEXT("Selection change invalidates pending commit"),
+        CanDispatchDeferredCommit(true, true, true, false, true, true));
+    TestFalse(TEXT("Host buffer replacement invalidates pending commit"),
+        CanDispatchDeferredCommit(true, true, true, true, false, true));
+    TestFalse(TEXT("Unreleased or foreign pointer capture invalidates pending commit"),
+        CanDispatchDeferredCommit(true, true, true, true, true, false));
+
+    // The live editable-text API is used rather than reading a stale Text
+    // binding. This verifies that a staged buffer can be observed directly.
+    const TSharedRef<SEditableText> Edit = SNew(SEditableText)
+        .Text(FText::FromString(TEXT("12.340")));
+    TestTrue(TEXT("Original host text accepts staged value"),
+        Edit->SetEditableText(FText::FromString(TEXT("12.350"))));
+    Edit->SelectAllText();
+    TestEqual(TEXT("Native editable buffer holds staged value"),
+        Edit->GetSelectedText().ToString(), FString(TEXT("12.350")));
+    return true;
+}
+
+// Model a bound tangent/weight control and a neighboring control, as a
+// native SSpinBox exposes them to Digit. Temporary delta adjustment must not
+// replace the host's binding, overwrite another key, or trigger a callback.
+// Actual Curve Editor multi-key transactions still require manual QA.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveEditorBoundNumericIsolationTest,
+    "Digit.CurveEditor.BoundNumericIsolation",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveEditorBoundNumericIsolationTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    double HostTangentValue = 0.5;
+    double AnotherKeyValue = 3.0;
+    int32 Changes = 0;
+    int32 Commits = 0;
+    int32 HostReads = 0;
+    const TSharedRef<SSpinBox<double>> BoundTangent = SNew(SSpinBox<double>)
+        .Value_Lambda([&HostTangentValue, &HostReads]()
+        {
+            ++HostReads;
+            return HostTangentValue;
+        })
+        .Delta(0.25)
+        .OnValueChanged_Lambda([&Changes](double) { ++Changes; })
+        .OnValueCommitted_Lambda([&Commits](double, ETextCommit::Type) { ++Commits; });
+
+    // SSpinBox::GetValue() may expose its most recently synchronized value
+    // until Slate updates the widget. It is not an immediate re-evaluation
+    // contract for a live .Value_Lambda binding. Query the value attribute
+    // itself to distinguish an intact host binding from a stale widget cache.
+    const TAttribute<double> LiveValue = BoundTangent->GetValueAttribute();
+    TestTrue(TEXT("Native numeric value attribute remains bound"), LiveValue.IsBound());
+    const int32 ReadsBeforeFirstQuery = HostReads;
+    TestTrue(TEXT("Host bound value unchanged before delta edit"),
+        FMath::IsNearlyEqual(LiveValue.Get(), 0.5));
+    TestTrue(TEXT("Value attribute actually evaluated host binding"),
+        HostReads > ReadsBeforeFirstQuery);
+
+    const double OriginalDelta = BoundTangent->GetDelta();
+    BoundTangent->SetDelta(0.01);
+    TestTrue(TEXT("Magnitude change affects only native delta"),
+        FMath::IsNearlyEqual(BoundTangent->GetDelta(), 0.01));
+    TestTrue(TEXT("Host binding intact after changing delta"),
+        BoundTangent->GetValueAttribute().IsBound()
+        && FMath::IsNearlyEqual(BoundTangent->GetValueAttribute().Get(), 0.5));
+    TestTrue(TEXT("Neighboring selected key is untouched"),
+        FMath::IsNearlyEqual(AnotherKeyValue, 3.0));
+
+    HostTangentValue = 0.75; // External host update before another Slate Tick.
+    const int32 ReadsBeforeHostChangeQuery = HostReads;
+    TestTrue(TEXT("Live native binding reads updated host value"),
+        FMath::IsNearlyEqual(BoundTangent->GetValueAttribute().Get(), 0.75));
+    TestTrue(TEXT("Updated host binding was evaluated"),
+        HostReads > ReadsBeforeHostChangeQuery);
+    TestEqual(TEXT("No synthetic value-change callback"), Changes, 0);
+    TestEqual(TEXT("No synthetic commit callback"), Commits, 0);
+
+    BoundTangent->SetDelta(OriginalDelta);
+    TestTrue(TEXT("Native delta restored"),
+        FMath::IsNearlyEqual(BoundTangent->GetDelta(), OriginalDelta));
+    TestTrue(TEXT("Native host binding preserved after restoration"),
+        BoundTangent->GetValueAttribute().IsBound()
+        && FMath::IsNearlyEqual(BoundTangent->GetValueAttribute().Get(), 0.75));
+    TestEqual(TEXT("Restoring delta does not trigger value changes"), Changes, 0);
+    TestEqual(TEXT("Restoring delta does not trigger commits"), Commits, 0);
+    AddInfo(FString::Printf(
+        TEXT("Live bound value=%.3f, unsynchronized widget GetValue=%.3f, host binding evaluations=%d"),
+        BoundTangent->GetValueAttribute().Get(), BoundTangent->GetValue(), HostReads));
+    return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS
 
 
+
+// Native Curve Editor SSpinBox path, distinct from text-only Ctrl+Alt staging.
+// A finer intended step can expand the displayed fractional width without
+// interrupting the original captured native scrub transaction.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitNativeScrubPrecisionContinuityTest,
+    "Digit.CurveEditor.NativeScrubPrecisionContinuity",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitNativeScrubPrecisionContinuityTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    using namespace DigitScrubDisplayPolicy;
+    TestEqual(TEXT("Native Ctrl+Alt has no hidden 0.01x slowdown"),
+        NativeModifierMultiplier(false, true, true), 1.0);
+    TestEqual(TEXT("Shift+Ctrl+Alt retains Shift's coarse multiplier"),
+        NativeModifierMultiplier(true, true, true), 10.0);
+    TestEqual(TEXT("Ctrl alone retains its 0.1x precision modifier"),
+        NativeModifierMultiplier(false, true, false), 0.1);
+    TestEqual(TEXT("Shift+Alt retains its coarse modifier"),
+        NativeModifierMultiplier(true, false, true), 100.0);
+    TestEqual(TEXT("Unmodified native scrub retains normal magnitude"),
+        NativeModifierMultiplier(false, false, false), 1.0);
+
+    const int32 Base = 2;
+    const int32 Max = 9;
+    TestEqual(TEXT("Two-decimal movement does not authorize extra decimals"),
+        MaximumSelfGeneratedFractionDigits(Base, Max, 0.01), 2);
+    const int32 Fine = MaximumSelfGeneratedFractionDigits(Base, Max, 0.0001);
+    TestEqual(TEXT("A 0.0001 step authorizes four decimals"), Fine, 4);
+    TestTrue(TEXT("12.34 becoming 12.3401 does not suspend after fine scrub"),
+        IsExpectedFractionalWidth(Base, 4, Fine, true));
+    TestFalse(TEXT("Unsolicited precision increase suspends before movement"),
+        IsExpectedFractionalWidth(Base, 4, Fine, false));
+    TestFalse(TEXT("Unexpected further precision expansion suspends"),
+        IsExpectedFractionalWidth(Base, 5, Fine, true));
+    TestFalse(TEXT("Loss of original decimals still suspends"),
+        IsExpectedFractionalWidth(Base, 1, Fine, true));
+    TestTrue(TEXT("Initial precision remains valid without movement"),
+        IsExpectedFractionalWidth(Base, 2, Base, false));
+    TestEqual(TEXT("Finer ladder rungs remain bounded by formatter precision"),
+        MaximumSelfGeneratedFractionDigits(Base, 5, 1.e-9), 5);
+    return true;
+}

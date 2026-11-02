@@ -16,6 +16,7 @@
 #include "DigitCurveTextMouse.h"
 #include "DigitScrubDisplayPolicy.h"
 #include "DigitNativeHostGuard.h"
+#include "DigitNativeBindingGuard.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Input/SEditableText.h"
 #include "Widgets/Input/SSpinBox.h"
@@ -1367,6 +1368,90 @@ bool FDigitCurveEditorNativeHostParentContinuityTest::RunTest(const FString& Par
         IsInteractive(WrongParentPath));
     TestTrue(TEXT("Guard never changes the host's original numeric delta"),
         FMath::IsNearlyEqual(Numeric->GetDelta(), 0.01));
+    return true;
+}
+
+// Same SSpinBox, NEW native value binding: Digit must neither keep scrubbing
+// the old key nor replace the new Curve Editor key/tangent owner's attribute.
+// Test the public Slate value attribute rather than the cached GetValue().
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveEditorNativeReboundValueOwnershipTest,
+    "Digit.CurveEditor.NativeReboundValueOwnership",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveEditorNativeReboundValueOwnershipTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    using namespace DigitNativeBindingGuard;
+    double FirstKey = 12.34;
+    double SecondKey = 42.0;
+    int32 Changes = 0;
+    int32 Commits = 0;
+    const TSharedRef<SSpinBox<double>> Numeric = SNew(SSpinBox<double>)
+        .Value_Lambda([&FirstKey]() { return FirstKey; })
+        .Delta(0.01)
+        .OnValueChanged_Lambda([&Changes](double) { ++Changes; })
+        .OnValueCommitted_Lambda([&Commits](double, ETextCommit::Type) { ++Commits; });
+    const TAttribute<double> Original = Numeric->GetValueAttribute();
+    TestTrue(TEXT("Initial numeric value is host bound"), Original.IsBound());
+    TestTrue(TEXT("Unchanged host binding retains getter identity"),
+        IsUnchangedHostBinding(Numeric->GetValueAttribute(), Original));
+    const double OriginalDelta = Numeric->GetDelta();
+    Numeric->SetDelta(0.001);
+    TestTrue(TEXT("Temporary magnitude does not rebind host"),
+        IsUnchangedHostBinding(Numeric->GetValueAttribute(), Original));
+
+    Numeric->SetDelta(0.0);
+    Numeric->SetValue(TAttribute<double>(12.341));
+    TestTrue(TEXT("Digit's matching temporary literal is identifiable"),
+        OwnsTemporaryLiteral(Numeric->GetValueAttribute(), 12.341));
+    TestFalse(TEXT("A different expected value cannot claim the temporary literal"),
+        OwnsTemporaryLiteral(Numeric->GetValueAttribute(), 12.342));
+
+    // Simulate selecting a different key. No widget replacement occurs: the
+    // existing spinbox now belongs to another host getter.
+    Numeric->SetValue(TAttribute<double>::Create(
+        TAttribute<double>::FGetter::CreateLambda([&SecondKey]() { return SecondKey; })));
+    TestFalse(TEXT("New selected-key binding is not Digit's temporary literal"),
+        OwnsTemporaryLiteral(Numeric->GetValueAttribute(), 12.341));
+    TestFalse(TEXT("New getter is not the original selected-key getter"),
+        IsUnchangedHostBinding(Numeric->GetValueAttribute(), Original));
+    const int32 ChangesBeforeDeltaRestore = Changes;
+    const int32 CommitsBeforeDeltaRestore = Commits;
+    Numeric->SetDelta(OriginalDelta);
+    TestTrue(TEXT("New host getter remains bound after temporary delta restore"),
+        Numeric->GetValueAttribute().IsBound()
+        && FMath::IsNearlyEqual(Numeric->GetValueAttribute().Get(), 42.0));
+    TestTrue(TEXT("First key was not overwritten"), FMath::IsNearlyEqual(FirstKey, 12.34));
+    // SSpinBox::SetValue itself can invoke native callbacks. Compare against
+    // the count AFTER the deliberate fixture's host replacement instead of
+    // incorrectly assuming those earlier SetValue calls emitted none.
+    TestEqual(TEXT("Restoring only delta does not emit a new value change"),
+        Changes, ChangesBeforeDeltaRestore);
+    TestEqual(TEXT("Restoring only delta does not emit a new commit"),
+        Commits, CommitsBeforeDeltaRestore);
+
+    // Also check a float-backed tangent/weight editor. The source may install
+    // a new literal rather than a new getter when the tool switches modes.
+    const TSharedRef<SSpinBox<float>> Weight = SNew(SSpinBox<float>)
+        .Value(0.5f).Delta(0.1f);
+    Weight->SetValue(TAttribute<float>(0.75f));
+    TestTrue(TEXT("Float tangent weight literal is recognized"),
+        OwnsTemporaryLiteral(Weight->GetValueAttribute(), 0.75f));
+    Weight->SetValue(TAttribute<float>(0.9f));
+    TestFalse(TEXT("New host float literal cannot be mistaken for an old Digit write"),
+        OwnsTemporaryLiteral(Weight->GetValueAttribute(), 0.75f));
+    TestTrue(TEXT("New host float remains unchanged"),
+        FMath::IsNearlyEqual(Weight->GetValueAttribute().Get(), 0.9f));
+
+    const TSharedRef<SSpinBox<int32>> Integer = SNew(SSpinBox<int32>)
+        .Value(10).Delta(1);
+    Integer->SetValue(TAttribute<int32>(20));
+    TestTrue(TEXT("Integer direct-value ownership works"),
+        OwnsTemporaryLiteral(Integer->GetValueAttribute(), 20));
+    Integer->SetValue(TAttribute<int32>(30));
+    TestFalse(TEXT("Replaced integer value is never restored as an old write"),
+        OwnsTemporaryLiteral(Integer->GetValueAttribute(), 20));
     return true;
 }
 

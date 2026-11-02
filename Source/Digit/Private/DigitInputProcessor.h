@@ -167,6 +167,7 @@ private:
     TFunction<void()> RestoreDeltaFunction;
     TFunction<bool(const FPointerEvent&, bool, int32, bool)> RouteActiveMoveFunction;
     TFunction<void()> VerifyActiveSourceFunction;
+    TFunction<void()> VerifyActiveBindingFunction;
     TFunction<void()> VerifyActiveDisplayFunction;
     int32 ActivePointerIndex = INDEX_NONE;
     int32 ActiveUserIndex = INDEX_NONE;

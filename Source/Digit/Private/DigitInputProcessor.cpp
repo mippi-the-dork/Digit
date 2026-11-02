@@ -13,6 +13,7 @@
 #include "DigitCurveTextMouse.h"
 #include "DigitScrubDisplayPolicy.h"
 #include "DigitNativeHostGuard.h"
+#include "DigitNativeBindingGuard.h"
 #include "Input/Events.h"
 #include "InputCoreTypes.h"
 #include "Layout/Children.h"
@@ -2282,6 +2283,10 @@ bool FDigitInputProcessor::HandleMouseButtonUpEvent(FSlateApplication& SlateApp,
         {
             VerifyActiveDisplayFunction();
         }
+        if (VerifyActiveBindingFunction)
+        {
+            VerifyActiveBindingFunction();
+        }
         if (VerifyActiveSourceFunction)
         {
             VerifyActiveSourceFunction();
@@ -2372,6 +2377,10 @@ void FDigitInputProcessor::HandlePostSlateTick()
             if (VerifyActiveDisplayFunction)
             {
                 VerifyActiveDisplayFunction();
+            }
+            if (VerifyActiveBindingFunction)
+            {
+                VerifyActiveBindingFunction();
             }
             if (VerifyActiveSourceFunction)
             {
@@ -3095,6 +3104,9 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
     const bool bMonitorSpecializedSource = Hit.Owner != ENumericOwner::General
         && OriginalValueAttribute.IsBound();
     const TSharedRef<bool> bDirectValueAssigned = MakeShared<bool>(false);
+    // Shared with restoration: a host may replace a bound Curve Editor
+    // key/tangent Value attribute while the old SSpinBox remains alive.
+    const TSharedRef<NumericType> LastWrittenNative = MakeShared<NumericType>(SpinBox->GetValue());
     const TWeakPtr<SSpinBox<NumericType>> WeakSpinBox = SpinBox;
     const TSharedRef<NumericType> WorkingDelta = MakeShared<NumericType>(NumericType(0));
     SpinBox->SetDelta(NumericType(0));
@@ -3119,7 +3131,7 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
     const TSharedRef<bool> bPinnedFractionalDisplayWidth = MakeShared<bool>(false);
     const int32 SavedMinFractionalDigits = SpinBox->GetMinFractionalDigits();
     RestoreDeltaFunction = [WeakSpinBox, OriginalDelta, OriginalValueAttribute, bDirectValueAssigned,
-        bPinnedFractionalDisplayWidth, SavedMinFractionalDigits]()
+        LastWrittenNative, bPinnedFractionalDisplayWidth, SavedMinFractionalDigits]()
     {
         if (const TSharedPtr<SSpinBox<NumericType>> PinnedSpinBox = WeakSpinBox.Pin())
         {
@@ -3131,8 +3143,14 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
             // Reinstate the host's original Delta only after the binding is
             // back. Never restore an unbound initial constant, which would
             // discard the edit instead of preserving the new native value.
-            if (*bDirectValueAssigned && OriginalValueAttribute.IsBound())
+            if (*bDirectValueAssigned && OriginalValueAttribute.IsBound()
+                && DigitNativeBindingGuard::OwnsTemporaryLiteral(
+                    PinnedSpinBox->GetValueAttribute(), *LastWrittenNative))
             {
+                // Rebind only if this is STILL the exact temporary value
+                // Digit wrote. A selected-key change can install another
+                // binding or literal on the same live SSpinBox; overwriting it
+                // would edit a different key/tangent after selection changed.
                 PinnedSpinBox->SetDelta(NumericType(0));
                 PinnedSpinBox->SetValue(OriginalValueAttribute);
             }
@@ -3316,9 +3334,49 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
     // SetValue(OriginalValueAttribute) dispatches OnValueChanged, so an
     // independent edit must be restored BEFORE SSpinBox's release commit,
     // never after its transaction has ended.
-    const TSharedRef<NumericType> LastWrittenNative = MakeShared<NumericType>(SpinBox->GetValue());
     const TSharedRef<NumericType> LastSourceValue = MakeShared<NumericType>(SpinBox->GetValue());
     const TSharedRef<TArray<NumericType>> RecentDirectWrites = MakeShared<TArray<NumericType>>();
+    // Even if Slate keeps the exact same numeric widget and parent chain,
+    // the native editor may rebind its value to a different selected key.
+    // Track binding identity separately from widget identity. Only a proven
+    // Digit-owned temporary literal is ours to continue editing or restore.
+    if (bRouteValueDirectly && OriginalValueAttribute.IsBound())
+    {
+        VerifyActiveBindingFunction = [this, WeakSpinBox, OriginalValueAttribute,
+            bDirectValueAssigned, LastWrittenNative, WorkingDelta]()
+        {
+            if (bActiveDigitScrubSuspended)
+            {
+                return;
+            }
+            const TSharedPtr<SSpinBox<NumericType>> Pinned = WeakSpinBox.Pin();
+            if (!Pinned.IsValid() || !Pinned->HasMouseCapture())
+            {
+                return;
+            }
+            const TAttribute<NumericType> Current = Pinned->GetValueAttribute();
+            const bool bStillOwned = *bDirectValueAssigned
+                ? DigitNativeBindingGuard::OwnsTemporaryLiteral(Current, *LastWrittenNative)
+                : DigitNativeBindingGuard::IsUnchangedHostBinding(Current, OriginalValueAttribute);
+            if (!bStillOwned)
+            {
+                bActiveDigitScrubSuspended = true;
+                *WorkingDelta = NumericType(0);
+                Pinned->SetDelta(NumericType(0));
+                const UDigitSettings* Settings = UDigitSettings::Get();
+                if (Settings && Settings->bLogWidgetDiagnostics)
+                {
+                    UE_LOG(LogDigit, Warning,
+                        TEXT("Native numeric host rebound during Digit scrub; stopped additional movement without restoring the old key binding"));
+                }
+            }
+        };
+    }
+    else
+    {
+        VerifyActiveBindingFunction = nullptr;
+    }
+
     if (bRouteValueDirectly && bMonitorSpecializedSource)
     {
         VerifyActiveSourceFunction = [
@@ -3353,8 +3411,13 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
             // Clear this before calling SetValue: UE's implementation invokes
             // the native OnValueChanged delegate synchronously and can rebuild
             // the owning widget hierarchy.
+            const bool bStillOwned = DigitNativeBindingGuard::OwnsTemporaryLiteral(
+                Pinned->GetValueAttribute(), *LastWrittenNative);
             *bDirectValueAssigned = false;
-            Pinned->SetValue(OriginalValueAttribute);
+            if (bStillOwned)
+            {
+                Pinned->SetValue(OriginalValueAttribute);
+            }
             const UDigitSettings* Settings = UDigitSettings::Get();
             if (Settings && Settings->bLogWidgetDiagnostics)
             {
@@ -3438,6 +3501,10 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         }
         // Also checked on every post-tick and immediately before native
         // mouse-up, to catch source changes without a subsequent mouse move.
+        if (bScaleMovement && VerifyActiveBindingFunction)
+        {
+            VerifyActiveBindingFunction();
+        }
         if (bScaleMovement && VerifyActiveSourceFunction)
         {
             VerifyActiveSourceFunction();
@@ -4966,6 +5033,7 @@ void FDigitInputProcessor::RestoreActiveDelta()
     RestoreDeltaFunction = nullptr;
     RouteActiveMoveFunction = nullptr;
     VerifyActiveSourceFunction = nullptr;
+    VerifyActiveBindingFunction = nullptr;
     VerifyActiveDisplayFunction = nullptr;
     ActiveSpinBox.Reset();
     ActiveTextWidget.Reset();

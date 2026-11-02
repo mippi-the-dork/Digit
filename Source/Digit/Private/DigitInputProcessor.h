@@ -67,6 +67,9 @@ private:
         ENumericOwner Owner = ENumericOwner::General;
         TOptional<FDigitTemporalSpinContext> TemporalContext;
         FString DisplayString;
+        // Weak path through the native owner, including the target spin box.
+        // Needed when multi-key/tangent tool rows rebuild during capture.
+        TArray<TWeakPtr<SWidget>> HostHierarchy;
     };
 
     bool FindNumericHit(FSlateApplication& SlateApp, const FPointerEvent& MouseEvent, FNumericHit& OutHit) const;
@@ -119,6 +122,7 @@ private:
     void FlushDeferredCurveTextCommit(FSlateApplication& SlateApp);
     void ClearDeferredCurveTextCommit();
 
+    bool IsActiveHostHierarchyInteractive() const;
     bool HasActiveSession() const;
     void QueueRestore(bool bPreserveLadderPreview = false);
     void RestoreActiveDelta();
@@ -157,6 +161,8 @@ private:
 
     TWeakPtr<SWidget> ActiveSpinBox;
     TWeakPtr<STextBlock> ActiveTextWidget;
+    TArray<TWeakPtr<SWidget>> ActiveHostHierarchy;
+    TFunction<void()> SuspendActiveScrubFunction;
     TFunction<void()> ApplySelectedDeltaFunction;
     TFunction<void()> RestoreDeltaFunction;
     TFunction<bool(const FPointerEvent&, bool, int32, bool)> RouteActiveMoveFunction;

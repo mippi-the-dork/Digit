@@ -1,4 +1,4 @@
-# Digit
+﻿# Digit
 
 **Digit-aware numeric scrubbing for Unreal Engine.**
 
@@ -9,7 +9,7 @@ Hover the hundreds place to work in hundreds. Hover the tenths place to make fin
 ![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.8.x-black?logo=unrealengine)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2064--bit-blue)
 ![Type](https://img.shields.io/badge/Plugin-Editor%20Only-green)
-![Version](https://img.shields.io/badge/Version-1.0.42.2-blue)
+![Version](https://img.shields.io/badge/Version-1.0.44.1-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 ![Digit targeting a numeric place value in Unreal Engine](Doc/Images/Digit-Hero.png)
@@ -162,6 +162,16 @@ Integer fields automatically prevent fractional ladder values.
 Sequencer time fields are not always decimal quantities. Their stored values can be native ticks while the editor displays frames, seconds, or bracketed timecode. For compatible Sequencer Value Stepper and Curve Editor Time spin boxes, Digit can now query the **owning Sequencer instance** and verify the displayed numeric interface against its actual frame rate and tick resolution, including when the field shows zero. Digit verifies two consecutive native-unit increments and the owner's display formatting, rather than inferring a unit from its displayed value. Curve Editor Time fields require this proof at every value, including nonzero. A generic Sequencer stepper without a verified time mapping only qualifies as an ordinary numeric scalar when the displayed number exactly matches its stored native value, and not when it displays zero. Frame-rate or display-format changes during a drag suspend the original digit magnitude, even when their numerical unit scales happen to match. Verified **non-drop-frame timecode inside native Sequencer spin boxes** can now use hours/minutes/seconds/frames digit scrubbing with whole selected-digit tick steps and native spin-box mouse-up commits. These controls do not offer a decimal Value Ladder. Drop-frame timecode and subframes remain excluded from mouse-dragging native spin boxes because their tick magnitudes cannot always be safely represented by a constant step. Verified Curve Editor Time text fields support Ctrl+Alt+Up/Down for frames, seconds, non-drop timecode, 29.97/59.94 drop-frame timecode, and conditionally explicit, host-roundtrippable subframe digits as described above.
 
 For developers validating compatibility in UE 5.8.x, Digit includes editor automation tests `Digit.Temporal.NativeFrameInterface`, `Digit.Temporal.SequencerRateBridge`, `Digit.Temporal.SequencerFormatSignature`, `Digit.Temporal.TimecodeDigitSteps`, `Digit.Temporal.TimecodeSpinQuantization`, `Digit.Temporal.EditableFrameSecondsPlaces`, `Digit.Temporal.EditableTextStage`, `Digit.Temporal.DropFrameLabels`, and `Digit.Temporal.SubframePlaces`, plus `Digit.CurveEditor.EditableValuePlaces`, `Digit.CurveEditor.TextDigitNavigation`, and `Digit.CurveEditor.TextMouseStage`, `Digit.CurveEditor.MouseCapturePolicy`, `Digit.CurveEditor.DragBufferIsolation`, and `Digit.CurveEditor.NativeNumericHostPolicy`, `Digit.CurveEditor.DeferredCommitPolicy`, and `Digit.CurveEditor.BoundNumericIsolation` for text-only Time/Value navigation, selected-place remapping, and accelerated editing. They test the engine's frame, seconds, timecode, and fractional-frame formats and the separate arithmetic used for skipped drop-frame labels. The keyboard and guarded text-drag interactions stage in the original Curve Editor text widget; neither creates a separate transaction. Native property Undo/Redo applies after the host commits, rather than once per staged shortcut. Source tests and engine automation do not substitute for live Sequencer interaction testing. See `Doc/Curve-Editor-Temporal-Expansion-V135.md` and the earlier frame/seconds documentation.
+
+### Curve Editor Host-Row Safety
+
+Digit uses Unreal's **native numeric fields** for Curve Editor key values and any tool/tangent numeric properties exposed as eligible spin boxes. Unreal still owns key selection, tangent and interpolation modes, transactions, mouse-up commits and Undo/Redo. Digit does **not** modify tangent modes or move tangent handles independently. In particular, multi-key editing uses the host field's existing semantics; selecting multiple keys does not create a separate Digit operation.
+
+A numeric field can remain alive momentarily after its owning Curve Editor row is hidden, disabled or rebuilt. Digit tracks the **verified native Slate ancestor path** using weak references and stops custom routed mouse movement if the original parent-child chain is broken, any owner disappears, or the owner becomes hidden or disabled. This applies to drags started on the numeric field and from a Value Ladder row. The parent-chain check is inexpensive and does not search the widget tree. Native mouse-up and transaction callbacks remain the host's responsibility. This protects against continuing a digit-scale edit on a stale row, but does not establish automatic cancellation or rollback of a host transaction after a selection change. A host that reuses exactly the same widget and its original parent chain may still change its backing selection, which requires live multi-key testing.
+
+The special **text-only Curve Editor** Ctrl+Alt drag options are grouped in Project Settings under **Scrubbing > Curve Editor Text (Experimental)**. The native capture and mouse-release commit previews are disabled by default. The release-commit checkbox becomes editable only when text dragging and native capture are enabled. These options **do not affect** the normal selected-key Value `SSpinBox` field, which uses live native scrubbing. Previous user-specific `DefaultDigit.ini` values are preserved.
+
+The `Digit.CurveEditor.NativeHostHierarchy` automation test covers enabled, disabled, hidden, collapsed, and destroyed host rows. `Digit.CurveEditor.NativeHostParentContinuity` verifies that a still-live spin box stops being eligible when its original details-row parent is replaced, and that an unrelated live sibling cannot masquerade as its parent. For exact weighted-tangent and multi-key interaction checks, see `Doc/Curve-Editor-Manual-QA-V144.md`.
 
 ### Native Drag Threshold
 

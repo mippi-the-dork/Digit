@@ -12,6 +12,7 @@
 #include "DigitCurveEditableValue.h"
 #include "DigitCurveTextMouse.h"
 #include "DigitScrubDisplayPolicy.h"
+#include "DigitNativeHostGuard.h"
 #include "Input/Events.h"
 #include "InputCoreTypes.h"
 #include "Layout/Children.h"
@@ -1966,6 +1967,19 @@ bool FDigitInputProcessor::HandleMouseMoveEvent(FSlateApplication& SlateApp, con
 
         bAwaitingNativeCapture = false;
         PendingCapturePostTicks = 0;
+        // Host rows can be disabled or replaced while a captured spinbox is
+        // still alive. Never move a now-unowned tangent/key value. Consume
+        // the original motion so it cannot reach the native widget either.
+        if (!IsActiveHostHierarchyInteractive())
+        {
+            bActiveDigitScrubSuspended = true;
+            if (SuspendActiveScrubFunction)
+            {
+                SuspendActiveScrubFunction();
+            }
+            ClearActiveDragOutline();
+            return true;
+        }
         // Another pointer/user must not modify this pointer's active scrub.
         if (MouseEvent.GetPointerIndex() != ActivePointerIndex
             || MouseEvent.GetUserIndex() != ActiveUserIndex)
@@ -2251,6 +2265,15 @@ bool FDigitInputProcessor::HandleMouseButtonUpEvent(FSlateApplication& SlateApp,
         && MouseEvent.GetPointerIndex() == ActivePointerIndex
         && MouseEvent.GetUserIndex() == ActiveUserIndex)
     {
+        // A vanished/disabled host row must not restore an old digit grid.
+        if (!IsActiveHostHierarchyInteractive())
+        {
+            bActiveDigitScrubSuspended = true;
+            if (SuspendActiveScrubFunction)
+            {
+                SuspendActiveScrubFunction();
+            }
+        }
         // The input preprocessor sees mouse-up BEFORE SSpinBox does. A host
         // value can change after the last mouse move (animation evaluation,
         // parameter refresh, multi-control selection). Reconcile it now so
@@ -2335,6 +2358,15 @@ void FDigitInputProcessor::HandlePostSlateTick()
         }
         else
         {
+            if (!IsActiveHostHierarchyInteractive())
+            {
+                bActiveDigitScrubSuspended = true;
+                if (SuspendActiveScrubFunction)
+                {
+                    SuspendActiveScrubFunction();
+                }
+                ClearActiveDragOutline();
+            }
             // Native numeric displays and specialized source bindings can
             // refresh while the cursor is stationary, before mouse-up.
             if (VerifyActiveDisplayFunction)
@@ -2710,6 +2742,12 @@ bool FDigitInputProcessor::FindNumericHit(FSlateApplication& SlateApp, const FPo
         return false;
     }
 
+    // Store the complete verified source path, not just the leaf. The native
+    // editor can disable/rebuild a selected-key or tangent property mid-drag.
+    for (int32 Index = 0; Index <= SpinBoxPathIndex; ++Index)
+    {
+        OutHit.HostHierarchy.Add(Path.Widgets[Index].Widget);
+    }
     OutHit.SpinBoxWidget = SpinWidget;
     OutHit.bRotatorComponent = bIsRotatorComponent;
     OutHit.bCurveKeyTimeField = bCurveKeyTimeField;
@@ -2859,6 +2897,7 @@ bool FDigitInputProcessor::ArmSpinBox(const FNumericHit& Hit, int32 PointerIndex
     if (bArmed)
     {
         ActiveSpinBox = Hit.SpinBoxWidget;
+        ActiveHostHierarchy = Hit.HostHierarchy;
         ActiveTextWidget = Hit.TextWidget;
         ActivePointerIndex = PointerIndex;
         ActiveDigitPlace = Hit.DigitPlace;
@@ -3060,6 +3099,14 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
     const TSharedRef<NumericType> WorkingDelta = MakeShared<NumericType>(NumericType(0));
     SpinBox->SetDelta(NumericType(0));
 
+    SuspendActiveScrubFunction = [WeakSpinBox, WorkingDelta]()
+    {
+        *WorkingDelta = NumericType(0);
+        if (const TSharedPtr<SSpinBox<NumericType>> Pinned = WeakSpinBox.Pin())
+        {
+            Pinned->SetDelta(NumericType(0));
+        }
+    };
     ApplySelectedDeltaFunction = [WeakSpinBox, WorkingDelta]()
     {
         if (const TSharedPtr<SSpinBox<NumericType>> PinnedSpinBox = WeakSpinBox.Pin())
@@ -4776,6 +4823,15 @@ bool FDigitInputProcessor::BuildLadderSourceHit(
     {
         return false;
     }
+    for (int32 Index = 0; Index < FieldPath.Widgets.Num(); ++Index)
+    {
+        const TSharedRef<SWidget>& NativeAncestor = FieldPath.Widgets[Index].Widget;
+        OutHit.HostHierarchy.Add(NativeAncestor);
+    }
+    if (!DigitNativeHostGuard::IsInteractive(OutHit.HostHierarchy))
+    {
+        return false;
+    }
     OutHit.SpinBoxWidget = Source;
     OutHit.TextWidget = TextWidget;
     OutHit.TextGeometry = TextWidget->GetTickSpaceGeometry();
@@ -4860,6 +4916,11 @@ bool FDigitInputProcessor::IsIntegralSpinBox(const TSharedPtr<SWidget>& Widget) 
         || DigitPrivate::IsWidgetClass<int8>(WidgetRef);
 }
 
+bool FDigitInputProcessor::IsActiveHostHierarchyInteractive() const
+{
+    return DigitNativeHostGuard::IsInteractive(ActiveHostHierarchy);
+}
+
 bool FDigitInputProcessor::HasActiveSession() const
 {
     // The weak widget may already be destroyed. Its validity alone must not
@@ -4900,6 +4961,8 @@ void FDigitInputProcessor::RestoreActiveDelta()
     // re-entry cannot run an old restore or be cleared as a newly armed scrub.
     TFunction<void()> RestoreFunction = MoveTemp(RestoreDeltaFunction);
     ApplySelectedDeltaFunction = nullptr;
+    SuspendActiveScrubFunction = nullptr;
+    ActiveHostHierarchy.Reset();
     RestoreDeltaFunction = nullptr;
     RouteActiveMoveFunction = nullptr;
     VerifyActiveSourceFunction = nullptr;

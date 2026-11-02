@@ -15,6 +15,8 @@
 #include "DigitCurveEditableValue.h"
 #include "DigitCurveTextMouse.h"
 #include "DigitScrubDisplayPolicy.h"
+#include "DigitNativeHostGuard.h"
+#include "Widgets/Layout/SBorder.h"
 #include "Widgets/Input/SEditableText.h"
 #include "Widgets/Input/SSpinBox.h"
 #include "Widgets/Input/NumericTypeInterface.h"
@@ -1210,10 +1212,6 @@ bool FDigitCurveEditorBoundNumericIsolationTest::RunTest(const FString& Paramete
     return true;
 }
 
-#endif // WITH_DEV_AUTOMATION_TESTS
-
-
-
 // Native Curve Editor SSpinBox path, distinct from text-only Ctrl+Alt staging.
 // A finer intended step can expand the displayed fractional width without
 // interrupting the original captured native scrub transaction.
@@ -1257,3 +1255,119 @@ bool FDigitNativeScrubPrecisionContinuityTest::RunTest(const FString& Parameters
         MaximumSelfGeneratedFractionDigits(Base, 5, 1.e-9), 5);
     return true;
 }
+
+// UE 5.8 native host hierarchy contract: disabling or rebuilding a
+// Curve Editor key/tangent/multi-key control must prevent Digit from applying
+// another routed native mouse movement. These checks operate on real widgets
+// but do not simulate Curve Editor keyframe transactions or interpolation.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveEditorNativeHostHierarchyTest,
+    "Digit.CurveEditor.NativeHostHierarchy",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveEditorNativeHostHierarchyTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    using namespace DigitNativeHostGuard;
+    const TSharedRef<SSpinBox<double>> Numeric = SNew(SSpinBox<double>)
+        .Value(12.34)
+        .Delta(0.1);
+    const TSharedRef<SBorder> Host = SNew(SBorder)
+        .Visibility(EVisibility::Visible)
+        [Numeric];
+
+    TArray<TWeakPtr<SWidget>> NativeHierarchy;
+    NativeHierarchy.Add(Host);
+    NativeHierarchy.Add(Numeric);
+    TestTrue(TEXT("Real visible enabled Curve Editor-style hierarchy can scrub"),
+        IsInteractive(NativeHierarchy));
+
+    Host->SetEnabled(false);
+    TestFalse(TEXT("A disabled tangent or selected-key owner stops scrubbing"),
+        IsInteractive(NativeHierarchy));
+    Host->SetEnabled(true);
+    TestTrue(TEXT("Reenabled host hierarchy can be rearmed"),
+        IsInteractive(NativeHierarchy));
+
+    Host->SetVisibility(EVisibility::Collapsed);
+    TestFalse(TEXT("Collapsed rebuilt details row stops scrubbing"),
+        IsInteractive(NativeHierarchy));
+    Host->SetVisibility(EVisibility::Hidden);
+    TestFalse(TEXT("Hidden host row stops scrubbing"),
+        IsInteractive(NativeHierarchy));
+    Host->SetVisibility(EVisibility::Visible);
+    TestTrue(TEXT("Visible hierarchy can start a new native drag"),
+        IsInteractive(NativeHierarchy));
+
+    TArray<TWeakPtr<SWidget>> NoVerifiedOwner;
+    TestFalse(TEXT("Never arm a numeric control without verified host ancestry"),
+        IsInteractive(NoVerifiedOwner));
+    {
+        const TSharedRef<SBorder> UnrelatedRow = SNew(SBorder);
+        NativeHierarchy.Add(UnrelatedRow);
+        TestFalse(TEXT("Live but unrelated details row is not on the original parent chain"),
+            IsInteractive(NativeHierarchy));
+    }
+    TestFalse(TEXT("Destroyed/replaced host row invalidates old drag"),
+        IsInteractive(NativeHierarchy));
+    TestTrue(TEXT("Host protection does not mutate numeric delta"),
+        FMath::IsNearlyEqual(Numeric->GetDelta(), 0.1));
+    return true;
+}
+
+
+// A multi-key/tangent details panel may be rebuilt without immediately
+// destroying the previous native spinbox. The real attached parent chain must
+// be retained, not just independently live/visible Slate widget identities.
+// Does not synthesize Curve Editor transactions or selection changes.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveEditorNativeHostParentContinuityTest,
+    "Digit.CurveEditor.NativeHostParentContinuity",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveEditorNativeHostParentContinuityTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    using namespace DigitNativeHostGuard;
+    const TSharedRef<SSpinBox<double>> Numeric = SNew(SSpinBox<double>)
+        .Value(12.34).Delta(0.01);
+    const TSharedRef<SBorder> Middle = SNew(SBorder)[Numeric];
+    const TSharedRef<SBorder> Outer = SNew(SBorder)[Middle];
+
+    TArray<TWeakPtr<SWidget>> OriginalPath;
+    OriginalPath.Add(Outer);
+    OriginalPath.Add(Middle);
+    OriginalPath.Add(Numeric);
+    TestTrue(TEXT("Actual nested numeric host chain can scrub"),
+        IsInteractive(OriginalPath));
+    TestTrue(TEXT("Child's native Slate parent is the recorded details row"),
+        Numeric->GetParentWidget().Get() == &Middle.Get());
+
+    // Simulates selecting a different set of keys and rebuilding a details
+    // panel while a capture keeps the original numeric control alive.
+    const TSharedRef<SBorder> Replacement = SNew(SBorder);
+    Middle->SetContent(Replacement);
+    TestTrue(TEXT("Old numeric widget remains alive after panel replacement"),
+        FMath::IsNearlyEqual(Numeric->GetDelta(), 0.01));
+    TestFalse(TEXT("Detached but live numeric widget cannot continue old drag"),
+        IsInteractive(OriginalPath));
+
+    // Reattach only for the fixture: a NEW gesture is then eligible. A
+    // suspended/old gesture is never auto-resumed by this helper.
+    Middle->SetContent(Numeric);
+    TestTrue(TEXT("New gesture may use restored native parent chain"),
+        IsInteractive(OriginalPath));
+
+    const TSharedRef<SBorder> Sibling = SNew(SBorder);
+    TArray<TWeakPtr<SWidget>> WrongParentPath;
+    WrongParentPath.Add(Outer);
+    WrongParentPath.Add(Sibling);
+    WrongParentPath.Add(Numeric);
+    TestFalse(TEXT("A live sibling cannot masquerade as the original parent"),
+        IsInteractive(WrongParentPath));
+    TestTrue(TEXT("Guard never changes the host's original numeric delta"),
+        FMath::IsNearlyEqual(Numeric->GetDelta(), 0.01));
+    return true;
+}
+
+#endif // WITH_DEV_AUTOMATION_TESTS

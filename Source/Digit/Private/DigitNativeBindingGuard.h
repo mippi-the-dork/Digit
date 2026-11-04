@@ -22,6 +22,28 @@ namespace DigitNativeBindingGuard
             && Current.Get() == LastDigitWrite;
     }
 
+    // A native SSpinBox can keep its Slate widget and ancestry while the
+    // Curve Editor changes the selected key or a tool switches its target.
+    // Check BOTH native-delta routes and direct-value routes. A newly bound
+    // getter replacing an original literal also belongs to the host.
+    template<typename NumericType>
+    inline bool HasReboundHost(
+        const TAttribute<NumericType>& Current,
+        const TAttribute<NumericType>& Original,
+        const bool bDigitOwnsDirectLiteral,
+        const NumericType LastDigitWrite)
+    {
+        if (bDigitOwnsDirectLiteral)
+        {
+            return !OwnsTemporaryLiteral(Current, LastDigitWrite);
+        }
+        if (Original.IsBound())
+        {
+            return !Current.IdenticalTo(Original);
+        }
+        return Current.IsBound();
+    }
+
     template<typename NumericType>
     inline bool IsUnchangedHostBinding(
         const TAttribute<NumericType>& Current,

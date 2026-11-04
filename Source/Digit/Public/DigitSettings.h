@@ -20,6 +20,9 @@ public:
     UPROPERTY(EditAnywhere, Config, Category = "Scrubbing", meta = (DisplayName = "Scrub Sensitivity", ClampMin = "0.1", ClampMax = "10.0", UIMin = "0.25", UIMax = "4.0", ToolTip = "Scales horizontal Digit scrubbing. 1.0 is the default speed. Lower values require more mouse movement; higher values require less. Does not affect the drag threshold or Value Ladder rung selection."))
     float ScrubSensitivity;
 
+    UPROPERTY(EditAnywhere, Config, Category = "Scrubbing|Curve Editor Shared Values (Experimental)", meta = (DisplayName = "Preview Scrub on Shared Key Value Fields", ToolTip = "OFF by default. On a verified Curve Editor selected-key VALUE spinbox that displays a plain number but has its native slider disabled, temporarily permits the host's own slider interaction for a Digit drag. Does not modify mixed-value labels, Time, or unrelated fields. Unreal owns all key changes and Undo/Redo. Verify with two equally valued keys first; multi-key slider callbacks and transaction semantics require live UE validation."))
+    bool bCurveEditorSharedValueSliderPreview;
+
     UPROPERTY(EditAnywhere, Config, Category = "Scrubbing|Curve Editor Text (Experimental)", meta = (DisplayName = "Enable Text-Only Ctrl+Alt Drag", ToolTip = "Enables Ctrl+Alt+left-drag on an already selected single digit in the Curve Editor Time/Value text boxes. Horizontal movement stages digit steps in Unreal's original text field. Press Enter to commit or Escape to cancel. No second property transaction or synthetic mouse capture is created."))
     bool bCurveEditorTextDrag;
 

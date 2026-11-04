@@ -64,6 +64,7 @@ private:
         int32 DigitPlace = 0;
         bool bRotatorComponent = false;
         bool bCurveKeyTimeField = false;
+        bool bCurveKeyValueField = false;
         ENumericOwner Owner = ENumericOwner::General;
         TOptional<FDigitTemporalSpinContext> TemporalContext;
         FString DisplayString;

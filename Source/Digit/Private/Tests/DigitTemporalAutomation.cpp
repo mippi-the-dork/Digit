@@ -17,6 +17,7 @@
 #include "DigitScrubDisplayPolicy.h"
 #include "DigitNativeHostGuard.h"
 #include "DigitNativeBindingGuard.h"
+#include "DigitCurveSharedValuePolicy.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Input/SEditableText.h"
 #include "Widgets/Input/SSpinBox.h"
@@ -1452,6 +1453,213 @@ bool FDigitCurveEditorNativeReboundValueOwnershipTest::RunTest(const FString& Pa
     Integer->SetValue(TAttribute<int32>(30));
     TestFalse(TEXT("Replaced integer value is never restored as an old write"),
         OwnsTemporaryLiteral(Integer->GetValueAttribute(), 20));
+    return true;
+}
+
+
+// A native float/double SSpinBox (the ordinary Curve Editor Value route) can
+// keep capture and the same Slate ancestry while its value getter is rebound
+// to another key. This is distinct from the special exact-value route tested
+// by NativeReboundValueOwnership. Do not route a second move or reinstate
+// the previous key's Delta over the newly selected key.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveEditorNativeBindingContinuityTest,
+    "Digit.CurveEditor.NativeBindingContinuity",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveEditorNativeBindingContinuityTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    using namespace DigitNativeBindingGuard;
+
+    double KeyA = 12.34;
+    double KeyB = 42.0;
+    int32 Changes = 0;
+    int32 Commits = 0;
+    const TSharedRef<SSpinBox<double>> Numeric = SNew(SSpinBox<double>)
+        .Value_Lambda([&KeyA]() { return KeyA; })
+        .Delta(0.1)
+        .OnValueChanged_Lambda([&Changes](double) { ++Changes; })
+        .OnValueCommitted_Lambda([&Commits](double, ETextCommit::Type) { ++Commits; });
+    const TAttribute<double> Original = Numeric->GetValueAttribute();
+    const double OriginalDelta = Numeric->GetDelta();
+
+    TestFalse(TEXT("Bound native field initially belongs to its original host"),
+        HasReboundHost(Numeric->GetValueAttribute(), Original, false, 12.34));
+    // A host getter may return another value as its property changes. The
+    // callback identity is still the same field; this is not a rebind.
+    KeyA = 13.0;
+    TestFalse(TEXT("Changing value behind same getter is not a new host binding"),
+        HasReboundHost(Numeric->GetValueAttribute(), Original, false, 12.34));
+    Numeric->SetDelta(0.01);
+
+    // Select another key without replacing the SSpinBox.
+    Numeric->SetValue(TAttribute<double>::Create(
+        TAttribute<double>::FGetter::CreateLambda([&KeyB]() { return KeyB; })));
+    TestTrue(TEXT("Native (non-direct) scrub detects same-widget getter replacement"),
+        HasReboundHost(Numeric->GetValueAttribute(), Original, false, 12.34));
+    Numeric->SetDelta(0.25); // The new host configures its own magnitude.
+    // The fixture's deliberate SetValue may itself invoke native callbacks.
+    // Only compare counts around Digit's delta-only cleanup.
+    const int32 ChangesBeforeCleanup = Changes;
+    const int32 CommitsBeforeCleanup = Commits;
+    if (!HasReboundHost(Numeric->GetValueAttribute(), Original, false, 12.34))
+    {
+        Numeric->SetDelta(OriginalDelta);
+    }
+    TestTrue(TEXT("Digit cleanup must not overwrite new host Delta"),
+        FMath::IsNearlyEqual(Numeric->GetDelta(), 0.25));
+    TestTrue(TEXT("New key remains the active native getter"),
+        Numeric->GetValueAttribute().IsBound()
+        && FMath::IsNearlyEqual(Numeric->GetValueAttribute().Get(), 42.0));
+    TestEqual(TEXT("Delta-only cleanup does not invoke native change callbacks"),
+        Changes, ChangesBeforeCleanup);
+    TestEqual(TEXT("Delta-only cleanup does not commit a new key"),
+        Commits, CommitsBeforeCleanup);
+
+    // An exact-value route is allowed to retain only its own temporary
+    // literal, including when the original field started unbound.
+    Numeric->SetValue(TAttribute<double>(13.5));
+    TestFalse(TEXT("Known temporary literal belongs to Digit's direct route"),
+        HasReboundHost(Numeric->GetValueAttribute(), Original, true, 13.5));
+    TestTrue(TEXT("Different literal is not Digit's temporary write"),
+        HasReboundHost(Numeric->GetValueAttribute(), Original, true, 13.6));
+    const TAttribute<double> UnboundOriginal(5.0);
+    TestFalse(TEXT("Unbound original may retain Digit's direct temporary literal"),
+        HasReboundHost(Numeric->GetValueAttribute(), UnboundOriginal, true, 13.5));
+    TestTrue(TEXT("New bound getter replaces an originally unbound host"),
+        HasReboundHost(Original, UnboundOriginal, false, 5.0));
+
+    // Float controls are common in native numeric tool properties. Do not
+    // require Curve Editor's graphical tangent handles to be numeric.
+    float WeightA = 0.25f;
+    float WeightB = 0.75f;
+    const TSharedRef<SSpinBox<float>> Weight = SNew(SSpinBox<float>)
+        .Value_Lambda([&WeightA]() { return WeightA; }).Delta(0.01f);
+    const TAttribute<float> FirstWeight = Weight->GetValueAttribute();
+    TestFalse(TEXT("Stable float tool binding is valid"),
+        HasReboundHost(Weight->GetValueAttribute(), FirstWeight, false, 0.25f));
+    Weight->SetValue(TAttribute<float>::Create(
+        TAttribute<float>::FGetter::CreateLambda([&WeightB]() { return WeightB; })));
+    TestTrue(TEXT("Rebound float tool binding is rejected"),
+        HasReboundHost(Weight->GetValueAttribute(), FirstWeight, false, 0.25f));
+    return true;
+}
+
+
+// 1.0.47: A shared selected-key Value control can display a regular number
+// while its native slider remains disabled. The preview must be tightly
+// scoped to the actual Curve Editor Value branch, not all read-only fields.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveEditorSharedValueSliderPolicyTest,
+    "Digit.CurveEditor.SharedValueSliderPolicy",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveEditorSharedValueSliderPolicyTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    using namespace DigitCurveSharedValuePolicy;
+    TestTrue(TEXT("Verified scalar Curve Value can preview a native slider"),
+        CanPreviewNativeSlider(true, true, true, false, true, true));
+    TestFalse(TEXT("Default preview off respects the host's disabled slider"),
+        CanPreviewNativeSlider(false, true, true, false, true, true));
+    TestFalse(TEXT("Unrelated Details and tangent fields remain native"),
+        CanPreviewNativeSlider(true, false, true, false, true, true));
+    TestFalse(TEXT("Disabled or read-only native control cannot be promoted"),
+        CanPreviewNativeSlider(true, true, false, false, true, true));
+    TestFalse(TEXT("Already-native-slider fields don't need the preview"),
+        CanPreviewNativeSlider(true, true, true, true, true, true));
+    TestFalse(TEXT("Integral and non-numeric controls cannot be promoted"),
+        CanPreviewNativeSlider(true, true, true, false, false, true));
+    TestFalse(TEXT("Mixed Values annotation is not a digit-place value"),
+        CanPreviewNativeSlider(true, true, true, false, true, false));
+    TestTrue(TEXT("Restore only the original attached and bound host"),
+        ShouldRestorePreviewSlider(true, true, false, true));
+    TestFalse(TEXT("Never restore over a new selected-key binding"),
+        ShouldRestorePreviewSlider(true, true, true, true));
+    TestFalse(TEXT("Never restore a stale detached details row"),
+        ShouldRestorePreviewSlider(true, false, false, true));
+    TestFalse(TEXT("Never override host slider changes made mid-drag"),
+        ShouldRestorePreviewSlider(true, true, false, false));
+    return true;
+}
+
+// Test public Slate setter and native host attribute ownership. This does
+// not simulate multi-key FCurveEditor transactions; those need an actual
+// Level Sequence and native Curve Editor selected-key callbacks.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveEditorSharedValueSliderLifecycleTest,
+    "Digit.CurveEditor.SharedValueSliderLifecycle",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveEditorSharedValueSliderLifecycleTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    using namespace DigitCurveSharedValuePolicy;
+    using namespace DigitNativeBindingGuard;
+    double KeyA = 30.0;
+    double KeyB = 90.0;
+    int32 Changes = 0;
+    int32 Commits = 0;
+    const TSharedRef<SSpinBox<double>> Numeric = SNew(SSpinBox<double>)
+        .Value_Lambda([&KeyA]() { return KeyA; })
+        .EnableSlider(false).Delta(0.01)
+        .OnValueChanged_Lambda([&Changes](double) { ++Changes; })
+        .OnValueCommitted_Lambda([&Commits](double, ETextCommit::Type) { ++Commits; });
+    const TSharedRef<SBorder> Host = SNew(SBorder)[Numeric];
+    TArray<TWeakPtr<SWidget>> OriginalPath;
+    OriginalPath.Add(Host);
+    OriginalPath.Add(Numeric);
+    const TAttribute<double> Original = Numeric->GetValueAttribute();
+    TestFalse(TEXT("Native shared-value spinbox begins with slider disabled"),
+        Numeric->GetEnableSlider());
+    TestTrue(TEXT("Verified parent chain is attached"),
+        DigitNativeHostGuard::IsInteractive(OriginalPath));
+    const int32 InitialChanges = Changes;
+    const int32 InitialCommits = Commits;
+    Numeric->SetEnableSlider(true);
+    TestTrue(TEXT("Preview activates native slider through public Slate API"),
+        Numeric->GetEnableSlider());
+    TestTrue(TEXT("Host's original bound getter remains identical"),
+        IsUnchangedHostBinding(Numeric->GetValueAttribute(), Original));
+    KeyA = 30.25;
+    TestTrue(TEXT("Original live source remains bound and readable"),
+        FMath::IsNearlyEqual(Numeric->GetValueAttribute().Get(), 30.25));
+    if (ShouldRestorePreviewSlider(true,
+        DigitNativeHostGuard::IsInteractive(OriginalPath),
+        HasReboundHost(Numeric->GetValueAttribute(), Original, false, 30.0),
+        Numeric->GetEnableSlider()))
+    {
+        Numeric->SetEnableSlider(false);
+    }
+    TestFalse(TEXT("Cleanup returns original widget to disabled slider"),
+        Numeric->GetEnableSlider());
+    TestEqual(TEXT("Enable/restore does not itself change selected keys"),
+        Changes, InitialChanges);
+    TestEqual(TEXT("Enable/restore does not itself commit a keyframe"),
+        Commits, InitialCommits);
+    // Rebind to Key B on the SAME spinbox. Cleanup must not restore the
+    // retired widget state, including its EnableSlider policy.
+    Numeric->SetEnableSlider(true);
+    Numeric->SetValue(TAttribute<double>::Create(
+        TAttribute<double>::FGetter::CreateLambda([&KeyB]() { return KeyB; })));
+    const int32 ChangesBeforeCleanup = Changes;
+    const int32 CommitsBeforeCleanup = Commits;
+    if (ShouldRestorePreviewSlider(true,
+        DigitNativeHostGuard::IsInteractive(OriginalPath),
+        HasReboundHost(Numeric->GetValueAttribute(), Original, false, 30.0),
+        Numeric->GetEnableSlider()))
+    {
+        Numeric->SetEnableSlider(false);
+    }
+    TestTrue(TEXT("New host slider policy is not overwritten by stale cleanup"),
+        Numeric->GetEnableSlider());
+    TestTrue(TEXT("New key owns original native widget"),
+        FMath::IsNearlyEqual(Numeric->GetValueAttribute().Get(), 90.0));
+    TestEqual(TEXT("Cleanup must not send additional value change"),
+        Changes, ChangesBeforeCleanup);
+    TestEqual(TEXT("Cleanup must not send an additional commit"),
+        Commits, CommitsBeforeCleanup);
     return true;
 }
 

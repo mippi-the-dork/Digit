@@ -5,6 +5,7 @@
 UDigitSettings::UDigitSettings()
     : ScrubSensitivity(1.0f)
     , bCurveEditorSharedValueSliderPreview(false)
+    , bCurveEditorMultiKeyTextScrubPreview(false)
     , bCurveEditorTextDrag(true)
     , bCurveEditorTextDragCommitOnRelease(false)
     , bCurveEditorTextDragUseNativeCapture(false)

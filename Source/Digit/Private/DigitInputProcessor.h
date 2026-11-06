@@ -112,6 +112,18 @@ private:
     // An explicitly selected Curve Editor Time/Value digit may be dragged in
     // the original editable field. No synthetic native mouse-down, external
     // OnTextCommitted, or property transactions are generated.
+    // Shared Curve Editor Value uses SPropertyEditorNumeric<T> >
+    // SNumericEntryBox<T> > SEditableText, not the SEditableTextBox above.
+    // All edits stage in that real text buffer and commit through its native
+    // Enter callback. Only explicit Ctrl+Alt mouse input starts this preview.
+    bool ResolveCurvePropertyValueTarget(const FWidgetPath& Path,
+        const SWidget* EditableWidget) const;
+    bool TryBeginCurvePropertyScrub(FSlateApplication& SlateApp, const FPointerEvent& Event);
+    bool UpdateCurvePropertyScrub(FSlateApplication& SlateApp, const FPointerEvent& Event);
+    void EndCurvePropertyScrub(bool bKeepStagedText = false);
+    void FlushCurvePropertyCommit(FSlateApplication& SlateApp);
+    void ClearCurvePropertyCommit();
+
     bool ResolveCurveTextTarget(const FWidgetPath& Path,
         const SWidget* FocusedWidget, bool& bOutTime) const;
     bool TryBeginCurveTextDrag(FSlateApplication& SlateApp, const FPointerEvent& Event);
@@ -133,6 +145,30 @@ private:
 private:
     // The public SEditableText API does not expose its uncommitted buffer or
     // edit transactions. Never re-step stale bound text within the same edit.
+
+    struct FCurvePropertyCommit
+    {
+        TWeakPtr<SEditableText> Editable;
+        TArray<TWeakPtr<SWidget>> OriginalHierarchy;
+        FString ExpectedText;
+        FString OriginalText;
+        int32 UserIndex = INDEX_NONE;
+    };
+    TOptional<FCurvePropertyCommit> PendingCurvePropertyCommit;
+    TWeakPtr<SEditableText> CurvePropertyEditable;
+    TArray<TWeakPtr<SWidget>> CurvePropertyHierarchy;
+    FString CurvePropertyInitialText;
+    FString CurvePropertyLastStaged;
+    int32 CurvePropertyDigitIndex = INDEX_NONE;
+    int32 CurvePropertyPointer = INDEX_NONE;
+    int32 CurvePropertyUser = INDEX_NONE;
+    int32 CurvePropertyAccumulatedSteps = 0;
+    double CurvePropertyPendingPixels = 0.0;
+    bool bCurvePropertyScrubActive = false;
+    bool bCurvePropertyOwnsCapture = false;
+    bool bCurvePropertyReceivedMove = false;
+    bool bCurvePropertyMixed = false;
+    bool bCurvePropertyChanged = false;
 
     TWeakPtr<SEditableText> CurveTextDragEditable;
     int32 CurveTextDragPointer = INDEX_NONE;

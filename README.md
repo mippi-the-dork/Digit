@@ -9,10 +9,39 @@ Hover the hundreds place to work in hundreds. Hover the tenths place to make fin
 ![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.8.x-black?logo=unrealengine)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2064--bit-blue)
 ![Type](https://img.shields.io/badge/Plugin-Editor%20Only-green)
-![Version](https://img.shields.io/badge/Version-1.0.47-blue)
+![Version](https://img.shields.io/badge/Version-1.0.51-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 ![Digit targeting a numeric place value in Unreal Engine](Doc/Images/Digit-Hero.png)
+
+---
+
+## v1.0.51: Deferred multi-key Value commit and release diagnostics
+
+- Corrects the v1.0.50 issue observed in real UE 5.8.3 logs: the multi-key gesture armed, received movement, and staged the first change, but never reached release/commit. The preview no longer writes temporary values to the native property text control during drag, avoiding an Unreal bound-text refresh cancelling the gesture.
+- Drag results are accumulated in Digit session memory only. On the verified mouse release, the original editor must still be focused, attached, and unchanged. Digit then stages its single proposal immediately before requesting the native Enter commit. No curve preview is shown until the original editor processes that commit.
+- Adds specific diagnostics for an unexpectedly changed Value widget or text, an incompatible release pointer, and deferred-commit rejection. The new native policy test is `Digit.CurveEditor.MultiKeyDeferredNativeCommit`. The interaction remains **experimental and OFF by default** until live key changes and Undo/Redo are verified.
+- Single-key numeric scrubbing and ordinary multi-key absolute text editing are unchanged. See `Doc/Curve-Editor-Multi-Key-Deferred-Commit-V151.md`.
+
+## v1.0.50: Captured multi-key scrub lifecycle and cancellation diagnostics
+
+- The Ctrl+Alt Curve Editor Value preview verifies only the original **key-detail subtree** before arming, requests the original text widget's Slate pointer capture, and tracks **owned capture** through movement, release, and cleanup. Only Digit's own captured pointer is released.
+- The preview is OFF by default and requires live Sequencer testing. The legacy shared-slider preview remains ineffective for text-only multi-key Value fields.
+
+## v1.0.49: Captureless Curve Editor multi-key gesture and diagnostics
+
+- Updated the Ctrl+Alt multi-key text preview to consume the verified Value-field mouse-down without requiring synchronous native Slate mouse capture. This fixes a potential activation rejection where normal `SEditableText` selection occurred instead of Digit's custom gesture.
+- Handles both the actual `SEditableText` leaf and the `SBorder` hit returned by UE 5.8.3 on clicks inside the same numeric Value control; resolves back to the full live Slate text ancestry before arming.
+- Checks exact Value-branch ancestry, physical left-button state, original keyboard focus, and absence of third-party capture on movement. Any interruption cancels the staged text. Commit remains native Enter on release and is **not** claimed as live-verified.
+- When **Log Numeric Widget Diagnostics** is enabled, a rejected Ctrl+Alt Value click now explains whether the preview was disabled, another session had capture, the text wasn't numeric, or the hit widget wasn't recognized. A successful arm writes `CurveEditor multi-key text scrub armed`.
+- New UE Automation test: `Digit.CurveEditor.MultiKeyTextActivation` validates the observed UE 5.8.3 `SConstrainedBox`/`SPropertyValueWidget` ancestry and captureless cancellation policy.
+- **OFF by default**, experimental. Single-key native slider scrubbing and multi-key manual entry are unchanged. Test with disposable keyframes first.
+
+## v1.0.48.1: Curve Editor multi-key focused-widget compilation hotfix
+
+Fixes the UE 5.8.3 compiler error C2679 in `DigitInputProcessor.cpp` at the focused-widget identity check in `TryBeginCurvePropertyScrub`. The check compares the Slate-focused `SWidget*` against the address of the `TSharedRef<SEditableText>` widget (`&Edit.Get()`), not the `SEditableText` object reference. The original focus safety check remains enforced. No changes to multi-key staging, Curve Editor commits, native single-key scrubbing, or Undo ownership.
+
+This hotfix is source-validated but still requires an Unreal Engine compile and the `Digit.CurveEditor.MultiKeyTextExpression` and `Digit.CurveEditor.MultiKeyTextEqualValue` native Automation Framework tests before manual testing. The preview remains opt-in/off by default.
 
 ---
 
@@ -87,6 +116,8 @@ Text-only **Value** fields in the Curve Editor key-detail panel also support **C
 **Curve Editor text drag:** After selecting exactly one digit in the original Time or Value text field, hold **Ctrl+Alt** and drag **horizontally with the left mouse button** over that same field. Each 8 horizontal pixels at sensitivity 1.0 stages one increment at that selected magnitude. Reverse direction to subtract; value selection survives carry and sign changes. Release the mouse, then press **Enter** to commit or **Escape** to cancel through the original Unreal text editor. This guarded gesture uses the existing edit buffer rather than routing a synthetic mouse-down or creating a second transaction. It is configurable with **Curve Editor Text Drag** in Project Settings. **v1.0.40 adds optional real Slate pointer capture for this original text widget**, releasing capture on mouse-up, focus loss, or panel teardown where the widget remains discoverable. Enable **Curve Editor Text Native Mouse Capture (Preview)** to test dragging outside the original field. It is disabled by default to preserve the previously validated mouse workflow. The standard release-then-Enter workflow remains the default. An optional **Commit Curve Editor Text Drag on Mouse Release (Preview)** setting (also disabled by default, and requiring native capture) queues a one-shot request and rechecks the original focused field, staged numeric buffer, digit selection, ownership and released mouse capture on the **next Slate post-tick** before routing Enter through Unreal's original text widget. Any intervening keyboard input, new mouse-down, focus loss, window teardown or stale buffer cancels the pending request. Digit never calls the property callback or creates a transaction directly. See `Doc/Curve-Editor-Preview-Transaction-QA-V142.md` for the exact four-mode testing procedure before enabling preview settings on a team.
 
 **Curve Editor safety and faster text scrubbing:** v1.0.41 verifies the text buffer and selected digit on each drag update, and terminates staging if the host modifies either. A value at its upper bound can still be scrubbed downward, provided the negative step is representable. Hold **Shift** while Ctrl+Alt+left-dragging to scrub text-only Time or Value at **4x** the regular horizontal rate, without changing the selected place. Curve Editor's native numeric tool properties and tangent-related controls continue to use the original host `SSpinBox` callbacks wherever their underlying widgets qualify. For actual widget discovery, enable **Log Numeric Widget Diagnostics** temporarily and inspect `LogDigit` for Curve Editor owner/type and numeric magnitude. Weighted tangents, mixed multi-key values, and live keyframe transactions require the additional QA matrix in `Doc/Curve-Editor-Host-Safety-And-Tangent-V141.md`. These are not broadly certified by source tests alone.
+
+**Curve Editor multi-key text scrub preview (v1.0.48):** UE 5.8.3 uses an `SEditableText` under `SPropertyEditorNumeric` for multi-key Value editing, not the spinbox targeted by the earlier preview. An optional, **OFF by default** Ctrl+Alt+left-drag gesture supports that host field. In v1.0.51, the proposed edits remain in Digit's session state until mouse release. With equal values, it stages ones-place absolute edits; with `Multiple Values`, it stages a relative expression so an offset can be applied individually to selected keys by Unreal's native per-object property handler. On mouse release, Digit verifies the original captured text field and requests a native Enter commit on a Slate post-tick after staging the proposed text. **This is a staged-text preview: it does not update keyframes live during mouse movement.** Its mouse-release transaction behavior must be verified in UE 5.8.3 before enabling it for everyday use. See `Doc/Curve-Editor-Multi-Key-Text-Preview-V148.md` and `Digit.CurveEditor.MultiKeyTextExpression` / `MultiKeyTextEqualValue`. The older shared-value slider preview did not work with the actual multi-key text widget and should remain disabled.
 
 **Shared Curve Editor Value slider preview (v1.0.47):** An opt-in setting under **Scrubbing > Curve Editor Shared Values (Experimental)** allows Digit to temporarily enable Unreal's existing slider when a verified selected-key **Value** field displays a plain number but its native slider is disabled. This targets the reported two-key `30, 30` case and uses Unreal's existing slider callbacks. The preview is **OFF by default** until live UE 5.8.3 multi-key transactions and Undo/Redo are validated. It does not create a custom multi-key transaction and does **not** yet implement relative drags on `Multiple Values` / `10, 20`. This behavior is intentionally disabled for Curve Editor Time and other editors. See `Doc/Curve-Editor-Shared-Value-Preview-V147.md` and `Digit.CurveEditor.SharedValueSliderPolicy` / `SharedValueSliderLifecycle`.
 
@@ -1054,7 +1085,7 @@ Digit is configured for:
 
 | | |
 |---|---|
-| **Digit Version** | 1.0.47 |
+| **Digit Version** | 1.0.51 |
 | **Unreal Engine** | 5.8.x |
 | **Platform** | Windows 64-bit |
 | **Plugin Type** | Editor |

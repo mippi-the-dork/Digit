@@ -15,9 +15,11 @@
 #include "DigitNativeHostGuard.h"
 #include "DigitNativeBindingGuard.h"
 #include "DigitCurveSharedValuePolicy.h"
+#include "DigitCurveMultiKeyTextPolicy.h"
 #include "Input/Events.h"
 #include "InputCoreTypes.h"
 #include "Layout/Children.h"
+#include "Templates/Function.h"
 #include "Widgets/SWidget.h"
 #include "Internationalization/Internationalization.h"
 #include "Internationalization/Culture.h"
@@ -1184,6 +1186,497 @@ bool FDigitInputProcessor::ResolveCurveTextTarget(const FWidgetPath& Path,
     return false;
 }
 
+bool FDigitInputProcessor::ResolveCurvePropertyValueTarget(
+    const FWidgetPath& Path, const SWidget* EditableWidget) const
+{
+    // This is the exact UE 5.8.3 multi-object PropertyEditor widget path.
+    // Checking the child-1 branch of SCurveKeyDetailPanel avoids touching
+    // Time, tangent tools, unrelated numeric fields, or placeholder boxes.
+    TArray<FString> WidgetTypes;
+    WidgetTypes.Reserve(Path.Widgets.Num());
+    for (int32 Index = 0; Index < Path.Widgets.Num(); ++Index)
+    {
+        WidgetTypes.Add(Path.Widgets[Index].Widget->GetTypeAsString());
+    }
+    if (!DigitCurveMultiKeyTextPolicy::HasValueTextWidgetTypes(WidgetTypes))
+    {
+        return false;
+    }
+    int32 Panel = INDEX_NONE;
+    int32 Horizontal = INDEX_NONE;
+    int32 Property = INDEX_NONE;
+    int32 NumericEntry = INDEX_NONE;
+    int32 Editable = INDEX_NONE;
+    for (int32 Index = 0; Index < Path.Widgets.Num(); ++Index)
+    {
+        const TSharedRef<SWidget>& Widget = Path.Widgets[Index].Widget;
+        const FString Type = Widget->GetTypeAsString();
+        if (Type == TEXT("SCurveKeyDetailPanel")) Panel = Index;
+        else if (Panel != INDEX_NONE && Horizontal == INDEX_NONE
+            && Type == TEXT("SHorizontalBox")) Horizontal = Index;
+        else if (Panel != INDEX_NONE && Type.StartsWith(TEXT("SPropertyEditorNumeric"))) Property = Index;
+        else if (Panel != INDEX_NONE && Type.StartsWith(TEXT("SNumericEntryBox"))) NumericEntry = Index;
+        if (&Widget.Get() == EditableWidget && Type == TEXT("SEditableText")) Editable = Index;
+    }
+    if (Panel == INDEX_NONE || Horizontal <= Panel || Property <= Horizontal
+        || NumericEntry <= Property || Editable <= NumericEntry
+        || Editable != Path.Widgets.Num() - 1 || Horizontal + 1 >= Path.Widgets.Num())
+    {
+        return false;
+    }
+    const TSharedRef<SWidget>& Row = Path.Widgets[Horizontal].Widget;
+    FChildren* Children = Row->GetChildren();
+    if (!Children || Children->Num() != 2
+        || &Children->GetChildAt(1).Get() != &Path.Widgets[Horizontal + 1].Widget.Get())
+    {
+        return false;
+    }
+    const TSharedRef<SEditableText> Text =
+        StaticCastSharedRef<SEditableText>(Path.Widgets[Editable].Widget);
+    if (Text->IsTextReadOnly()) return false;
+    for (int32 Index = Panel; Index <= Editable; ++Index)
+    {
+        const TSharedRef<SWidget>& Widget = Path.Widgets[Index].Widget;
+        const EVisibility Visibility = Widget->GetVisibility();
+        if (!Widget->IsEnabled() || Visibility == EVisibility::Collapsed
+            || Visibility == EVisibility::Hidden) return false;
+    }
+    return true;
+}
+
+void FDigitInputProcessor::ClearCurvePropertyCommit()
+{
+    // The value is staged only in Digit's session state. Nothing is written
+    // to the native SEditableText buffer until the commit is dispatched.
+    PendingCurvePropertyCommit.Reset();
+}
+
+void FDigitInputProcessor::EndCurvePropertyScrub(bool bKeepStagedText)
+{
+    const TSharedPtr<SEditableText> Edit = CurvePropertyEditable.Pin();
+    if (bCurvePropertyScrubActive && Edit.IsValid())
+    {
+        // No staged value has entered the native text buffer yet. Cancellation
+        // therefore cannot accidentally invoke a property change or need to
+        // restore a bound value that Unreal may have refreshed mid-drag.
+        (void)bKeepStagedText;
+        // A mouse-down consumed by Digit must keep the pointer routed to this
+        // exact text editor until release. Release only capture acquired by
+        // this session, never a different editor's capture.
+        if (bCurvePropertyOwnsCapture && Edit->HasMouseCapture()
+            && FSlateApplication::IsInitialized())
+        {
+            FSlateApplication& SlateApp = FSlateApplication::Get();
+            FWidgetPath CurrentPath;
+            if (SlateApp.FindPathToWidget(Edit.ToSharedRef(), CurrentPath, EVisibility::Visible))
+            {
+                SlateApp.ProcessExternalReply(CurrentPath,
+                    FReply::Handled().ReleaseMouseCapture(),
+                    CurvePropertyUser, CurvePropertyPointer);
+            }
+        }
+    }
+    bCurvePropertyScrubActive = false;
+    bCurvePropertyOwnsCapture = false;
+    bCurvePropertyReceivedMove = false;
+    bCurvePropertyMixed = false;
+    bCurvePropertyChanged = false;
+    CurvePropertyEditable.Reset();
+    CurvePropertyHierarchy.Empty();
+    CurvePropertyInitialText.Reset();
+    CurvePropertyLastStaged.Reset();
+    CurvePropertyDigitIndex = INDEX_NONE;
+    CurvePropertyPointer = INDEX_NONE;
+    CurvePropertyUser = INDEX_NONE;
+    CurvePropertyPendingPixels = 0.0;
+    CurvePropertyAccumulatedSteps = 0;
+}
+
+bool FDigitInputProcessor::TryBeginCurvePropertyScrub(FSlateApplication& SlateApp,
+    const FPointerEvent& Event)
+{
+    const UDigitSettings* Settings = UDigitSettings::Get();
+    if (!Settings || Event.GetEffectingButton() != EKeys::LeftMouseButton
+        || !Event.IsControlDown() || !Event.IsAltDown())
+    {
+        return false;
+    }
+    // Inspect Ctrl+Alt clicks with diagnostics even when the preview setting
+    // was not persisted, so users can distinguish configuration from hit testing.
+    const bool bEnabled = Settings->bCurveEditorMultiKeyTextScrubPreview;
+    FWidgetPath Path = SlateApp.LocateWindowUnderMouse(
+        Event.GetScreenSpacePosition(), SlateApp.GetInteractiveTopLevelWindows(),
+        false, Event.GetUserIndex());
+    if (!Path.IsValid()) return false;
+    bool bOverCurveKeyValue = false;
+    for (int32 I = 0; I < Path.Widgets.Num(); ++I)
+    {
+        if (Path.Widgets[I].Widget->GetType() == FName(TEXT("SCurveKeyDetailPanel")))
+        {
+            bOverCurveKeyValue = true;
+            break;
+        }
+    }
+    if (!bEnabled || HasActiveSession() || bRestorePending || LadderWidget.IsValid()
+        || SlateApp.HasUserMouseCapture(Event.GetUserIndex()))
+    {
+        if (bOverCurveKeyValue && Settings->bLogWidgetDiagnostics)
+        {
+            UE_LOG(LogDigit, Display,
+                TEXT("CurveEditor multi-key text preview skipped: enabled=%d active=%d restore=%d ladder=%d mouseCapture=%d"),
+                bEnabled, HasActiveSession(), bRestorePending, LadderWidget.IsValid(),
+                SlateApp.HasUserMouseCapture(Event.GetUserIndex()));
+        }
+        return false;
+    }
+    // UE 5.8.3 hit-testing can return the SNumericEntryBox's SBorder
+    // instead of its SEditableText (confirmed in widget diagnostics). A
+    // click on that border still belongs to the same Value editor. Resolve
+    // the visible text leaf, then rerun the FULL native Value-branch check.
+    const TSharedRef<SWidget>& Last = Path.Widgets[Path.Widgets.Num() - 1].Widget;
+    TSharedPtr<SEditableText> TargetEdit;
+    if (Last->GetType() == FName(TEXT("SEditableText")))
+    {
+        TargetEdit = StaticCastSharedRef<SEditableText>(Last);
+    }
+    else if (bOverCurveKeyValue)
+    {
+        for (int32 I = Path.Widgets.Num() - 1; I >= 0; --I)
+        {
+            if (!Path.Widgets[I].Widget->GetTypeAsString().StartsWith(TEXT("SNumericEntryBox")))
+            {
+                continue;
+            }
+            const TSharedRef<SWidget> Entry = Path.Widgets[I].Widget;
+            TFunction<TSharedPtr<SEditableText>(const TSharedRef<SWidget>&, int32)> FindEditable;
+            FindEditable = [&FindEditable](const TSharedRef<SWidget>& Current, int32 Depth)
+                -> TSharedPtr<SEditableText>
+            {
+                if (Depth > 6 || !Current->IsEnabled()
+                    || Current->GetVisibility() != EVisibility::Visible)
+                {
+                    return nullptr;
+                }
+                if (Current->GetType() == FName(TEXT("SEditableText")))
+                {
+                    return StaticCastSharedRef<SEditableText>(Current);
+                }
+                FChildren* Children = Current->GetChildren();
+                if (!Children) return nullptr;
+                for (int32 ChildIndex = 0; ChildIndex < Children->Num(); ++ChildIndex)
+                {
+                    const TSharedPtr<SEditableText> Found = FindEditable(
+                        Children->GetChildAt(ChildIndex), Depth + 1);
+                    if (Found.IsValid())
+                    {
+                        return Found;
+                    }
+                }
+                return nullptr;
+            };
+            TargetEdit = FindEditable(Entry, 0);
+            break;
+        }
+        if (TargetEdit.IsValid())
+        {
+            FWidgetPath TextPath;
+            if (!SlateApp.FindPathToWidget(
+                TargetEdit.ToSharedRef(), TextPath, EVisibility::Visible))
+            {
+                TargetEdit.Reset();
+            }
+            else
+            {
+                Path = MoveTemp(TextPath);
+            }
+        }
+    }
+    if (!TargetEdit.IsValid()
+        || !ResolveCurvePropertyValueTarget(Path, TargetEdit.Get()))
+    {
+        if (Settings->bLogWidgetDiagnostics)
+        {
+            for (int32 I = 0; I < Path.Widgets.Num(); ++I)
+            {
+                if (Path.Widgets[I].Widget->GetType() == FName(TEXT("SCurveKeyDetailPanel")))
+                {
+                    UE_LOG(LogDigit, Display,
+                        TEXT("CurveEditor multi-key text preview skipped: Value field hit not recognized. Expected editable SPropertyEditorNumeric > SNumericEntryBox > SEditableText under the Value slot. Hit widget=%s"),
+                        *Last->GetTypeAsString());
+                    break;
+                }
+            }
+        }
+        return false;
+    }
+    const TSharedRef<SEditableText> Edit = TargetEdit.ToSharedRef();
+    const FString Source = Edit->GetText().ToString();
+    if (Source.IsEmpty() || Source.Len() > 128)
+    {
+        if (Settings->bLogWidgetDiagnostics && bOverCurveKeyValue)
+        {
+            UE_LOG(LogDigit, Display, TEXT("CurveEditor multi-key text preview skipped: empty or oversized text (length=%d)"), Source.Len());
+        }
+        return false;
+    }
+
+    const bool bMixed = DigitCurveMultiKeyTextPolicy::IsVerifiedMixedMarker(Source);
+    int32 Index = INDEX_NONE;
+    if (!bMixed && (!FindCharacterIndexForDigitPlace(Source, 0, Index)
+        || !DigitCurveMultiKeyTextPolicy::CanBeginEqualValues(Source, Index)))
+    {
+        if (Settings->bLogWidgetDiagnostics && bOverCurveKeyValue)
+        {
+            UE_LOG(LogDigit, Display, TEXT("CurveEditor multi-key text preview skipped: invalid numeric text '%s'"), *Source);
+        }
+        return false;
+    }
+    // Verify the STABLE key-detail subtree before arming. A full window
+    // FWidgetPath includes docking/layout proxy widgets that are not always
+    // connected by GetParentWidget(), and made the old Tick silently cancel
+    // every newly armed gesture. The panel-to-text ancestry is the ownership
+    // boundary; revalidate the real live path on every movement and commit.
+    TArray<TWeakPtr<SWidget>> VerifiedHierarchy;
+    bool bFoundPanel = false;
+    for (int32 I = 0; I < Path.Widgets.Num(); ++I)
+    {
+        if (Path.Widgets[I].Widget->GetType() == FName(TEXT("SCurveKeyDetailPanel")))
+        {
+            VerifiedHierarchy.Empty();
+            bFoundPanel = true;
+        }
+        if (bFoundPanel)
+        {
+            VerifiedHierarchy.Add(Path.Widgets[I].Widget);
+        }
+    }
+    if (!DigitNativeHostGuard::IsInteractive(VerifiedHierarchy))
+    {
+        if (Settings->bLogWidgetDiagnostics)
+        {
+            UE_LOG(LogDigit, Display,
+                TEXT("CurveEditor multi-key text preview skipped: key-detail parent chain invalid before mouse capture"));
+        }
+        return false;
+    }
+    // Unlike v1.0.49, Digit owns true Slate capture here. Without capture,
+    // the host can resume native selection as soon as the preprocessor's
+    // mouse-down ends, even though Digit reported an armed gesture.
+    SlateApp.ProcessExternalReply(Path,
+        FReply::Handled().CaptureMouse(Edit).SetUserFocus(Edit, EFocusCause::Mouse),
+        Event.GetUserIndex(), Event.GetPointerIndex());
+    const bool bFocused = SlateApp.GetKeyboardFocusedWidget().Get() == &Edit.Get();
+    const bool bCaptured = Edit->HasMouseCapture();
+    if (!bCaptured || !bFocused)
+    {
+        if (Settings->bLogWidgetDiagnostics)
+        {
+            UE_LOG(LogDigit, Display,
+                TEXT("CurveEditor multi-key text preview skipped: capture or focus not granted (capture=%d focus=%d)"),
+                bCaptured, bFocused);
+        }
+        if (bCaptured)
+        {
+            SlateApp.ProcessExternalReply(Path, FReply::Handled().ReleaseMouseCapture(),
+                Event.GetUserIndex(), Event.GetPointerIndex());
+        }
+        return false;
+    }
+    CurvePropertyHierarchy = MoveTemp(VerifiedHierarchy);
+    bCurvePropertyScrubActive = true;
+    bCurvePropertyOwnsCapture = true;
+    bCurvePropertyReceivedMove = false;
+    bCurvePropertyMixed = bMixed;
+    bCurvePropertyChanged = false;
+    CurvePropertyEditable = Edit;
+    CurvePropertyInitialText = Source;
+    CurvePropertyLastStaged.Reset();
+    CurvePropertyDigitIndex = Index;
+    CurvePropertyPointer = Event.GetPointerIndex();
+    CurvePropertyUser = Event.GetUserIndex();
+    CurvePropertyPendingPixels = 0.0;
+    CurvePropertyAccumulatedSteps = 0;
+    if (!bMixed)
+    {
+        Edit->SelectText(FTextLocation(0, Index), FTextLocation(0, Index + 1));
+    }
+    if (Settings->bLogWidgetDiagnostics)
+    {
+        UE_LOG(LogDigit, Display, TEXT("CurveEditor multi-key text scrub armed (%s, capture=owned). Digit accumulates in memory until release; native property text commit follows."),
+            bMixed ? TEXT("relative mixed") : TEXT("shared numeric"));
+    }
+    return true;
+}
+
+bool FDigitInputProcessor::UpdateCurvePropertyScrub(FSlateApplication& SlateApp,
+    const FPointerEvent& Event)
+{
+    if (!bCurvePropertyScrubActive) return false;
+    if (Event.GetPointerIndex() != CurvePropertyPointer
+        || Event.GetUserIndex() != CurvePropertyUser) return false;
+    const TSharedPtr<SEditableText> Edit = CurvePropertyEditable.Pin();
+    const bool bCaptureValid = bCurvePropertyOwnsCapture && Edit.IsValid()
+        && Edit->HasMouseCapture();
+    const bool bAttached = DigitNativeHostGuard::IsInteractive(CurvePropertyHierarchy);
+    const bool bFocused = Edit.IsValid()
+        && SlateApp.GetKeyboardFocusedWidget().Get() == Edit.Get();
+    const bool bMouseHeld = Event.IsMouseButtonDown(EKeys::LeftMouseButton);
+    if (!Edit.IsValid() || !bCaptureValid || !bMouseHeld || !bFocused || !bAttached)
+    {
+        const UDigitSettings* Diagnostics = UDigitSettings::Get();
+        if (Diagnostics && Diagnostics->bLogWidgetDiagnostics)
+        {
+            UE_LOG(LogDigit, Display,
+                TEXT("CurveEditor multi-key scrub cancelled on move: widget=%d ownsCapture=%d mouseHeld=%d focus=%d attached=%d"),
+                Edit.IsValid(), bCaptureValid, bMouseHeld, bFocused, bAttached);
+        }
+        EndCurvePropertyScrub();
+        return true;
+    }
+    if (!bCurvePropertyReceivedMove)
+    {
+        bCurvePropertyReceivedMove = true;
+        const UDigitSettings* Diagnostics = UDigitSettings::Get();
+        if (Diagnostics && Diagnostics->bLogWidgetDiagnostics)
+        {
+            UE_LOG(LogDigit, Display,
+                TEXT("CurveEditor multi-key scrub first move received (deltaX=%.2f, capture=owned)"),
+                static_cast<double>(Event.GetCursorDelta().X));
+        }
+    }
+    FWidgetPath Path;
+    if (!SlateApp.FindPathToWidget(Edit.ToSharedRef(), Path, EVisibility::Visible)
+        || !ResolveCurvePropertyValueTarget(Path, Edit.Get()))
+    {
+        UE_LOG(LogDigit, Warning,
+            TEXT("CurveEditor multi-key scrub cancelled: native Value widget path changed during drag"));
+        EndCurvePropertyScrub();
+        return true;
+    }
+    // Unreal binds this text to SPropertyEditorNumeric::OnGetValue. Writing a
+    // temporary expression during the drag causes Slate to refresh it back to
+    // the original selection, which v1.0.50 treated as a stale-edit abort.
+    // Observe the native bound display without selecting or overwriting the
+    // user's text. Selection-only mouse drags are not part of this gesture.
+    // The pending proposal never enters Unreal's editor until release.
+    const FString Live = Edit->GetText().ToString();
+    if (Live != CurvePropertyInitialText)
+    {
+        UE_LOG(LogDigit, Warning,
+            TEXT("CurveEditor multi-key scrub cancelled: native Value text changed before release"));
+        EndCurvePropertyScrub();
+        return true;
+    }
+    const FString Working = CurvePropertyLastStaged.IsEmpty()
+        ? CurvePropertyInitialText : CurvePropertyLastStaged;
+    const UDigitSettings* Settings = UDigitSettings::Get();
+    const double Sensitivity = Settings && FMath::IsFinite(Settings->ScrubSensitivity)
+        ? FMath::Clamp(static_cast<double>(Settings->ScrubSensitivity), 0.1, 10.0) : 1.0;
+    CurvePropertyPendingPixels += static_cast<double>(Event.GetCursorDelta().X);
+    const int32 Steps = DigitCurveTextMouse::ConsumeSteps(CurvePropertyPendingPixels,
+        DigitCurveTextMouse::GetPixelsPerStep(Sensitivity, Event.IsShiftDown()));
+    if (Steps == 0) return true;
+    FString Next;
+    int32 NextIndex = CurvePropertyDigitIndex;
+    if (bCurvePropertyMixed)
+    {
+        const int64 Sum = static_cast<int64>(CurvePropertyAccumulatedSteps) + Steps;
+        if (Sum > 100000 || Sum < -100000) return true;
+        CurvePropertyAccumulatedSteps = static_cast<int32>(Sum);
+        if (CurvePropertyAccumulatedSteps == 0)
+        {
+            Next = CurvePropertyInitialText;
+        }
+        else if (!DigitCurveMultiKeyTextPolicy::TryStageMixedRelative(
+            CurvePropertyInitialText, CurvePropertyAccumulatedSteps, Next))
+        {
+            return true;
+        }
+    }
+    else if (!DigitCurveTextMouse::TryStageValueSteps(
+        Working, CurvePropertyDigitIndex, Steps, Next, NextIndex))
+    {
+        return true;
+    }
+    if (Next == Working) return true;
+    // Only session state changes here. Editing the native text would trigger
+    // bound-value synchronization and could terminate the drag silently.
+    if (!bCurvePropertyChanged)
+    {
+        const UDigitSettings* Diagnostics = UDigitSettings::Get();
+        if (Diagnostics && Diagnostics->bLogWidgetDiagnostics)
+        {
+            UE_LOG(LogDigit, Display,
+                TEXT("CurveEditor multi-key scrub staged first change in memory (mode=%s)"),
+                bCurvePropertyMixed ? TEXT("relative") : TEXT("equal"));
+        }
+    }
+    CurvePropertyLastStaged = Next;
+    CurvePropertyDigitIndex = NextIndex;
+    bCurvePropertyChanged = Next != CurvePropertyInitialText;
+    if (!bCurvePropertyMixed && Next.IsValidIndex(NextIndex))
+    {
+        Edit->SelectText(FTextLocation(0, NextIndex), FTextLocation(0, NextIndex + 1));
+    }
+    return true;
+}
+
+void FDigitInputProcessor::FlushCurvePropertyCommit(FSlateApplication& SlateApp)
+{
+    if (!PendingCurvePropertyCommit.IsSet()) return;
+    const FCurvePropertyCommit Pending = PendingCurvePropertyCommit.GetValue();
+    PendingCurvePropertyCommit.Reset(); // consume before dispatching native Enter
+    const TSharedPtr<SEditableText> Edit = Pending.Editable.Pin();
+    const UDigitSettings* Settings = UDigitSettings::Get();
+    if (!Edit.IsValid())
+    {
+        UE_LOG(LogDigit, Warning, TEXT("CurveEditor multi-key native commit skipped: Value editor expired"));
+        return;
+    }
+    FWidgetPath Path;
+    const bool bHostValid = DigitNativeHostGuard::IsInteractive(Pending.OriginalHierarchy)
+        && SlateApp.FindPathToWidget(Edit.ToSharedRef(), Path, EVisibility::Visible)
+        && ResolveCurvePropertyValueTarget(Path, Edit.Get());
+    const bool bFocused = SlateApp.GetKeyboardFocusedWidget().Get() == Edit.Get();
+    if (!bHostValid || !bFocused || Edit->HasMouseCapture()
+        || !Settings || !Settings->bCurveEditorMultiKeyTextScrubPreview)
+    {
+        UE_LOG(LogDigit, Warning,
+            TEXT("CurveEditor multi-key native commit skipped: host=%d focus=%d capture=%d setting=%d"),
+            bHostValid, bFocused, Edit->HasMouseCapture(),
+            Settings && Settings->bCurveEditorMultiKeyTextScrubPreview);
+        return; // no native edit-buffer write has occurred
+    }
+    Edit->SelectAllText();
+    const FString Live = Edit->GetSelectedText().ToString();
+    if (!DigitCurveMultiKeyTextPolicy::CanCommitDeferredValue(
+            Pending.OriginalText, Live, Pending.ExpectedText))
+    {
+        UE_LOG(LogDigit, Warning,
+            TEXT("CurveEditor multi-key native commit skipped: original host text changed or proposal was empty"));
+        return;
+    }
+    // Stage the proposed value ONLY NOW, immediately before native Enter. This
+    // prevents the bound PropertyEditor text from reverting between move events.
+    if (!Edit->SetEditableText(FText::FromString(Pending.ExpectedText)))
+    {
+        UE_LOG(LogDigit, Warning,
+            TEXT("CurveEditor multi-key native commit skipped: native text rejected proposed value"));
+        return;
+    }
+    // Native UE 5.8.3 SNumericEntryBox dispatches through either the equal
+    // value or per-object expression handler. Digit does not write keys or
+    // create its own property transaction.
+    const FKeyEvent Enter(EKeys::Enter, FModifierKeysState(),
+        static_cast<uint32>(Pending.UserIndex), false, 0, 0);
+    SlateApp.ProcessKeyDownEvent(Enter);
+    if (Settings->bLogWidgetDiagnostics)
+    {
+        UE_LOG(LogDigit, Display,
+            TEXT("CurveEditor multi-key text scrub: proposed Value staged and native Enter dispatched"));
+    }
+}
+
 void FDigitInputProcessor::EndCurveTextDrag()
 {
     // A preprocessor consumes mouse-down for its own gesture. Requesting a
@@ -1617,6 +2110,26 @@ bool FDigitInputProcessor::UpdateCurveTextDrag(FSlateApplication& SlateApp,
 
 void FDigitInputProcessor::Tick(const float DeltaTime, FSlateApplication& SlateApp, TSharedRef<ICursor> Cursor)
 {
+    if (bCurvePropertyScrubActive)
+    {
+        const TSharedPtr<SEditableText> Edit = CurvePropertyEditable.Pin();
+        const bool bHasOwnedCapture = Edit.IsValid() && bCurvePropertyOwnsCapture
+            && Edit->HasMouseCapture();
+        const bool bFocused = Edit.IsValid()
+            && SlateApp.GetKeyboardFocusedWidget().Get() == Edit.Get();
+        const bool bAttached = DigitNativeHostGuard::IsInteractive(CurvePropertyHierarchy);
+        if (!bHasOwnedCapture || !bFocused || !bAttached)
+        {
+            const UDigitSettings* Diagnostics = UDigitSettings::Get();
+            if (Diagnostics && Diagnostics->bLogWidgetDiagnostics)
+            {
+                UE_LOG(LogDigit, Display,
+                    TEXT("CurveEditor multi-key scrub cancelled on tick: capture=%d focus=%d attached=%d"),
+                    bHasOwnedCapture, bFocused, bAttached);
+            }
+            EndCurvePropertyScrub();
+        }
+    }
     if (bCurveTextDragActive)
     {
         const TSharedPtr<SEditableText> Text = CurveTextDragEditable.Pin();
@@ -1665,6 +2178,19 @@ void FDigitInputProcessor::Tick(const float DeltaTime, FSlateApplication& SlateA
 
 bool FDigitInputProcessor::HandleKeyDownEvent(FSlateApplication& SlateApp, const FKeyEvent& InKeyEvent)
 {
+    ClearCurvePropertyCommit();
+    if (bCurvePropertyScrubActive)
+    {
+        const UDigitSettings* Diagnostics = UDigitSettings::Get();
+        if (Diagnostics && Diagnostics->bLogWidgetDiagnostics)
+        {
+            UE_LOG(LogDigit, Display,
+                TEXT("CurveEditor multi-key scrub interrupted by key-down: %s"),
+                *InKeyEvent.GetKey().ToString());
+        }
+        EndCurvePropertyScrub();
+        if (InKeyEvent.GetKey() == EKeys::Escape) return true;
+    }
     ClearDeferredCurveTextCommit(); // Escape/typing/host Enter wins over pending auto-commit.
     // Let the native text field handle Enter, Escape, and focus changes.
     // Neither drag staging nor cancellation generates a second property commit.
@@ -1920,6 +2446,9 @@ bool FDigitInputProcessor::HandleKeyUpEvent(FSlateApplication& SlateApp, const F
     {
         ClearDeferredCurveTextCommit(); // Modifier release cancels still-pending Enter.
     }
+    // Do not drop the multi-key gesture just because Ctrl/Alt is released
+    // before the mouse button. Capture and original field identity remain
+    // the authority; mouse-up performs the native commit request.
     if (bCurveTextDragActive
         && (InKeyEvent.GetKey() == EKeys::LeftAlt
             || InKeyEvent.GetKey() == EKeys::RightAlt
@@ -1942,6 +2471,10 @@ bool FDigitInputProcessor::HandleKeyUpEvent(FSlateApplication& SlateApp, const F
 
 bool FDigitInputProcessor::HandleMouseMoveEvent(FSlateApplication& SlateApp, const FPointerEvent& MouseEvent)
 {
+    if (bCurvePropertyScrubActive)
+    {
+        return UpdateCurvePropertyScrub(SlateApp, MouseEvent);
+    }
     if (bCurveTextDragActive)
     {
         return UpdateCurveTextDrag(SlateApp, MouseEvent);
@@ -2078,10 +2611,25 @@ bool FDigitInputProcessor::HandleMouseMoveEvent(FSlateApplication& SlateApp, con
 
 bool FDigitInputProcessor::HandleMouseButtonDownEvent(FSlateApplication& SlateApp, const FPointerEvent& MouseEvent)
 {
+    ClearCurvePropertyCommit();
+    if (bCurvePropertyScrubActive)
+    {
+        const UDigitSettings* Diagnostics = UDigitSettings::Get();
+        if (Diagnostics && Diagnostics->bLogWidgetDiagnostics)
+        {
+            UE_LOG(LogDigit, Display,
+                TEXT("CurveEditor multi-key scrub interrupted by new mouse-down"));
+        }
+        EndCurvePropertyScrub();
+    }
     ClearDeferredCurveTextCommit(); // New input supersedes pending mouse-up Enter.
     if (bCurveTextDragActive)
     {
         EndCurveTextDrag();
+    }
+    if (TryBeginCurvePropertyScrub(SlateApp, MouseEvent))
+    {
+        return true;
     }
     if (TryBeginCurveTextDrag(SlateApp, MouseEvent))
     {
@@ -2156,10 +2704,14 @@ bool FDigitInputProcessor::HandleMouseButtonDownEvent(FSlateApplication& SlateAp
                 PathTypes += TypeString;
                 bContainsSpinBox |= TypeString.StartsWith(TEXT("SSpinBox"));
             }
-            if (PathTypes.Contains(TEXT("SCurveKeyDetailPanel")))
+            // The old slider preview cannot operate on the text-only multi-key
+            // Value widget. Do not emit its misleading SSpinBox diagnostic when
+            // only the current multi-key text preview is enabled.
+            if (Settings->bCurveEditorSharedValueSliderPreview
+                && PathTypes.Contains(TEXT("SCurveKeyDetailPanel")))
             {
                 UE_LOG(LogDigit, Display,
-                    TEXT("CurveEditor numeric target unresolved: %s. Shared-value preview requires an SSpinBox<float/double> in the selected-key Value branch; if this is a text-only control, provide this widget path."),
+                    TEXT("CurveEditor legacy shared-slider preview skipped (not a supported SSpinBox): %s"),
                     *PathTypes);
             }
             if (bContainsSpinBox)
@@ -2242,6 +2794,56 @@ bool FDigitInputProcessor::HandleMouseButtonDownEvent(FSlateApplication& SlateAp
 
 bool FDigitInputProcessor::HandleMouseButtonUpEvent(FSlateApplication& SlateApp, const FPointerEvent& MouseEvent)
 {
+    if (bCurvePropertyScrubActive && MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton
+        && (MouseEvent.GetPointerIndex() != CurvePropertyPointer
+            || MouseEvent.GetUserIndex() != CurvePropertyUser))
+    {
+        UE_LOG(LogDigit, Warning,
+            TEXT("CurveEditor multi-key mouse release pointer mismatch: actual=(%d,%d) armed=(%d,%d)"),
+            MouseEvent.GetUserIndex(), MouseEvent.GetPointerIndex(),
+            CurvePropertyUser, CurvePropertyPointer);
+    }
+    if (bCurvePropertyScrubActive && MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton
+        && MouseEvent.GetPointerIndex() == CurvePropertyPointer
+        && MouseEvent.GetUserIndex() == CurvePropertyUser)
+    {
+        const TSharedPtr<SEditableText> Edit = CurvePropertyEditable.Pin();
+        if (bCurvePropertyChanged && Edit.IsValid()
+            && bCurvePropertyOwnsCapture && Edit->HasMouseCapture()
+            && SlateApp.GetKeyboardFocusedWidget().Get() == Edit.Get()
+            && DigitNativeHostGuard::IsInteractive(CurvePropertyHierarchy))
+        {
+            FCurvePropertyCommit Pending;
+            Pending.Editable = Edit;
+            Pending.ExpectedText = CurvePropertyLastStaged;
+            Pending.OriginalText = CurvePropertyInitialText;
+            Pending.OriginalHierarchy = CurvePropertyHierarchy;
+            Pending.UserIndex = CurvePropertyUser;
+            PendingCurvePropertyCommit = MoveTemp(Pending);
+            EndCurvePropertyScrub(true); // release Digit's capture before deferred Enter
+            const UDigitSettings* Diagnostics = UDigitSettings::Get();
+            if (Diagnostics && Diagnostics->bLogWidgetDiagnostics)
+            {
+                UE_LOG(LogDigit, Display,
+                    TEXT("CurveEditor multi-key scrub released: model-only change queued for native commit"));
+            }
+        }
+        else
+        {
+            const UDigitSettings* Diagnostics = UDigitSettings::Get();
+            if (Diagnostics && Diagnostics->bLogWidgetDiagnostics)
+            {
+                UE_LOG(LogDigit, Display,
+                    TEXT("CurveEditor multi-key scrub released: no commit (changed=%d widget=%d capture=%d focus=%d attached=%d)"),
+                    bCurvePropertyChanged, Edit.IsValid(),
+                    Edit.IsValid() && bCurvePropertyOwnsCapture && Edit->HasMouseCapture(),
+                    Edit.IsValid() && SlateApp.GetKeyboardFocusedWidget().Get() == Edit.Get(),
+                    DigitNativeHostGuard::IsInteractive(CurvePropertyHierarchy));
+            }
+            EndCurvePropertyScrub();
+        }
+        return true;
+    }
     if (bCurveTextDragActive && MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton
         && MouseEvent.GetPointerIndex() == CurveTextDragPointer
         && MouseEvent.GetUserIndex() == CurveTextDragUser)
@@ -2312,6 +2914,10 @@ bool FDigitInputProcessor::HandleMouseButtonUpEvent(FSlateApplication& SlateApp,
 
 void FDigitInputProcessor::HandlePostSlateTick()
 {
+    if (PendingCurvePropertyCommit.IsSet() && FSlateApplication::IsInitialized())
+    {
+        FlushCurvePropertyCommit(FSlateApplication::Get());
+    }
     // Mouse-up dispatch has ended. A pending optional release commit is now
     // safe to revalidate and request through the host's ordinary Enter path.
     if (DeferredCurveTextCommit.IsSet() && FSlateApplication::IsInitialized())
@@ -2428,6 +3034,8 @@ void FDigitInputProcessor::HandlePostSlateTick()
 
 void FDigitInputProcessor::Shutdown()
 {
+    ClearCurvePropertyCommit();
+    EndCurvePropertyScrub();
     ClearDeferredCurveTextCommit();
     EndCurveTextDrag();
     ClearLadder();

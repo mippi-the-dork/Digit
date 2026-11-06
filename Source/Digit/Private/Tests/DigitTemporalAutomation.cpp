@@ -18,6 +18,7 @@
 #include "DigitNativeHostGuard.h"
 #include "DigitNativeBindingGuard.h"
 #include "DigitCurveSharedValuePolicy.h"
+#include "DigitCurveMultiKeyTextPolicy.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Input/SEditableText.h"
 #include "Widgets/Input/SSpinBox.h"
@@ -1660,6 +1661,176 @@ bool FDigitCurveEditorSharedValueSliderLifecycleTest::RunTest(const FString& Par
         Changes, ChangesBeforeCleanup);
     TestEqual(TEXT("Cleanup must not send an additional commit"),
         Commits, CommitsBeforeCleanup);
+    return true;
+}
+
+// Contract for v1.0.51: a drag accumulates values in Digit state, then
+// checks the original bound PropertyEditor text before a single native commit.
+// Does not claim to emulate a live Sequencer property transaction.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveMultiKeyDeferredNativeCommitTest,
+    "Digit.CurveEditor.MultiKeyDeferredNativeCommit",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveMultiKeyDeferredNativeCommitTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    using namespace DigitCurveMultiKeyTextPolicy;
+    TestTrue(TEXT("Equal keys can commit unchanged native source"),
+        CanCommitDeferredValue(TEXT("30"), TEXT("30"), TEXT("31")));
+    TestTrue(TEXT("Mixed keys can commit a relative expression"),
+        CanCommitDeferredValue(TEXT("Multiple Values"), TEXT("Multiple Values"),
+            TEXT("Multiple Values + 5")));
+    TestFalse(TEXT("Refreshed external native value cancels proposal"),
+        CanCommitDeferredValue(TEXT("30"), TEXT("40"), TEXT("31")));
+    TestFalse(TEXT("Returning to original does not create an Undo record"),
+        CanCommitDeferredValue(TEXT("30"), TEXT("30"), TEXT("30")));
+    TestFalse(TEXT("Empty candidate cannot commit"),
+        CanCommitDeferredValue(TEXT("30"), TEXT("30"), FString()));
+    return true;
+}
+
+#endif // WITH_DEV_AUTOMATION_TESTS
+
+#if WITH_DEV_AUTOMATION_TESTS
+
+// UE Automation Framework only. The SPropertyEditorNumeric implementation
+// supplied from UE 5.8.3 remains the owner of commits and transactions.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveMultiKeyTextExpressionTest,
+    "Digit.CurveEditor.MultiKeyTextExpression",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveMultiKeyTextExpressionTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    using namespace DigitCurveMultiKeyTextPolicy;
+    FString Expression;
+    TestTrue(TEXT("Verified undetermined marker"), IsVerifiedMixedMarker(TEXT("Multiple Values")));
+    TestFalse(TEXT("Other arbitrary labels rejected"), IsVerifiedMixedMarker(TEXT("Current Value")));
+    TestTrue(TEXT("Positive relative expression"), TryStageMixedRelative(TEXT("Multiple Values"), 5, Expression));
+    TestEqual(TEXT("Per-object additive syntax"), Expression, FString(TEXT("Multiple Values + 5")));
+    TestTrue(TEXT("Negative relative expression"), TryStageMixedRelative(TEXT("Multiple Values"), -3, Expression));
+    TestEqual(TEXT("Per-object subtractive syntax"), Expression, FString(TEXT("Multiple Values - 3")));
+    TestFalse(TEXT("No zero-change transaction"), TryStageMixedRelative(TEXT("Multiple Values"), 0, Expression));
+    TestFalse(TEXT("Reject unknown undetermined text"), TryStageMixedRelative(TEXT("---"), 5, Expression));
+    // PropertyEditorNumeric substitutes each original value for the marker
+    // and uses its type interface to parse the expression independently.
+    TDefaultNumericTypeInterface<double> NativeInterface;
+    const TOptional<double> First = NativeInterface.FromString(TEXT("10 + 5"), 10.0);
+    const TOptional<double> Second = NativeInterface.FromString(TEXT("20 + 5"), 20.0);
+    TestTrue(TEXT("Native expression parser accepts offset for first key"), First.IsSet());
+    TestTrue(TEXT("Native expression parser accepts offset for second key"), Second.IsSet());
+    if (First.IsSet()) TestEqual(TEXT("First key +5"), First.GetValue(), 15.0);
+    if (Second.IsSet()) TestEqual(TEXT("Second key +5"), Second.GetValue(), 25.0);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveMultiKeyTextEqualTest,
+    "Digit.CurveEditor.MultiKeyTextEqualValue",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveMultiKeyTextEqualTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    using namespace DigitCurveMultiKeyTextPolicy;
+    TestTrue(TEXT("Ones digit of 30 can move"), CanBeginEqualValues(TEXT("30"), 1));
+    TestFalse(TEXT("Non-numeric marker cannot be digit-staged"), CanBeginEqualValues(TEXT("Multiple Values"), 1));
+    FString Updated;
+    int32 Index = INDEX_NONE;
+    TestTrue(TEXT("Equal-key text stages a single magnitude step"),
+        DigitCurveTextMouse::TryStageValueSteps(TEXT("30"), 1, 5, Updated, Index));
+    TestEqual(TEXT("Shared absolute value to submit to host"), Updated, FString(TEXT("35")));
+    return true;
+}
+
+#endif // WITH_DEV_AUTOMATION_TESTS
+
+#if WITH_DEV_AUTOMATION_TESTS
+
+// Regression for an actual UE 5.8.3 Curve Editor multi-selection path:
+// a non-spin numeric entry in the VALUE branch, with native text as leaf.
+// This checks the detection policy, not a live Sequencer/property transaction.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveMultiKeyTextActivationTest,
+    "Digit.CurveEditor.MultiKeyTextActivation",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveMultiKeyTextActivationTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    using namespace DigitCurveMultiKeyTextPolicy;
+    const TArray<FString> ValueTypes = {
+        TEXT("SWindow"), TEXT("SCurveKeyDetailPanel"), TEXT("SBox"),
+        TEXT("SHorizontalBox"), TEXT("SConstrainedBox"), TEXT("SHorizontalBox"),
+        TEXT("SPropertyValueWidget"), TEXT("SPropertyEditorNumeric<double>"),
+        TEXT("SNumericEntryBox<NumericType>"), TEXT("SBorder"),
+        TEXT("SOverlay"), TEXT("SEditableText")};
+    TestTrue(TEXT("Real multi-key Value text-only ancestry recognized"),
+        HasValueTextWidgetTypes(ValueTypes));
+    TArray<FString> TextBoxTypes = ValueTypes;
+    TextBoxTypes.Last() = TEXT("SEditableTextBox");
+    TestFalse(TEXT("Other text widget leaves rejected"),
+        HasValueTextWidgetTypes(TextBoxTypes));
+    TArray<FString> NonPropertyTypes = ValueTypes;
+    NonPropertyTypes[7] = TEXT("SPropertyEditorBoolean");
+    TestFalse(TEXT("Unrelated property editor rejected"),
+        HasValueTextWidgetTypes(NonPropertyTypes));
+    TestTrue(TEXT("Preprocessor-owned gesture continues while Digit owns capture"),
+        CanContinueOwnedCaptureDrag(true, true, true, true));
+    TestFalse(TEXT("Release cancels drag"),
+        CanContinueOwnedCaptureDrag(false, true, true, true));
+    TestFalse(TEXT("Absent/foreign capture cancels drag"),
+        CanContinueOwnedCaptureDrag(true, false, true, true));
+    TestFalse(TEXT("Focus loss cancels drag"),
+        CanContinueOwnedCaptureDrag(true, true, false, true));
+    TestFalse(TEXT("Detached key detail row cancels drag"),
+        CanContinueOwnedCaptureDrag(true, true, true, false));
+    return true;
+}
+
+#endif // WITH_DEV_AUTOMATION_TESTS
+
+#if WITH_DEV_AUTOMATION_TESTS
+
+// Regression for the v1.0.49 runtime failure: an armed session was silently
+// canceled during Tick before any staging. Validate the stable owner subtree
+// and actual reparenting, plus capture/focus/mouse-held eligibility. This
+// fixture intentionally does not fabricate a real Sequencer transaction.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveMultiKeyCaptureLifecycleTest,
+    "Digit.CurveEditor.MultiKeyCaptureLifecycle",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveMultiKeyCaptureLifecycleTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    using namespace DigitCurveMultiKeyTextPolicy;
+    using namespace DigitNativeHostGuard;
+    const TSharedRef<SEditableText> Edit = SNew(SEditableText).Text(FText::FromString(TEXT("30")));
+    const TSharedRef<SBorder> ValueBranch = SNew(SBorder)[Edit];
+    const TSharedRef<SBorder> KeyDetail = SNew(SBorder)[ValueBranch];
+    TArray<TWeakPtr<SWidget>> OriginalOwner;
+    OriginalOwner.Add(KeyDetail);
+    OriginalOwner.Add(ValueBranch);
+    OriginalOwner.Add(Edit);
+    TestTrue(TEXT("Verified owner subtree remains attached after capture starts"),
+        IsInteractive(OriginalOwner));
+    TestTrue(TEXT("Owned capture and held mouse permit movement"),
+        CanContinueOwnedCaptureDrag(true, true, true, IsInteractive(OriginalOwner)));
+    TestFalse(TEXT("An arbitrary external capture must not be mistaken for ours"),
+        CanContinueOwnedCaptureDrag(true, false, true, IsInteractive(OriginalOwner)));
+    TestFalse(TEXT("Mouse release terminates movement"),
+        CanContinueOwnedCaptureDrag(false, true, true, IsInteractive(OriginalOwner)));
+    TestFalse(TEXT("Focus loss terminates movement"),
+        CanContinueOwnedCaptureDrag(true, true, false, IsInteractive(OriginalOwner)));
+    const TSharedRef<SEditableText> Replacement = SNew(SEditableText);
+    ValueBranch->SetContent(Replacement);
+    TestFalse(TEXT("Rebuilt value row invalidates previous captured text editor"),
+        IsInteractive(OriginalOwner));
+    TestFalse(TEXT("A rebuilt owner cannot inherit the old gesture"),
+        CanContinueOwnedCaptureDrag(true, true, true, IsInteractive(OriginalOwner)));
     return true;
 }
 

@@ -26,7 +26,10 @@ public class Digit : ModuleRules
                 "Slate",
                 "SlateCore",
                 "TimeManagement",
-                "Sequencer"
+                "Sequencer",
+                "CurveEditor",
+                "PropertyEditor",
+                "UnrealEd"
             }
         );
     }

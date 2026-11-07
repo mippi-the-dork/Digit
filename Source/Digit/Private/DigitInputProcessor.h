@@ -9,6 +9,7 @@
 #include "Input/Events.h"
 #include "Input/Reply.h"
 #include "DigitSequencerContext.h"
+#include "ScopedTransaction.h"
 
 class STextBlock;
 class SBorder;
@@ -17,6 +18,8 @@ class SWidget;
 class SWindow;
 class FWidgetPath;
 class IToolTip;
+class IPropertyHandle;
+class SOverlay;
 
 class FDigitInputProcessor final : public IInputProcessor
 {
@@ -123,6 +126,8 @@ private:
     void EndCurvePropertyScrub(bool bKeepStagedText = false);
     void FlushCurvePropertyCommit(FSlateApplication& SlateApp);
     void ClearCurvePropertyCommit();
+    void ShowCurvePropertyLadder(FSlateApplication& SlateApp,
+        const TSharedRef<SEditableText>& Edit);
 
     bool ResolveCurveTextTarget(const FWidgetPath& Path,
         const SWidget* FocusedWidget, bool& bOutTime) const;
@@ -163,12 +168,29 @@ private:
     int32 CurvePropertyPointer = INDEX_NONE;
     int32 CurvePropertyUser = INDEX_NONE;
     int32 CurvePropertyAccumulatedSteps = 0;
+    double CurvePropertyCurrentOffset = 0.0;
+    int32 CurvePropertyFinestPlace = 0;
+    bool bCurvePropertyLadderActive = false;
     double CurvePropertyPendingPixels = 0.0;
     bool bCurvePropertyScrubActive = false;
     bool bCurvePropertyOwnsCapture = false;
     bool bCurvePropertyReceivedMove = false;
     bool bCurvePropertyMixed = false;
     bool bCurvePropertyChanged = false;
+    // Non-interactive preview only modifies a hit-test-invisible overlay. It
+    // never writes to Unreal's original property-bound SEditableText.
+    TWeakPtr<SOverlay> CurvePropertyFeedbackOverlay;
+    TSharedPtr<SWidget> CurvePropertyFeedbackWidget;
+    TSharedPtr<STextBlock> CurvePropertyFeedbackLabel;
+    // Optional interactive key updates use the original PropertyEditor handle.
+    // The known-good deferred text commit remains the fallback when disabled.
+    TSharedPtr<IPropertyHandle> CurvePropertyLiveHandle;
+    TArray<FString> CurvePropertyOriginalObjectValues;
+    TArray<double> CurvePropertyOriginalNumericValues;
+    TArray<FString> CurvePropertyCurrentObjectValues;
+    TUniquePtr<FScopedTransaction> CurvePropertyLiveTransaction;
+    bool bCurvePropertyLiveEnabled = false;
+    bool bCurvePropertyLiveApplied = false;
 
     TWeakPtr<SEditableText> CurveTextDragEditable;
     int32 CurveTextDragPointer = INDEX_NONE;

@@ -9,12 +9,62 @@ Hover the hundreds place to work in hundreds. Hover the tenths place to make fin
 ![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.8.x-black?logo=unrealengine)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2064--bit-blue)
 ![Type](https://img.shields.io/badge/Plugin-Editor%20Only-green)
-![Version](https://img.shields.io/badge/Version-1.0.51-blue)
+![Version](https://img.shields.io/badge/Version-1.0.54.2-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 ![Digit targeting a numeric place value in Unreal Engine](Doc/Images/Digit-Hero.png)
 
 ---
+
+## v1.0.54.2: Fractional-expression native test linker hotfix
+
+- Fixes two `LNK2019` unresolved externals from `TNumericUnitTypeInterface<double>` introduced **only in the new** `Digit.CurveEditor.MultiKeyFractionalExpressions` Unreal Automation test. The template's out-of-line constructor and `FromString` were not linked in the Digit editor module.
+- Tests fractional arithmetic expressions using the already-established `TDefaultNumericTypeInterface<double>` instead. The native test still asserts `10 + 0.25 == 10.25` and `20 - 0.25 == 19.75`. The existing live multi-key feature and its Property Editor-owned commit path are **unchanged**.
+- Added a linker-contract source regression to prevent this accidentally exported unit-interface dependency from returning. Build and real editor validation of the fractional Value Ladder remain pending.
+
+## v1.0.54.1: UE 5.8.3 arranged-widget compile hotfix
+
+- Fixes **C2039** in `DigitInputProcessor.cpp` (line 1338 in v1.0.54). The `FWidgetPath::Widgets` collection is `FArrangedChildren`, which supports `Num()` but not `IsEmpty()` in UE 5.8.3. Digit now checks `Path.Widgets.Num() == 0` before accessing the path's first geometry.
+- The nine-rung multi-key Value Ladder, fractional offsets, live Curve Editor feedback, native release commit, and existing single-key behavior are unchanged. Adds a source regression guard for the supported `FArrangedChildren` API.
+- **Compilation and live validation of this hotfix remain pending.**
+
+## v1.0.54: Multi-key fractional Value Ladder
+
+- Extends the validated Ctrl+Alt multi-key Curve Editor Value gesture to **fractional magnitudes**. The familiar nine-rung Value Ladder appears beside a multi-key Value field, initially on `1`, with `10`, `100` upward and `0.1`, `0.01`, `0.001`, `0.0001` downward. **Move vertically during the drag** to choose a rung, then move horizontally to apply full increments of the chosen magnitude. `Ladder Magnitude Sensitivity` controls vertical selection; `Scrub Sensitivity` still controls horizontal distance per whole step.
+- **Mixed values** retain their differences and display signed feedback such as `+0.25` or `-23.8383`; the native release-only commit uses the property editor's per-object relative-expression handler. **Equal values** display the proposed absolute result, including newly introduced decimal places (e.g. `30` to `29.75`). Both modes use the same fractional offset for live updates and deferred native commits.
+- Switching rungs does **not** rescale previous steps. Moving back toward the original values restores the mouse-down snapshot, and cancelling a live gesture restores its selected keys through the established transaction path. The existing Ctrl+Alt activation means Ctrl is not used for magnitude locking during multi-key scrubs; normal single-key Ctrl-lock Value Ladder behavior is unchanged. During a multi-key gesture, the Value Ladder is display-only and accepts vertical drag selection rather than direct clicks.
+- Adds two native Unreal tests: `Digit.CurveEditor.MultiKeyMagnitudeLadder` and `Digit.CurveEditor.MultiKeyFractionalExpressions`. **UE 5.8.3 compilation and manual interaction for v1.0.54 are not yet verified.** Prior releases' successful Undo/Redo/Escape and live-feedback results remain the regression baseline.
+
+## v1.0.53: Exact selected-place increments at every scrub sensitivity
+
+- Fixes the confirmed single-key Curve Editor digit-place regression at **Scrub Sensitivity = 0.7**: the native spinbox path had multiplied its numeric value change by sensitivity, so one pixel on the tens digit changed `12.34` by `7`, ones by `0.7`, and tenths by `0.07`. These were incorrect magnitudes relative to the highlighted digit.
+- Horizontal sensitivity now determines **pixels per complete selected-place increment**, with fractional cursor travel retained between mouse events. Each emitted step is a complete selected decimal magnitude: tens `+10`, ones `+1`, tenths `+0.1`, hundredths `+0.01`, before deliberate Shift/Ctrl modifier scaling. Changing a Value Ladder rung drops fractional travel from the previous magnitude.
+- Preserves the native `SSpinBox` capture/commit path, input modifiers, unit conversion, timecode handling, binding checks, per-property Undo/Redo, and the previously confirmed multi-key live-preview path. Native UE automation test: `Digit.Scrubbing.SelectedPlaceQuantization`.
+- **User-confirmed in UE 5.8.3:** the corrected `12.34` single-key digit-place scrub now works at Scrub Sensitivity `0.7`, and the native automation tests passed. The previously confirmed multi-key live preview, Undo and Redo remain unchanged.
+
+## v1.0.52.2: Public FString header compile hotfix
+
+- Fixes `C1189` from a direct `Containers/UnrealString.h.inl` include. The `.inl` is an implementation header requiring Unreal's internal `UE_STRING_CLASS` macro; it must not be included directly by a plugin.
+- Includes the public `Containers/UnrealString.h` wrapper instead. The three existing numeric `LexTryParseString` calls and all v1.0.52 preview logic remain unchanged.
+- Adds a regression test that prohibits including the private implementation header directly. Unreal compilation and live behavior still require UE 5.8.3 validation.
+
+## v1.0.52.1: UE 5.8.3 numeric parsing include hotfix
+
+- Attempted to replace nonexistent `Misc/LexFromString.h` with `Containers/UnrealString.h.inl`. This exposed an Unreal internal-header guard and was corrected in v1.0.52.2. No numeric or interaction behavior was changed.
+
+## v1.0.52: In-field multi-key feedback and opt-in live Curve Editor preview
+
+- Confirmed from UE 5.8.3 user testing: multi-key relative and equal-value scrubs now commit correctly; Undo, Redo, and Escape also work on the release-only path.
+- Adds a temporary in-field preview during Ctrl+Alt drag. Identical key values display the proposed new shared value; differing values display their signed change (`+5` / `-2`). This is a display-only overlay; Unreal's original native text remains unchanged until commit.
+- Adds optional **Live Multi-Key Curve Updates (Experimental)**, OFF by default. Attempts to use the selected-key Value property handle to update curves during drag, with one transaction and an original-value cancellation snapshot. The proven release-only path is still the fallback and remains the default.
+- Live Curve Editor transactions have **not** been validated in UE; test on disposable sequences before enabling. See `Doc/Curve-Editor-Multi-Key-Visual-Preview-V152.md`.
+
+## v1.0.51.1: Multi-key modifier key-down continuity hotfix
+
+- Fixes the confirmed v1.0.51 UE 5.8.3 input sequence: after the Ctrl+Alt multi-key Value gesture armed, Unreal delivered `LeftControl` or `LeftAlt` as another key-down, and Digit immediately cancelled its own drag before mouse release.
+- A held Ctrl/Alt key-down, including either side, no longer ends an active multi-key Value drag or discards its already queued native commit. Shift is also allowed for sensitivity changes. Escape and unrelated key presses still cancel the gesture, and native host/capture safety checks are unchanged.
+- Adds native `Digit.CurveEditor.MultiKeyModifierContinuity` automation test and a source regression test. Single-key scrubbing is unchanged. The multi-key editor commit is still experimental and must be verified manually in UE 5.8.3.
+- See `Doc/Curve-Editor-Multi-Key-Modifier-Continuity-V1511.md` for validation.
 
 ## v1.0.51: Deferred multi-key Value commit and release diagnostics
 
@@ -117,7 +167,7 @@ Text-only **Value** fields in the Curve Editor key-detail panel also support **C
 
 **Curve Editor safety and faster text scrubbing:** v1.0.41 verifies the text buffer and selected digit on each drag update, and terminates staging if the host modifies either. A value at its upper bound can still be scrubbed downward, provided the negative step is representable. Hold **Shift** while Ctrl+Alt+left-dragging to scrub text-only Time or Value at **4x** the regular horizontal rate, without changing the selected place. Curve Editor's native numeric tool properties and tangent-related controls continue to use the original host `SSpinBox` callbacks wherever their underlying widgets qualify. For actual widget discovery, enable **Log Numeric Widget Diagnostics** temporarily and inspect `LogDigit` for Curve Editor owner/type and numeric magnitude. Weighted tangents, mixed multi-key values, and live keyframe transactions require the additional QA matrix in `Doc/Curve-Editor-Host-Safety-And-Tangent-V141.md`. These are not broadly certified by source tests alone.
 
-**Curve Editor multi-key text scrub preview (v1.0.48):** UE 5.8.3 uses an `SEditableText` under `SPropertyEditorNumeric` for multi-key Value editing, not the spinbox targeted by the earlier preview. An optional, **OFF by default** Ctrl+Alt+left-drag gesture supports that host field. In v1.0.51, the proposed edits remain in Digit's session state until mouse release. With equal values, it stages ones-place absolute edits; with `Multiple Values`, it stages a relative expression so an offset can be applied individually to selected keys by Unreal's native per-object property handler. On mouse release, Digit verifies the original captured text field and requests a native Enter commit on a Slate post-tick after staging the proposed text. **This is a staged-text preview: it does not update keyframes live during mouse movement.** Its mouse-release transaction behavior must be verified in UE 5.8.3 before enabling it for everyday use. See `Doc/Curve-Editor-Multi-Key-Text-Preview-V148.md` and `Digit.CurveEditor.MultiKeyTextExpression` / `MultiKeyTextEqualValue`. The older shared-value slider preview did not work with the actual multi-key text widget and should remain disabled.
+**Curve Editor multi-key text scrub preview (v1.0.48):** UE 5.8.3 uses an `SEditableText` under `SPropertyEditorNumeric` for multi-key Value editing, not the spinbox targeted by the earlier preview. An optional, **OFF by default** Ctrl+Alt+left-drag gesture supports that host field. In v1.0.51, the proposed edits remain in Digit's session state until mouse release. With equal values, it stages ones-place absolute edits; with `Multiple Values`, it stages a relative expression so an offset can be applied individually to selected keys by Unreal's native per-object property handler. On mouse release, Digit verifies the original captured text field and requests a native Enter commit on a Slate post-tick after staging the proposed text. **By default this remains a staged-text preview.** Version 1.0.52 optionally displays proposed changes in-field, and separately offers experimental live key changes (OFF by default). Its mouse-release transaction behavior must be verified in UE 5.8.3 before enabling it for everyday use. See `Doc/Curve-Editor-Multi-Key-Text-Preview-V148.md` and `Digit.CurveEditor.MultiKeyTextExpression` / `MultiKeyTextEqualValue`. The older shared-value slider preview did not work with the actual multi-key text widget and should remain disabled.
 
 **Shared Curve Editor Value slider preview (v1.0.47):** An opt-in setting under **Scrubbing > Curve Editor Shared Values (Experimental)** allows Digit to temporarily enable Unreal's existing slider when a verified selected-key **Value** field displays a plain number but its native slider is disabled. This targets the reported two-key `30, 30` case and uses Unreal's existing slider callbacks. The preview is **OFF by default** until live UE 5.8.3 multi-key transactions and Undo/Redo are validated. It does not create a custom multi-key transaction and does **not** yet implement relative drags on `Multiple Values` / `10, 20`. This behavior is intentionally disabled for Curve Editor Time and other editors. See `Doc/Curve-Editor-Shared-Value-Preview-V147.md` and `Digit.CurveEditor.SharedValueSliderPolicy` / `SharedValueSliderLifecycle`.
 
@@ -1085,7 +1135,7 @@ Digit is configured for:
 
 | | |
 |---|---|
-| **Digit Version** | 1.0.51 |
+| **Digit Version** | 1.0.52.2 |
 | **Unreal Engine** | 5.8.x |
 | **Platform** | Windows 64-bit |
 | **Plugin Type** | Editor |

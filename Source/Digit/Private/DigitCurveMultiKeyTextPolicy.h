@@ -2,6 +2,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "InputCoreTypes.h"
 #include "DigitCurveTextMouse.h"
 
 // UE 5.8.3's SPropertyEditorNumeric<T> constructs an SNumericEntryBox<T>
@@ -12,6 +13,18 @@
 namespace DigitCurveMultiKeyTextPolicy
 {
     enum class EMode : uint8 { None, EqualValues, MixedValues };
+
+    // UE 5.8.3 may report Ctrl/Alt key-down events after the preprocessor has
+    // already armed a Ctrl+Alt+mouse gesture. These are not a new edit request;
+    // cancelling on them drops the session before mouse release. Shift is an
+    // ordinary scrubbing sensitivity modifier and may change mid-drag.
+    // The caller must still cancel Escape and unrelated key presses.
+    inline bool IsGestureModifierKey(const FKey& Key)
+    {
+        return Key == EKeys::LeftControl || Key == EKeys::RightControl
+            || Key == EKeys::LeftAlt || Key == EKeys::RightAlt
+            || Key == EKeys::LeftShift || Key == EKeys::RightShift;
+    }
 
     // Text-only key Value field path observed in UE 5.8.3 Sequencer. This
     // checks widget ordering only; the caller must ALSO verify that the first

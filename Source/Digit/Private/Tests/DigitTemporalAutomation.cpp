@@ -15,11 +15,16 @@
 #include "DigitCurveEditableValue.h"
 #include "DigitCurveTextMouse.h"
 #include "DigitScrubDisplayPolicy.h"
+#include "DigitNativeStepPolicy.h"
 #include "DigitNativeHostGuard.h"
 #include "DigitNativeBindingGuard.h"
 #include "DigitCurveSharedValuePolicy.h"
 #include "DigitCurveMultiKeyTextPolicy.h"
+#include "DigitCurveLivePreviewPolicy.h"
+#include "DigitCurveMultiKeyMagnitudePolicy.h"
 #include "Widgets/Layout/SBorder.h"
+#include "Widgets/SOverlay.h"
+#include "Widgets/Text/STextBlock.h"
 #include "Widgets/Input/SEditableText.h"
 #include "Widgets/Input/SSpinBox.h"
 #include "Widgets/Input/NumericTypeInterface.h"
@@ -1690,6 +1695,38 @@ bool FDigitCurveMultiKeyDeferredNativeCommitTest::RunTest(const FString& Paramet
     return true;
 }
 
+// v1.0.51.1: Modifier key-down can be delivered after the Ctrl+Alt mouse-down
+// that armed a property scrub. Regression for the exact user-reported sequence.
+// This tests the key classification; a live Slate drag still needs manual QA.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveMultiKeyModifierContinuityTest,
+    "Digit.CurveEditor.MultiKeyModifierContinuity",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveMultiKeyModifierContinuityTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    using namespace DigitCurveMultiKeyTextPolicy;
+    TestTrue(TEXT("Late LeftControl key-down keeps armed drag"),
+        IsGestureModifierKey(EKeys::LeftControl));
+    TestTrue(TEXT("Late RightControl key-down keeps armed drag"),
+        IsGestureModifierKey(EKeys::RightControl));
+    TestTrue(TEXT("Late LeftAlt key-down keeps armed drag"),
+        IsGestureModifierKey(EKeys::LeftAlt));
+    TestTrue(TEXT("Late RightAlt key-down keeps armed drag"),
+        IsGestureModifierKey(EKeys::RightAlt));
+    TestTrue(TEXT("Shift sensitivity adjustment keeps armed drag"),
+        IsGestureModifierKey(EKeys::LeftShift)
+        && IsGestureModifierKey(EKeys::RightShift));
+    TestFalse(TEXT("Escape still cancels drag"),
+        IsGestureModifierKey(EKeys::Escape));
+    TestFalse(TEXT("Typing a new value still cancels drag"),
+        IsGestureModifierKey(EKeys::A));
+    TestFalse(TEXT("Navigation keys still interrupt drag"),
+        IsGestureModifierKey(EKeys::Left));
+    return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS
 
 #if WITH_DEV_AUTOMATION_TESTS
@@ -1831,6 +1868,298 @@ bool FDigitCurveMultiKeyCaptureLifecycleTest::RunTest(const FString& Parameters)
         IsInteractive(OriginalOwner));
     TestFalse(TEXT("A rebuilt owner cannot inherit the old gesture"),
         CanContinueOwnedCaptureDrag(true, true, true, IsInteractive(OriginalOwner)));
+    return true;
+}
+
+#endif // WITH_DEV_AUTOMATION_TESTS
+
+#if WITH_DEV_AUTOMATION_TESTS
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveMultiKeyInFieldPreviewTest,
+    "Digit.CurveEditor.MultiKeyInFieldPreview",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveMultiKeyInFieldPreviewTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    using namespace DigitCurveLivePreviewPolicy;
+    TestEqual(TEXT("Mixed-value positive offset shows explicit sign"),
+        SignedOffset(50), FString(TEXT("+50")));
+    TestEqual(TEXT("Mixed-value negative offset is signed"),
+        SignedOffset(-23), FString(TEXT("-23")));
+    TestEqual(TEXT("Fractional signed offsets remain readable"),
+        SignedOffset(-23.83834), FString(TEXT("-23.83834")));
+    TestEqual(TEXT("Zero offset is visible"),
+        SignedOffset(0), FString(TEXT("+0")));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveMultiKeyLiveOriginalSnapshotTest,
+    "Digit.CurveEditor.MultiKeyLiveOriginalSnapshot",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveMultiKeyLiveOriginalSnapshotTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    using namespace DigitCurveLivePreviewPolicy;
+    const TArray<double> Original{10.0, 20.0, -7.25};
+    TArray<FString> Result;
+    TestTrue(TEXT("Can stage a relative plus five from originals"),
+        BuildValues(Original, 5.0, Result));
+    TestEqual(TEXT("Three selected keys remain independent"), Result.Num(), 3);
+    if (Result.Num() == 3)
+    {
+        TestEqual(TEXT("First key is relative"), Result[0], FString(TEXT("15")));
+        TestEqual(TEXT("Second key preserves delta"), Result[1], FString(TEXT("25")));
+        TestEqual(TEXT("Fractional key retains fraction"), Result[2], FString(TEXT("-2.25")));
+    }
+    TestTrue(TEXT("Reverse direction uses original snapshot, not previous result"),
+        BuildValues(Original, -1.5, Result));
+    if (Result.Num() == 3)
+    {
+        TestEqual(TEXT("First key reverses"), Result[0], FString(TEXT("8.5")));
+        TestEqual(TEXT("Second key reverses"), Result[1], FString(TEXT("18.5")));
+        TestEqual(TEXT("Fraction remains exact"), Result[2], FString(TEXT("-8.75")));
+    }
+    TestFalse(TEXT("Nonfinite offset is never written to CurveEditor"),
+        BuildValues(Original, std::numeric_limits<double>::infinity(), Result));
+    TestTrue(TEXT("Rejected offset clears the output"), Result.IsEmpty());
+    return true;
+}
+
+#endif // WITH_DEV_AUTOMATION_TESTS
+
+#if WITH_DEV_AUTOMATION_TESTS
+
+// Source-integrated Slate contract: a hit-test-invisible preview can be added
+// to / removed from the native SNumericEntryBox overlay without destroying
+// or replacing the original editable text child.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveMultiKeyOverlayLifecycleTest,
+    "Digit.CurveEditor.MultiKeyOverlayLifecycle",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveMultiKeyOverlayLifecycleTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    const TSharedRef<SOverlay> Overlay = SNew(SOverlay);
+    const TSharedRef<SEditableText> NativeEdit = SNew(SEditableText).Text(FText::FromString(TEXT("30")));
+    Overlay->AddSlot()[NativeEdit];
+    const TSharedRef<SBorder> Feedback = SNew(SBorder)
+        .Visibility(EVisibility::HitTestInvisible)
+        [SNew(STextBlock).Text(FText::FromString(TEXT("31")))];
+    Overlay->AddSlot()[Feedback];
+    TestEqual(TEXT("Preview is a sibling of native editor"), Overlay->GetNumWidgets(), 2);
+    TestTrue(TEXT("Preview is visual only"), Feedback->GetVisibility() == EVisibility::HitTestInvisible);
+    TestTrue(TEXT("Only preview is removed"), Overlay->RemoveSlot(Feedback));
+    TestEqual(TEXT("Native editor remains in overlay"), Overlay->GetNumWidgets(), 1);
+    return true;
+}
+
+#endif // WITH_DEV_AUTOMATION_TESTS
+
+
+#if WITH_DEV_AUTOMATION_TESTS
+
+// v1.0.53: Sensitivity changes mouse travel per whole selected-digit step,
+// never the magnitude of that digit. This is the 12.34 / 0.7-speed live QA
+// regression: ones must not produce tenths, tens must not produce ones.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitNativeSelectedPlaceQuantizationTest,
+    "Digit.Scrubbing.SelectedPlaceQuantization",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitNativeSelectedPlaceQuantizationTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    using namespace DigitNativeStepPolicy;
+
+    // One screen pixel at 0.7 sensitivity is a partial step. After two
+    // pixels, the same selected place advances by ONE exact step.
+    double PendingPixels = 0.0;
+    TestEqual(TEXT("Sub-step movement preserves the original value"),
+        ConsumeWholePlaceSteps(PendingPixels, 1.0, 0.7), 0);
+    TestEqual(TEXT("Second pixel produces a whole selected place step"),
+        ConsumeWholePlaceSteps(PendingPixels, 1.0, 0.7), 1);
+    TestTrue(TEXT("Fractional mouse travel is retained"),
+        FMath::IsNearlyEqual(PendingPixels, 0.4, 1.e-8));
+
+    const double Original = 12.34;
+    const double Expected[] = {22.34, 13.34, 12.44, 12.35};
+    const int32 Places[] = {1, 0, -1, -2};
+    for (int32 Index = 0; Index < 4; ++Index)
+    {
+        const double Proposed = Original + FMath::Pow(10.0, static_cast<double>(Places[Index]));
+        TestTrue(*FString::Printf(TEXT("12.34 selected place %d remains exact"), Places[Index]),
+            FMath::IsNearlyEqual(Proposed, Expected[Index], 1.e-8));
+    }
+
+    // Each 10px gesture at 0.7 speed represents exactly seven selected
+    // steps, never a decimal 0.7 of each selected step.
+    PendingPixels = 0.0;
+    const int32 Forward = ConsumeWholePlaceSteps(PendingPixels, 10.0, 0.7);
+    TestEqual(TEXT("Ten pixels at 0.7 means seven full steps"), Forward, 7);
+    TestTrue(TEXT("Tens: seven steps produce +70, not +7"),
+        FMath::IsNearlyEqual(Original + Forward * 10.0, 82.34, 1.e-8));
+    TestTrue(TEXT("Ones: seven steps produce +7, not +0.7"),
+        FMath::IsNearlyEqual(Original + Forward, 19.34, 1.e-8));
+    TestTrue(TEXT("Tenths: seven steps produce +0.7, not +0.07"),
+        FMath::IsNearlyEqual(Original + Forward * 0.1, 13.04, 1.e-8));
+    TestTrue(TEXT("Hundredths: seven steps produce +0.07"),
+        FMath::IsNearlyEqual(Original + Forward * 0.01, 12.41, 1.e-8));
+    TestEqual(TEXT("Reverse gesture cancels every whole step"),
+        ConsumeWholePlaceSteps(PendingPixels, -10.0, 0.7), -7);
+    TestTrue(TEXT("Reversal clears accumulated fractional travel"),
+        FMath::IsNearlyZero(PendingPixels, 1.e-8));
+
+    PendingPixels = 0.0;
+    TestEqual(TEXT("A small forward movement stages no step"),
+        ConsumeWholePlaceSteps(PendingPixels, 1.0, 0.7), 0);
+    TestEqual(TEXT("A matching reverse cancels before stepping"),
+        ConsumeWholePlaceSteps(PendingPixels, -1.0, 0.7), 0);
+    TestTrue(TEXT("No residual after partial reversal"),
+        FMath::IsNearlyZero(PendingPixels, 1.e-8));
+    TestEqual(TEXT("Faster sensitivity can emit multiple whole steps per pixel"),
+        ConsumeWholePlaceSteps(PendingPixels, 1.0, 2.0), 2);
+    TestEqual(TEXT("Nonfinite cursor movement must not produce values"),
+        ConsumeWholePlaceSteps(PendingPixels, std::numeric_limits<double>::infinity(), 1.0), 0);
+    TestTrue(TEXT("Invalid movement resets fractional accumulator"),
+        FMath::IsNearlyZero(PendingPixels));
+    return true;
+}
+
+#endif // WITH_DEV_AUTOMATION_TESTS
+
+#if WITH_DEV_AUTOMATION_TESTS
+
+// v1.0.54: Mixed selected keys have no single digit to hover. The existing
+// nine-row Value Ladder starts at 1.0, and its selected place controls all
+// future WHOLE mouse steps. Already accumulated offsets must not be rescaled.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveMultiKeyMagnitudeLadderTest,
+    "Digit.CurveEditor.MultiKeyMagnitudeLadder",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveMultiKeyMagnitudeLadderTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    using namespace DigitCurveMultiKeyMagnitudePolicy;
+    int32 Place = OriginPlace;
+    float Travel = 0.0f;
+    TestEqual(TEXT("Shared Value Ladder begins at ones"), Place, 0);
+    TestFalse(TEXT("Sub-threshold motion retains current magnitude"),
+        ConsumeVerticalRungs(Place, Travel, 4.0f, 1.0f));
+    TestTrue(TEXT("Vertical down selects tenths"),
+        ConsumeVerticalRungs(Place, Travel, 5.0f, 1.0f));
+    TestEqual(TEXT("First downward rung is tenths"), Place, -1);
+    TestTrue(TEXT("Vertical up restores ones"),
+        ConsumeVerticalRungs(Place, Travel, -17.0f, 1.0f));
+    TestEqual(TEXT("Returned rung is ones"), Place, 0);
+    TestTrue(TEXT("Upward movement selects tens"),
+        ConsumeVerticalRungs(Place, Travel, -17.0f, 1.0f));
+    TestEqual(TEXT("Higher rung is tens"), Place, 1);
+
+    double Offset = 0.0;
+    TestTrue(TEXT("Three tens apply thirty"), TryAccumulate(Offset, 3, Place, Offset));
+    TestTrue(TEXT("Tens are exact full magnitudes"), FMath::IsNearlyEqual(Offset, 30.0));
+    Place = -2;
+    TestTrue(TEXT("Fractional row adds hundredths"), TryAccumulate(Offset, 4, Place, Offset));
+    TestTrue(TEXT("Prior tens are not rescaled when switching rungs"),
+        FMath::IsNearlyEqual(Offset, 30.04, 1.e-9));
+    TestTrue(TEXT("Reversing horizontal motion removes only its original step"),
+        TryAccumulate(Offset, -4, Place, Offset));
+    TestTrue(TEXT("Previous magnitude remains unchanged by reversal"),
+        FMath::IsNearlyEqual(Offset, 30.0, 1.e-9));
+    Place = 1;
+    TestTrue(TEXT("Return to zero uses original snapshot"),
+        TryAccumulate(Offset, -3, Place, Offset));
+    TestTrue(TEXT("Complete reversal returns zero without drift"),
+        FMath::IsNearlyZero(Offset, 1.e-9));
+    TestFalse(TEXT("Out-of-range magnitude cannot be applied"),
+        TryAccumulate(Offset, 1, -5, Offset));
+    TestFalse(TEXT("Non-finite movement cannot change magnitude"),
+        ConsumeVerticalRungs(Place, Travel,
+            std::numeric_limits<float>::infinity(), 1.0f));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveMultiKeyFractionalExpressionsTest,
+    "Digit.CurveEditor.MultiKeyFractionalExpressions",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveMultiKeyFractionalExpressionsTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    using namespace DigitCurveMultiKeyMagnitudePolicy;
+    FString Proposal;
+    TestTrue(TEXT("Mixed keys stage +0.1 as relative expression"),
+        TryStageMixed(TEXT("Multiple Values"), 0.1, Proposal));
+    TestEqual(TEXT("Fractional mixed expression is native-parseable text"),
+        Proposal, FString(TEXT("Multiple Values + 0.1")));
+    TestTrue(TEXT("Negative mixed offset remains signed and precise"),
+        TryStageMixed(TEXT("Multiple Values"), -23.8383, Proposal));
+    TestEqual(TEXT("Negative native expression"), Proposal,
+        FString(TEXT("Multiple Values - 23.8383")));
+    // Exercise fractional arithmetic through the UE numeric-expression
+    // interface already used by Digit's native MultiKeyTextExpression test.
+    // Avoid TNumericUnitTypeInterface here: its out-of-line unit-interface
+    // symbols are not linked by this plugin's module dependencies in UE 5.8.3.
+    // This validates unitless expressions; the live Property Editor handles
+    // the actual per-object substitution, commit, and optional unit context.
+    TDefaultNumericTypeInterface<double> NativeNumber;
+    const TOptional<double> ParsedPositive = NativeNumber.FromString(
+        TEXT("10 + 0.25"), 10.0);
+    TestTrue(TEXT("Native PropertyEditor numeric parser accepts fractional addition"),
+        ParsedPositive.IsSet());
+    if (ParsedPositive.IsSet())
+    {
+        TestTrue(TEXT("Fractional addition keeps each object's initial value"),
+            FMath::IsNearlyEqual(ParsedPositive.GetValue(), 10.25, 1.e-8));
+    }
+    const TOptional<double> ParsedNegative = NativeNumber.FromString(
+        TEXT("20 - 0.25"), 20.0);
+    TestTrue(TEXT("Native PropertyEditor numeric parser accepts fractional subtraction"),
+        ParsedNegative.IsSet());
+    if (ParsedNegative.IsSet())
+    {
+        TestTrue(TEXT("Fractional subtraction is relative"),
+            FMath::IsNearlyEqual(ParsedNegative.GetValue(), 19.75, 1.e-8));
+    }
+    TestFalse(TEXT("Unverified marker must not be committed"),
+        TryStageMixed(TEXT("Different Values"), 0.25, Proposal));
+    TestFalse(TEXT("Zero delta must not create a native transaction"),
+        TryStageMixed(TEXT("Multiple Values"), 0.0, Proposal));
+    TestTrue(TEXT("Equal keys show the proposed final fractional value"),
+        TryStageEqual(TEXT("12.34"), 0.01, -2, Proposal));
+    TestEqual(TEXT("Equal field displays the result rather than an offset"),
+        Proposal, FString(TEXT("12.35")));
+    TestTrue(TEXT("Fractional scrubs can add precision to an integer"),
+        TryStageEqual(TEXT("30"), -0.25, -2, Proposal));
+    TestEqual(TEXT("Equal integer now shows fractional result"),
+        Proposal, FString(TEXT("29.75")));
+    TestEqual(TEXT("Field feedback has an explicit positive sign"),
+        FormatSignedOffset(0.25), FString(TEXT("+0.25")));
+    TestEqual(TEXT("Field feedback has an explicit negative sign"),
+        FormatSignedOffset(-23.8383), FString(TEXT("-23.8383")));
+    TestEqual(TEXT("No change displays positive zero"),
+        FormatSignedOffset(0.0), FString(TEXT("+0")));
+
+    TArray<double> Originals{10.0, 20.0, -7.25};
+    TArray<FString> Preview;
+    TestTrue(TEXT("Live multi-key curve uses a single fractional snapshot offset"),
+        DigitCurveLivePreviewPolicy::BuildValues(Originals, 0.25, Preview));
+    TestEqual(TEXT("All three keys change independently"), Preview.Num(), 3);
+    if (Preview.Num() == 3)
+    {
+        TestEqual(TEXT("First key changes by .25"), Preview[0], FString(TEXT("10.25")));
+        TestEqual(TEXT("Second key retains the original ten-unit difference"),
+            Preview[1], FString(TEXT("20.25")));
+        TestEqual(TEXT("Negative key receives the same offset"),
+            Preview[2], FString(TEXT("-7")));
+    }
     return true;
 }
 

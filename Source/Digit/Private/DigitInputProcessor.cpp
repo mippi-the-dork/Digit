@@ -12,10 +12,13 @@
 #include "DigitCurveEditableValue.h"
 #include "DigitCurveTextMouse.h"
 #include "DigitScrubDisplayPolicy.h"
+#include "DigitNativeStepPolicy.h"
 #include "DigitNativeHostGuard.h"
 #include "DigitNativeBindingGuard.h"
 #include "DigitCurveSharedValuePolicy.h"
 #include "DigitCurveMultiKeyTextPolicy.h"
+#include "DigitCurveLivePreviewPolicy.h"
+#include "DigitCurveMultiKeyMagnitudePolicy.h"
 #include "Input/Events.h"
 #include "InputCoreTypes.h"
 #include "Layout/Children.h"
@@ -39,6 +42,13 @@
 #include "Widgets/SOverlay.h"
 #include "Widgets/SWindow.h"
 #include "Widgets/Text/STextBlock.h"
+#include "Styling/AppStyle.h"
+#include "ScopedTransaction.h"
+#include "SCurveKeyDetailPanel.h"
+#include "IPropertyRowGenerator.h"
+#include "IDetailTreeNode.h"
+#include "PropertyHandle.h"
+#include "Containers/UnrealString.h"
 
 #include <limits>
 #include <cmath>
@@ -1244,6 +1254,63 @@ bool FDigitInputProcessor::ResolveCurvePropertyValueTarget(
     return true;
 }
 
+namespace DigitCurveLivePreview
+{
+    // The source selected-key proxies are passed directly to this generator by
+    // SCurveEditorPanel::UpdateEditBox. Reject any ambiguous or unrecognized row.
+    static TSharedPtr<IPropertyHandle> FindValueHandle(const FWidgetPath& Path)
+    {
+        for (int32 WidgetIndex = 0; WidgetIndex < Path.Widgets.Num(); ++WidgetIndex)
+        {
+            if (Path.Widgets[WidgetIndex].Widget->GetType()
+                != FName(TEXT("SCurveKeyDetailPanel"))) continue;
+            const TSharedRef<SCurveKeyDetailPanel> Panel =
+                StaticCastSharedRef<SCurveKeyDetailPanel>(Path.Widgets[WidgetIndex].Widget);
+            const TSharedPtr<IPropertyRowGenerator> Generator = Panel->GetPropertyRowGenerator();
+            if (!Generator.IsValid()) return nullptr;
+            for (const TSharedRef<IDetailTreeNode>& Root : Generator->GetRootTreeNodes())
+            {
+                TArray<TSharedRef<IDetailTreeNode>> Children;
+                Root->GetChildren(Children);
+                for (const TSharedRef<IDetailTreeNode>& Node : Children)
+                {
+                    if (Node->GetNodeName() == TEXT("Value"))
+                    {
+                        return Node->CreatePropertyHandle();
+                    }
+                }
+            }
+            return nullptr;
+        }
+        return nullptr;
+    }
+
+    static bool ReadOriginals(const TSharedPtr<IPropertyHandle>& Handle,
+        TArray<FString>& OutStrings, TArray<double>& OutNumeric)
+    {
+        OutStrings.Reset();
+        OutNumeric.Reset();
+        if (!Handle.IsValid() || !Handle->GetProperty()
+            || !Handle->GetProperty()->IsA(FDoubleProperty::StaticClass())
+            || Handle->GetPerObjectValues(OutStrings) == FPropertyAccess::Fail
+            || OutStrings.Num() < 2 || OutStrings.Num() > 4096) return false;
+        for (const FString& Item : OutStrings)
+        {
+            double Value = 0.0;
+            if (!LexTryParseString(Value, *Item) || !FMath::IsFinite(Value))
+            {
+                OutStrings.Reset();
+                OutNumeric.Reset();
+                return false;
+            }
+            OutNumeric.Add(Value);
+        }
+        return true;
+    }
+
+
+}
+
 void FDigitInputProcessor::ClearCurvePropertyCommit()
 {
     // The value is staged only in Digit's session state. Nothing is written
@@ -1251,18 +1318,107 @@ void FDigitInputProcessor::ClearCurvePropertyCommit()
     PendingCurvePropertyCommit.Reset();
 }
 
+void FDigitInputProcessor::ShowCurvePropertyLadder(FSlateApplication& SlateApp,
+    const TSharedRef<SEditableText>& Edit)
+{
+    // Multi-object Value text has no SSpinBox and therefore no highlighted
+    // native digit. Start at 1.0 and reuse Digit's existing nine-rung Slate
+    // Value Ladder appearance, alongside the original editable field.
+    LadderOriginDigitPlace = DigitCurveMultiKeyMagnitudePolicy::OriginPlace;
+    LadderSelectedDigitPlace = LadderOriginDigitPlace;
+    LadderVerticalTravel = 0.0f;
+    bLadderIntegral = false;
+    const UDigitSettings* Settings = UDigitSettings::Get();
+    ActiveLadderMagnitudeSensitivity = Settings
+        ? FMath::Clamp(Settings->LadderMagnitudeSensitivity, 0.1f, 10.0f) : 1.0f;
+    const TSharedPtr<SWindow> Window = SlateApp.FindWidgetWindow(Edit);
+    FWidgetPath Path;
+    if (!Window.IsValid() || !Window->HasOverlay()
+        || !SlateApp.GeneratePathToWidgetUnchecked(Edit, Path)
+        || Path.Widgets.Num() == 0)
+    {
+        return; // A missing overlay must never prevent native scrubbing.
+    }
+    const FGeometry& Field = Edit->GetTickSpaceGeometry();
+    const FGeometry& Root = Path.Widgets[0].Geometry;
+    const FVector2D FieldSize = Field.GetLocalSize();
+    const FVector2D WindowSize = Root.GetLocalSize();
+    if (FieldSize.X <= 0.0f || FieldSize.Y <= 0.0f
+        || WindowSize.X <= 0.0f || WindowSize.Y <= 0.0f)
+    {
+        return;
+    }
+    constexpr float Width = 72.0f;
+    constexpr float Height = 17.0f * 9.0f + 6.0f;
+    constexpr float Margin = 4.0f;
+    constexpr float Gap = 6.0f;
+    const FVector2D Local = Root.AbsoluteToLocal(Field.LocalToAbsolute(FVector2D::ZeroVector));
+    const float Left = Local.X - Width - Gap;
+    const float X = Left >= Margin ? Left : Local.X + FieldSize.X + Gap;
+    LadderWindowPosition.X = FMath::Clamp(X, Margin,
+        FMath::Max(Margin, WindowSize.X - Width - Margin));
+    LadderWindowPosition.Y = FMath::Clamp(
+        Local.Y + FieldSize.Y * 0.5f - Height * 0.5f, Margin,
+        FMath::Max(Margin, WindowSize.Y - Height - Margin));
+    LadderWindow = Window;
+    bCurvePropertyLadderActive = true;
+    RebuildLadderVisual();
+}
+
 void FDigitInputProcessor::EndCurvePropertyScrub(bool bKeepStagedText)
 {
+    if (bCurvePropertyLadderActive)
+    {
+        bCurvePropertyLadderActive = false;
+        ClearLadder();
+    }
+    // Detach the display-only field overlay before the owner widget can be
+    // destroyed by a PropertyEditor refresh. Leave the SEditableText intact.
+    if (const TSharedPtr<SOverlay> Overlay = CurvePropertyFeedbackOverlay.Pin())
+    {
+        if (CurvePropertyFeedbackWidget.IsValid())
+        {
+            Overlay->RemoveSlot(CurvePropertyFeedbackWidget.ToSharedRef());
+        }
+    }
+    CurvePropertyFeedbackOverlay.Reset();
+    CurvePropertyFeedbackWidget.Reset();
+    CurvePropertyFeedbackLabel.Reset();
+
+    // The live path owns one transaction for the complete drag. Escape and
+    // unexpected termination put the original values back, then cancel that
+    // transaction; successful release keeps one undoable edit.
+    if (CurvePropertyLiveTransaction.IsValid())
+    {
+        if (!bKeepStagedText)
+        {
+            if (CurvePropertyLiveHandle.IsValid()
+                && CurvePropertyOriginalObjectValues.Num() > 1)
+            {
+                const FPropertyAccess::Result Restored =
+                    CurvePropertyLiveHandle->SetPerObjectValues(
+                        CurvePropertyOriginalObjectValues,
+                        EPropertyValueSetFlags::NotTransactable);
+                if (Restored == FPropertyAccess::Fail)
+                {
+                    UE_LOG(LogDigit, Warning,
+                        TEXT("CurveEditor live scrub cancellation: could not restore original Value objects"));
+                }
+            }
+            CurvePropertyLiveTransaction->Cancel();
+        }
+        CurvePropertyLiveTransaction.Reset();
+    }
+    CurvePropertyLiveHandle.Reset();
+    CurvePropertyOriginalObjectValues.Empty();
+    CurvePropertyOriginalNumericValues.Empty();
+    CurvePropertyCurrentObjectValues.Empty();
+    bCurvePropertyLiveEnabled = false;
+    bCurvePropertyLiveApplied = false;
+
     const TSharedPtr<SEditableText> Edit = CurvePropertyEditable.Pin();
     if (bCurvePropertyScrubActive && Edit.IsValid())
     {
-        // No staged value has entered the native text buffer yet. Cancellation
-        // therefore cannot accidentally invoke a property change or need to
-        // restore a bound value that Unreal may have refreshed mid-drag.
-        (void)bKeepStagedText;
-        // A mouse-down consumed by Digit must keep the pointer routed to this
-        // exact text editor until release. Release only capture acquired by
-        // this session, never a different editor's capture.
         if (bCurvePropertyOwnsCapture && Edit->HasMouseCapture()
             && FSlateApplication::IsInitialized())
         {
@@ -1290,6 +1446,8 @@ void FDigitInputProcessor::EndCurvePropertyScrub(bool bKeepStagedText)
     CurvePropertyUser = INDEX_NONE;
     CurvePropertyPendingPixels = 0.0;
     CurvePropertyAccumulatedSteps = 0;
+    CurvePropertyCurrentOffset = 0.0;
+    CurvePropertyFinestPlace = 0;
 }
 
 bool FDigitInputProcessor::TryBeginCurvePropertyScrub(FSlateApplication& SlateApp,
@@ -1496,10 +1654,68 @@ bool FDigitInputProcessor::TryBeginCurvePropertyScrub(FSlateApplication& SlateAp
     CurvePropertyUser = Event.GetUserIndex();
     CurvePropertyPendingPixels = 0.0;
     CurvePropertyAccumulatedSteps = 0;
+    CurvePropertyCurrentOffset = 0.0;
+    CurvePropertyFinestPlace = 0;
+    bCurvePropertyLiveEnabled = false;
+    bCurvePropertyLiveApplied = false;
+    CurvePropertyLiveHandle.Reset();
+    CurvePropertyOriginalObjectValues.Empty();
+    CurvePropertyOriginalNumericValues.Empty();
+    CurvePropertyCurrentObjectValues.Empty();
+    // Property editing uses the exact same generated Value row as native
+    // typing. A missing, non-double, or unparseable property makes live mode
+    // unavailable without affecting the already-proven release-only mode.
+    if (Settings->bCurveEditorMultiKeyLivePreview)
+    {
+        TSharedPtr<IPropertyHandle> Handle = DigitCurveLivePreview::FindValueHandle(Path);
+        TArray<FString> Strings;
+        TArray<double> Values;
+        if (DigitCurveLivePreview::ReadOriginals(Handle, Strings, Values))
+        {
+            bCurvePropertyLiveEnabled = true;
+            CurvePropertyLiveHandle = MoveTemp(Handle);
+            CurvePropertyOriginalObjectValues = MoveTemp(Strings);
+            CurvePropertyOriginalNumericValues = MoveTemp(Values);
+        }
+        else if (Settings->bLogWidgetDiagnostics)
+        {
+            UE_LOG(LogDigit, Display,
+                TEXT("CurveEditor live multi-key preview unavailable: using native release commit"));
+        }
+    }
+    // Add a hit-test-invisible label to the *existing* SNumericEntryBox
+    // overlay. Never replace, reparent, or change the original SEditableText.
+    if (Settings->bCurveEditorMultiKeyFieldFeedback)
+    {
+        for (int32 I = Path.Widgets.Num() - 2; I >= 0; --I)
+        {
+            if (Path.Widgets[I].Widget->GetTypeAsString().StartsWith(TEXT("SNumericEntryBox"))) break;
+            if (Path.Widgets[I].Widget->GetType() != FName(TEXT("SOverlay"))) continue;
+            const TSharedRef<SOverlay> NativeOverlay =
+                StaticCastSharedRef<SOverlay>(Path.Widgets[I].Widget);
+            CurvePropertyFeedbackOverlay = NativeOverlay;
+            TSharedRef<SBorder> PreviewBorder = SNew(SBorder)
+                .Visibility(EVisibility::HitTestInvisible)
+                .BorderImage(FAppStyle::GetBrush("WhiteBrush"))
+                .BorderBackgroundColor(FAppStyle::Get().GetSlateColor("Colors.Input"))
+                .Padding(FMargin(3.f, 0.f))
+                [
+                    SAssignNew(CurvePropertyFeedbackLabel, STextBlock)
+                    .ColorAndOpacity(FSlateColor::UseForeground())
+                    .Text(FText::FromString(bMixed ? TEXT("+0") : Source))
+                ];
+            CurvePropertyFeedbackWidget = PreviewBorder;
+            NativeOverlay->AddSlot()
+                .HAlign(HAlign_Fill).VAlign(VAlign_Fill)
+                [ PreviewBorder ];
+            break;
+        }
+    }
     if (!bMixed)
     {
         Edit->SelectText(FTextLocation(0, Index), FTextLocation(0, Index + 1));
     }
+    ShowCurvePropertyLadder(SlateApp, Edit);
     if (Settings->bLogWidgetDiagnostics)
     {
         UE_LOG(LogDigit, Display, TEXT("CurveEditor multi-key text scrub armed (%s, capture=owned). Digit accumulates in memory until release; native property text commit follows."),
@@ -1560,7 +1776,7 @@ bool FDigitInputProcessor::UpdateCurvePropertyScrub(FSlateApplication& SlateApp,
     // user's text. Selection-only mouse drags are not part of this gesture.
     // The pending proposal never enters Unreal's editor until release.
     const FString Live = Edit->GetText().ToString();
-    if (Live != CurvePropertyInitialText)
+    if (!bCurvePropertyLiveApplied && Live != CurvePropertyInitialText)
     {
         UE_LOG(LogDigit, Warning,
             TEXT("CurveEditor multi-key scrub cancelled: native Value text changed before release"));
@@ -1570,35 +1786,58 @@ bool FDigitInputProcessor::UpdateCurvePropertyScrub(FSlateApplication& SlateApp,
     const FString Working = CurvePropertyLastStaged.IsEmpty()
         ? CurvePropertyInitialText : CurvePropertyLastStaged;
     const UDigitSettings* Settings = UDigitSettings::Get();
+    // Mixed-value Ctrl+Alt always uses Ctrl as an activation modifier, not
+    // as a magnitude lock. Vertical movement selects a Value Ladder rung;
+    // horizontal movement increments that rung by whole units.
+    if (bCurvePropertyLadderActive
+        && DigitCurveMultiKeyMagnitudePolicy::ConsumeVerticalRungs(
+        LadderSelectedDigitPlace, LadderVerticalTravel,
+        static_cast<float>(Event.GetCursorDelta().Y),
+        ActiveLadderMagnitudeSensitivity))
+    {
+        CurvePropertyPendingPixels = 0.0;
+        RefreshLadderRowVisuals();
+        if (Settings && Settings->bLogWidgetDiagnostics)
+        {
+            UE_LOG(LogDigit, Display,
+                TEXT("CurveEditor multi-key Value Ladder selected magnitude: %.6g"),
+                DigitCurveMultiKeyMagnitudePolicy::StepForPlace(LadderSelectedDigitPlace));
+        }
+        return true; // Changing magnitude does not also scrub the value.
+    }
     const double Sensitivity = Settings && FMath::IsFinite(Settings->ScrubSensitivity)
         ? FMath::Clamp(static_cast<double>(Settings->ScrubSensitivity), 0.1, 10.0) : 1.0;
     CurvePropertyPendingPixels += static_cast<double>(Event.GetCursorDelta().X);
     const int32 Steps = DigitCurveTextMouse::ConsumeSteps(CurvePropertyPendingPixels,
         DigitCurveTextMouse::GetPixelsPerStep(Sensitivity, Event.IsShiftDown()));
     if (Steps == 0) return true;
-    FString Next;
-    int32 NextIndex = CurvePropertyDigitIndex;
-    if (bCurvePropertyMixed)
+    double NextOffset = 0.0;
+    if (!DigitCurveMultiKeyMagnitudePolicy::TryAccumulate(
+        CurvePropertyCurrentOffset, Steps, LadderSelectedDigitPlace, NextOffset))
     {
-        const int64 Sum = static_cast<int64>(CurvePropertyAccumulatedSteps) + Steps;
-        if (Sum > 100000 || Sum < -100000) return true;
-        CurvePropertyAccumulatedSteps = static_cast<int32>(Sum);
-        if (CurvePropertyAccumulatedSteps == 0)
-        {
-            Next = CurvePropertyInitialText;
-        }
-        else if (!DigitCurveMultiKeyTextPolicy::TryStageMixedRelative(
-            CurvePropertyInitialText, CurvePropertyAccumulatedSteps, Next))
-        {
-            return true;
-        }
+        return true;
     }
-    else if (!DigitCurveTextMouse::TryStageValueSteps(
-        Working, CurvePropertyDigitIndex, Steps, Next, NextIndex))
+    const int32 CandidateFinestPlace = FMath::Min(
+        CurvePropertyFinestPlace, LadderSelectedDigitPlace);
+    FString Next;
+    const int32 NextIndex = CurvePropertyDigitIndex;
+    if (FMath::IsNearlyZero(NextOffset, 1.e-9))
+    {
+        Next = CurvePropertyInitialText;
+    }
+    else if (bCurvePropertyMixed)
+    {
+        if (!DigitCurveMultiKeyMagnitudePolicy::TryStageMixed(
+            CurvePropertyInitialText, NextOffset, Next)) return true;
+    }
+    else if (!DigitCurveMultiKeyMagnitudePolicy::TryStageEqual(
+        CurvePropertyInitialText, NextOffset, CandidateFinestPlace, Next))
     {
         return true;
     }
     if (Next == Working) return true;
+    CurvePropertyCurrentOffset = NextOffset;
+    CurvePropertyFinestPlace = CandidateFinestPlace;
     // Only session state changes here. Editing the native text would trigger
     // bound-value synchronization and could terminate the drag silently.
     if (!bCurvePropertyChanged)
@@ -1613,10 +1852,53 @@ bool FDigitInputProcessor::UpdateCurvePropertyScrub(FSlateApplication& SlateApp,
     }
     CurvePropertyLastStaged = Next;
     CurvePropertyDigitIndex = NextIndex;
-    bCurvePropertyChanged = Next != CurvePropertyInitialText;
-    if (!bCurvePropertyMixed && Next.IsValidIndex(NextIndex))
+    bCurvePropertyChanged = !FMath::IsNearlyZero(CurvePropertyCurrentOffset, 1.e-9);
+    if (CurvePropertyFeedbackLabel.IsValid())
     {
-        Edit->SelectText(FTextLocation(0, NextIndex), FTextLocation(0, NextIndex + 1));
+        CurvePropertyFeedbackLabel->SetText(FText::FromString(
+            bCurvePropertyMixed
+                ? DigitCurveMultiKeyMagnitudePolicy::FormatSignedOffset(CurvePropertyCurrentOffset)
+                : Next));
+    }
+    if (bCurvePropertyLiveEnabled && CurvePropertyLiveHandle.IsValid()
+        && (bCurvePropertyChanged || bCurvePropertyLiveApplied))
+    {
+        // Both equal and mixed value previews apply the original-snapshot
+        // offset. The selected rung only changes future steps, never the
+        // previously accumulated displacement.
+        const double Offset = CurvePropertyCurrentOffset;
+        TArray<FString> NewValues;
+        if (bCurvePropertyLiveEnabled
+            && DigitCurveLivePreviewPolicy::BuildValues(
+                CurvePropertyOriginalNumericValues, Offset, NewValues))
+        {
+            if (!CurvePropertyLiveTransaction.IsValid())
+            {
+                CurvePropertyLiveTransaction = MakeUnique<FScopedTransaction>(
+                    NSLOCTEXT("Digit", "CurveMultiKeyScrub", "Digit Scrub Selected Curve Keys"),
+                    true);
+            }
+            const FPropertyAccess::Result Applied =
+                CurvePropertyLiveHandle->SetPerObjectValues(NewValues,
+                    static_cast<EPropertyValueSetFlags::Type>(
+                        EPropertyValueSetFlags::InteractiveChange
+                        | EPropertyValueSetFlags::NotTransactable));
+            if (Applied != FPropertyAccess::Fail)
+            {
+                CurvePropertyCurrentObjectValues = MoveTemp(NewValues);
+                bCurvePropertyLiveApplied = true;
+            }
+            else
+            {
+                UE_LOG(LogDigit, Warning,
+                    TEXT("CurveEditor live multi-key preview rejected by Value handle; cancelling live preview"));
+                bCurvePropertyLiveEnabled = false;
+                // Do not commit through the old text field after a partial
+                // live edit. Cleanup restores original values on failure.
+                EndCurvePropertyScrub();
+                return true;
+            }
+        }
     }
     return true;
 }
@@ -2140,7 +2422,8 @@ void FDigitInputProcessor::Tick(const float DeltaTime, FSlateApplication& SlateA
             EndCurveTextDrag();
         }
     }
-    if (LadderWidget.IsValid() && (!LadderSourceSpinBox.IsValid() || !LadderSourceText.IsValid()))
+    if (LadderWidget.IsValid() && !bCurvePropertyLadderActive
+        && (!LadderSourceSpinBox.IsValid() || !LadderSourceText.IsValid()))
     {
         ClearLadder();
     }
@@ -2178,6 +2461,16 @@ void FDigitInputProcessor::Tick(const float DeltaTime, FSlateApplication& SlateA
 
 bool FDigitInputProcessor::HandleKeyDownEvent(FSlateApplication& SlateApp, const FKeyEvent& InKeyEvent)
 {
+    // The real UE 5.8.3 input sequence can deliver LeftControl / LeftAlt
+    // key-down immediately AFTER Ctrl+Alt+mouse-down has armed this gesture.
+    // They are the gesture's own modifiers, not interruptions. Also preserve
+    // an already queued native commit until its next Slate post-tick.
+    // Returning false lets Slate keep its normal keyboard/modifier state.
+    if (DigitCurveMultiKeyTextPolicy::IsGestureModifierKey(InKeyEvent.GetKey())
+        && (bCurvePropertyScrubActive || PendingCurvePropertyCommit.IsSet()))
+    {
+        return false;
+    }
     ClearCurvePropertyCommit();
     if (bCurvePropertyScrubActive)
     {
@@ -2458,7 +2751,7 @@ bool FDigitInputProcessor::HandleKeyUpEvent(FSlateApplication& SlateApp, const F
         EndCurveTextDrag(); // Release modifiers: stop staging, do not commit.
     }
     if ((InKeyEvent.GetKey() == EKeys::LeftAlt || InKeyEvent.GetKey() == EKeys::RightAlt)
-        && !IsLadderToggleEnabled())
+        && !IsLadderToggleEnabled() && !bCurvePropertyScrubActive)
     {
         ClearLadder();
         // The numerical drag itself may still be captured by its native spin box.
@@ -2808,6 +3101,40 @@ bool FDigitInputProcessor::HandleMouseButtonUpEvent(FSlateApplication& SlateApp,
         && MouseEvent.GetUserIndex() == CurvePropertyUser)
     {
         const TSharedPtr<SEditableText> Edit = CurvePropertyEditable.Pin();
+        if (bCurvePropertyLiveApplied)
+        {
+            const bool bValid = Edit.IsValid()
+                && bCurvePropertyOwnsCapture && Edit->HasMouseCapture()
+                && SlateApp.GetKeyboardFocusedWidget().Get() == Edit.Get()
+                && DigitNativeHostGuard::IsInteractive(CurvePropertyHierarchy);
+            if (bValid && !bCurvePropertyChanged)
+            {
+                EndCurvePropertyScrub(); // zero net delta; no Undo entry
+                return true;
+            }
+            if (bValid && CurvePropertyLiveHandle.IsValid())
+            {
+                // Final notification without InteractiveChange. The single
+                // outer scoped transaction owns all changes from this drag.
+                const FPropertyAccess::Result Finished =
+                    CurvePropertyLiveHandle->SetPerObjectValues(
+                        CurvePropertyCurrentObjectValues,
+                        EPropertyValueSetFlags::DefaultFlags);
+                if (Finished != FPropertyAccess::Fail)
+                {
+                    EndCurvePropertyScrub(true);
+                    const UDigitSettings* Diagnostics = UDigitSettings::Get();
+                    if (Diagnostics && Diagnostics->bLogWidgetDiagnostics)
+                    {
+                        UE_LOG(LogDigit, Display,
+                            TEXT("CurveEditor multi-key live preview released: one transaction completed"));
+                    }
+                    return true;
+                }
+            }
+            EndCurvePropertyScrub(); // restore initial values and cancel undo
+            return true;
+        }
         if (bCurvePropertyChanged && Edit.IsValid()
             && bCurvePropertyOwnsCapture && Edit->HasMouseCapture()
             && SlateApp.GetKeyboardFocusedWidget().Get() == Edit.Get()
@@ -4149,6 +4476,8 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
         RotationAccumulatedChange = 0.0,
         RotationChangeCorrection = 0.0,
         TimecodeAccumulatedTickChange = 0.0,
+        NativeFractionalPlaceSteps = 0.0,
+        PreviousSelectedPlace = Hit.DigitPlace,
         bLoggedPrecisionLimit = false](
             const FPointerEvent& MouseEvent,
             bool bScaleMovement,
@@ -4165,6 +4494,14 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
             bActiveDigitScrubSuspended = true;
             *WorkingDelta = NumericType(0);
             return true; // Do not route a movement into the newly selected key.
+        }
+
+        // Changing Value Ladder rung must never carry a sub-step residual
+        // from the previous decimal magnitude into the new selected place.
+        if (DigitPlace != PreviousSelectedPlace)
+        {
+            NativeFractionalPlaceSteps = 0.0;
+            PreviousSelectedPlace = DigitPlace;
         }
 
         NumericType DesiredStep = NumericType(0);
@@ -4218,8 +4555,14 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
             const double PhysicalDeltaX = static_cast<double>(MouseEvent.GetCursorDelta().X);
             const double InputMultiplier = DigitPrivate::GetDefaultInputEventMultiplier(MouseEvent);
             const double NativeStep = static_cast<double>(DesiredStep) * DisplayScale;
-            const double RequestedChange = PhysicalDeltaX
-                * NativeStep * InputMultiplier * ScrubSensitivity;
+            // Quantize PHYSICAL cursor movement into whole selected-place steps.
+            // ScrubSensitivity affects travel per step, not numeric magnitude:
+            // with 12.34, selecting tens can add 10 (never 7 at 0.7 speed),
+            // ones adds 1, tenths adds 0.1 and hundredths adds 0.01.
+            const int32 SelectedPlaceSteps = DigitNativeStepPolicy::ConsumeWholePlaceSteps(
+                NativeFractionalPlaceSteps, PhysicalDeltaX, ScrubSensitivity);
+            const double RequestedChange = static_cast<double>(SelectedPlaceSteps)
+                * NativeStep * InputMultiplier;
 
             // UE 5.8 may defer a mouse move's native commit to a widget Tick.
             // When the committed value becomes observable, rebase on it instead
@@ -4268,7 +4611,7 @@ bool FDigitInputProcessor::TryArmTypedSpinBox(const TSharedPtr<SWidget>& Widget,
                     *MaxGeneratedFractionDigits,
                     DigitScrubDisplayPolicy::MaximumSelfGeneratedFractionDigits(
                         DisplayFractionDigits, OriginalMaxFractionalDigits,
-                        static_cast<double>(DesiredStep) * InputMultiplier * ScrubSensitivity));
+                        static_cast<double>(DesiredStep) * InputMultiplier));
             }
             if (bUnrepresentableStep)
             {
@@ -5279,7 +5622,8 @@ void FDigitInputProcessor::RebuildLadderVisual()
 
     TSharedRef<SBox> LadderRoot =
         SNew(SBox)
-        .Visibility(IsLadderToggleEnabled() || IsLadderRowSelectionEnabled()
+        .Visibility(!bCurvePropertyLadderActive
+            && (IsLadderToggleEnabled() || IsLadderRowSelectionEnabled())
             ? EVisibility::Visible : EVisibility::HitTestInvisible)
         .WidthOverride(72.0f)
         [

@@ -20,7 +20,8 @@ namespace DigitCurveMultiKeyMagnitudePolicy
     }
 
     inline bool ConsumeVerticalRungs(int32& SelectedPlace, float& Travel,
-        const float DeltaY, const float Sensitivity)
+        const float DeltaY, const float Sensitivity,
+        const int32 Origin = OriginPlace)
     {
         if (!FMath::IsFinite(DeltaY) || !FMath::IsFinite(Sensitivity)
             || Sensitivity < 0.1f || Sensitivity > 10.0f)
@@ -31,23 +32,23 @@ namespace DigitCurveMultiKeyMagnitudePolicy
         constexpr float Threshold = RowHeight * 0.5f;
         Travel += DeltaY * Sensitivity;
         bool bChanged = false;
-        while (Travel <= -Threshold && SelectedPlace < OriginPlace + Radius)
+        while (Travel <= -Threshold && SelectedPlace < Origin + Radius)
         {
             ++SelectedPlace;
             Travel += RowHeight;
             bChanged = true;
         }
-        while (Travel >= Threshold && SelectedPlace > OriginPlace - Radius)
+        while (Travel >= Threshold && SelectedPlace > Origin - Radius)
         {
             --SelectedPlace;
             Travel -= RowHeight;
             bChanged = true;
         }
-        if (SelectedPlace >= OriginPlace + Radius)
+        if (SelectedPlace >= Origin + Radius)
         {
             Travel = FMath::Max(Travel, -Threshold);
         }
-        if (SelectedPlace <= OriginPlace - Radius)
+        if (SelectedPlace <= Origin - Radius)
         {
             Travel = FMath::Min(Travel, Threshold);
         }
@@ -55,10 +56,11 @@ namespace DigitCurveMultiKeyMagnitudePolicy
     }
 
     inline bool TryAccumulate(const double Previous, const int32 Steps,
-        const int32 SelectedPlace, double& OutOffset)
+        const int32 SelectedPlace, double& OutOffset,
+        const int32 Origin = OriginPlace)
     {
         if (!FMath::IsFinite(Previous) || Steps < -32 || Steps > 32
-            || SelectedPlace < OriginPlace - Radius || SelectedPlace > OriginPlace + Radius)
+            || SelectedPlace < Origin - Radius || SelectedPlace > Origin + Radius)
         {
             return false;
         }

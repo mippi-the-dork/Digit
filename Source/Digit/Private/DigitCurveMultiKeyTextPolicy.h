@@ -15,7 +15,7 @@ namespace DigitCurveMultiKeyTextPolicy
     enum class EMode : uint8 { None, EqualValues, MixedValues };
 
     // UE 5.8.3 may report Ctrl/Alt key-down events after the preprocessor has
-    // already armed a Ctrl+Alt+mouse gesture. These are not a new edit request;
+    // already armed an Alt or Ctrl+Alt mouse gesture. These are not a new edit request;
     // cancelling on them drops the session before mouse release. Shift is an
     // ordinary scrubbing sensitivity modifier and may change mid-drag.
     // The caller must still cancel Escape and unrelated key presses.

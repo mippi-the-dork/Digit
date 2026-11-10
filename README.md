@@ -1,4 +1,4 @@
-﻿# Digit
+# Digit
 
 **Digit-aware numeric scrubbing for Unreal Engine.**
 
@@ -9,12 +9,20 @@ Hover the hundreds place to work in hundreds. Hover the tenths place to make fin
 ![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.8.x-black?logo=unrealengine)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2064--bit-blue)
 ![Type](https://img.shields.io/badge/Plugin-Editor%20Only-green)
-![Version](https://img.shields.io/badge/Version-1.0.54.2-blue)
+![Version](https://img.shields.io/badge/Version-1.0.55.0-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 ![Digit targeting a numeric place value in Unreal Engine](Doc/Images/Digit-Hero.png)
 
 ---
+
+## v1.0.55.0: Unified Curve Editor multi-key scrubbing
+
+- **Equal values:** Select multiple Curve Editor keys with the same Value, then hover a specific digit and drag horizontally to change only that decimal place across the selection. Normal clicks still reach Unreal's text field; Digit takes ownership only after a real drag is detected.
+- **Mixed values:** Use **Alt + drag** for the relative Value Ladder. The earlier **Ctrl + Alt + drag** gesture remains supported.
+- **Shared ladder settings:** Alt toggle, click-row magnitude selection, Ctrl magnitude locking, vertical sensitivity, and horizontal scrub sensitivity now also govern multi-key value scrubbing. Equal values can open the ladder around the hovered digit; mixed values start at ones. A Ctrl+Alt gesture still treats Ctrl as an activation modifier for backwards compatibility.
+- Preserves the validated fractional offsets, live curve movement, in-field signed/absolute value feedback, and Undo/Redo/Escape paths from v1.0.54.2. Adds `Digit.CurveEditor.UnifiedMultiKeyGesturePolicy` automation coverage and `Doc/Curve-Editor-Unified-Multi-Key-Scrubbing-V155.md` for manual validation.
+- **Build and new gestures still require UE 5.8.3 validation.** Source regressions are not a substitute for mouse-routing tests in Slate.
 
 ## v1.0.54.2: Fractional-expression native test linker hotfix
 

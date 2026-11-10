@@ -117,17 +117,28 @@ private:
     // OnTextCommitted, or property transactions are generated.
     // Shared Curve Editor Value uses SPropertyEditorNumeric<T> >
     // SNumericEntryBox<T> > SEditableText, not the SEditableTextBox above.
-    // All edits stage in that real text buffer and commit through its native
-    // Enter callback. Only explicit Ctrl+Alt mouse input starts this preview.
+    // Digit tracks its proposed value without modifying the bound native text.
+    // Equal values support delayed direct digit-hover drags; Alt opens the
+    // common Value Ladder. Commit uses native Enter or the live property handle.
     bool ResolveCurvePropertyValueTarget(const FWidgetPath& Path,
         const SWidget* EditableWidget) const;
-    bool TryBeginCurvePropertyScrub(FSlateApplication& SlateApp, const FPointerEvent& Event);
+    bool TryBeginCurvePropertyScrub(FSlateApplication& SlateApp, const FPointerEvent& Event,
+        bool bFromPendingDirect = false,
+        const TSharedPtr<SEditableText>& ForcedSource = nullptr,
+        int32 ForcedPlace = INDEX_NONE, bool bFromLadderRow = false);
+    bool ResolveCurvePropertyPointerTarget(FSlateApplication& SlateApp,
+        const FVector2D& Position, int32 UserIndex,
+        TSharedPtr<SEditableText>& OutEdit, FWidgetPath& OutPath) const;
+    bool GetCurvePropertyHoveredDigit(FSlateApplication& SlateApp,
+        const TSharedRef<SEditableText>& Edit, const FString& Source,
+        const FVector2D& Position, int32& OutIndex, int32& OutPlace) const;
+    void ClearPendingCurvePropertyDirect();
     bool UpdateCurvePropertyScrub(FSlateApplication& SlateApp, const FPointerEvent& Event);
     void EndCurvePropertyScrub(bool bKeepStagedText = false);
     void FlushCurvePropertyCommit(FSlateApplication& SlateApp);
     void ClearCurvePropertyCommit();
     void ShowCurvePropertyLadder(FSlateApplication& SlateApp,
-        const TSharedRef<SEditableText>& Edit);
+        const TSharedRef<SEditableText>& Edit, int32 OriginPlace = 0);
 
     bool ResolveCurveTextTarget(const FWidgetPath& Path,
         const SWidget* FocusedWidget, bool& bOutTime) const;
@@ -171,6 +182,19 @@ private:
     double CurvePropertyCurrentOffset = 0.0;
     int32 CurvePropertyFinestPlace = 0;
     bool bCurvePropertyLadderActive = false;
+    TWeakPtr<SEditableText> CurvePropertyLadderSource;
+    // A plain click must reach native SEditableText. Only a later actual
+    // drag over the same equal-value digit takes over mouse capture.
+    TWeakPtr<SEditableText> PendingCurvePropertyDirect;
+    FString PendingCurvePropertyText;
+    FVector2D PendingCurvePropertyPosition = FVector2D::ZeroVector;
+    int32 PendingCurvePropertyDigitIndex = INDEX_NONE;
+    int32 PendingCurvePropertyPlace = 0;
+    int32 PendingCurvePropertyUser = INDEX_NONE;
+    int32 PendingCurvePropertyPointer = INDEX_NONE;
+    bool bCurvePropertyCtrlUsedForActivation = false;
+    bool bCurvePropertyRowLocked = false;
+    bool bCurvePropertyCtrlWasLocked = false;
     double CurvePropertyPendingPixels = 0.0;
     bool bCurvePropertyScrubActive = false;
     bool bCurvePropertyOwnsCapture = false;

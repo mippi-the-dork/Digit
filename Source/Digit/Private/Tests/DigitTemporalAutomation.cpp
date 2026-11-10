@@ -22,6 +22,7 @@
 #include "DigitCurveMultiKeyTextPolicy.h"
 #include "DigitCurveLivePreviewPolicy.h"
 #include "DigitCurveMultiKeyMagnitudePolicy.h"
+#include "DigitCurveUnifiedGesturePolicy.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/SOverlay.h"
 #include "Widgets/Text/STextBlock.h"
@@ -2163,4 +2164,71 @@ bool FDigitCurveMultiKeyFractionalExpressionsTest::RunTest(const FString& Parame
     return true;
 }
 
+#endif // WITH_DEV_AUTOMATION_TESTS
+
+#if WITH_DEV_AUTOMATION_TESTS
+
+// v1.0.55: multi-object equal values may scrub by hovered digit without
+// intercepting native clicks. Mixed values use Alt, preserving Ctrl+Alt.
+// Numeric magnitudes honor the selected digit origin and the same Alt/Ctrl
+// semantics as the native single-key Value Ladder.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveUnifiedGestureTest,
+    "Digit.CurveEditor.UnifiedMultiKeyGesturePolicy",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveUnifiedGestureTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    using namespace DigitCurveUnifiedGesturePolicy;
+    using namespace DigitCurveMultiKeyMagnitudePolicy;
+
+    TestTrue(TEXT("Equal value digit-hover drag needs no modifier"),
+        Classify(false, false, false, true) == EActivation::HoveredEqualDigit);
+    TestTrue(TEXT("Equal value punctuation click remains native text"),
+        Classify(false, false, false, false) == EActivation::NativeText);
+    TestTrue(TEXT("Mixed value plain clicks remain native text"),
+        Classify(true, false, false, false) == EActivation::NativeText);
+    TestTrue(TEXT("Alt alone enables mixed-value ladder"),
+        Classify(true, true, false, false) == EActivation::AltLadder);
+    TestTrue(TEXT("Ctrl+Alt remains supported"),
+        Classify(true, true, true, false) == EActivation::LegacyCtrlAlt);
+    TestTrue(TEXT("Alt on an equal digit uses ladder"),
+        ShouldUseLadder(Classify(false, true, false, true)));
+    TestFalse(TEXT("Plain hovered digit stays outside ladder"),
+        ShouldUseLadder(Classify(false, false, false, true)));
+
+    TestTrue(TEXT("Ctrl may lock Alt-only multi-key ladder"),
+        ShouldLockMagnitude(true, true, false, true, false));
+    TestFalse(TEXT("Ctrl must not lock a Ctrl+Alt compatibility gesture"),
+        ShouldLockMagnitude(true, true, true, true, false));
+    TestFalse(TEXT("Disabling the shared lock setting is honored"),
+        ShouldLockMagnitude(false, true, false, true, false));
+    TestFalse(TEXT("Row-selected rungs ignore Ctrl lock"),
+        ShouldLockMagnitude(true, true, false, true, true));
+
+    int32 Place = 1;
+    float Travel = 0.0f;
+    TestTrue(TEXT("Equal-values ladder moves relative to hovered tens digit"),
+        ConsumeVerticalRungs(Place, Travel, 18.0f, 0.5f, 1));
+    TestEqual(TEXT("One rung below tens is ones"), Place, 0);
+    double Offset = 0.0;
+    TestTrue(TEXT("Ones movement after tens selection is exact"),
+        TryAccumulate(Offset, 3, Place, Offset, 1));
+    TestTrue(TEXT("Previously committed steps are unchanged"),
+        FMath::IsNearlyEqual(Offset, 3.0));
+    Place = 1;
+    TestTrue(TEXT("Tens origin increments entire selected place"),
+        TryAccumulate(Offset, 1, Place, Offset, 1));
+    TestTrue(TEXT("Mixed origin applies future steps only"),
+        FMath::IsNearlyEqual(Offset, 13.0));
+    TestFalse(TEXT("Magnitude beyond selected origin plus four rejected"),
+        TryAccumulate(Offset, 1, 6, Offset, 1));
+    FString Equal;
+    TestTrue(TEXT("Equal keys stage number not expression"),
+        TryStageEqual(TEXT("12.34"), 10.0, 0, Equal));
+    TestEqual(TEXT("Hovered tens digit stages full tens"), Equal,
+        FString(TEXT("22.34")));
+    return true;
+}
 #endif // WITH_DEV_AUTOMATION_TESTS

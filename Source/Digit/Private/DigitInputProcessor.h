@@ -1,4 +1,4 @@
-﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
+// Copyright Mippithedork 2026, Inc. All Rights Reserved.
 
 #pragma once
 
@@ -169,6 +169,10 @@ private:
         FString ExpectedText;
         FString OriginalText;
         int32 UserIndex = INDEX_NONE;
+        // A direct equal-value drag starts as a native editable-text click.
+        // After live property changes, commit the text editor buffer as well
+        // so its later focus loss cannot replay the pre-scrub numeric value.
+        bool bSynchronizeAfterLive = false;
     };
     TOptional<FCurvePropertyCommit> PendingCurvePropertyCommit;
     TWeakPtr<SEditableText> CurvePropertyEditable;
@@ -192,6 +196,7 @@ private:
     int32 PendingCurvePropertyPlace = 0;
     int32 PendingCurvePropertyUser = INDEX_NONE;
     int32 PendingCurvePropertyPointer = INDEX_NONE;
+    bool bCurvePropertyBeganInNativeText = false;
     bool bCurvePropertyCtrlUsedForActivation = false;
     bool bCurvePropertyRowLocked = false;
     bool bCurvePropertyCtrlWasLocked = false;

@@ -1,4 +1,4 @@
-﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
+// Copyright Mippithedork 2026, Inc. All Rights Reserved.
 #pragma once
 
 #include "CoreMinimal.h"
@@ -77,6 +77,24 @@ namespace DigitCurveMultiKeyTextPolicy
     {
         return !Initial.IsEmpty() && !Proposed.IsEmpty()
             && NativeLive == Initial && Proposed != Initial;
+    }
+
+    inline bool CanSynchronizeLiveEqualText(const FString& Initial,
+        const FString& NativeLive, const FString& Proposed)
+    {
+        if (Initial.IsEmpty() || Proposed.IsEmpty() || Proposed == Initial)
+            return false;
+        double ProposedValue = 0.0;
+        if (!LexTryParseString(ProposedValue, *Proposed)
+            || !FMath::IsFinite(ProposedValue)) return false;
+        if (NativeLive == Initial || NativeLive == Proposed) return true;
+        // When the property handle updates live, the native widget may have
+        // reformatted the same numeric result (12.40 -> 12.4). Only accept
+        // that equivalent value; property values are checked separately.
+        double NativeValue = 0.0;
+        return LexTryParseString(NativeValue, *NativeLive)
+            && FMath::IsFinite(NativeValue)
+            && FMath::IsNearlyEqual(NativeValue, ProposedValue, 1.e-6);
     }
 
     inline bool CanBeginEqualValues(const FString& Initial, int32 DigitIndex)

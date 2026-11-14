@@ -1,4 +1,4 @@
-﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
+// Copyright Mippithedork 2026, Inc. All Rights Reserved.
 
 #include "DigitInputProcessor.h"
 #include "DigitSettings.h"
@@ -1309,6 +1309,24 @@ namespace DigitCurveLivePreview
         return true;
     }
 
+    static bool IsExpectedCommittedEqualValue(const FWidgetPath& Path,
+        const FString& ExpectedText)
+    {
+        double Expected = 0.0;
+        if (!LexTryParseString(Expected, *ExpectedText)
+            || !FMath::IsFinite(Expected)) return false;
+        TArray<FString> Strings;
+        TArray<double> Values;
+        if (!ReadOriginals(FindValueHandle(Path), Strings, Values)) return false;
+        // Do not synthesize a text commit if the selection or an edited key
+        // changed since mouse release. The live property write already owns
+        // the single Undo transaction; this is only buffer synchronization.
+        for (const double Value : Values)
+        {
+            if (!FMath::IsNearlyEqual(Value, Expected, 1.e-6)) return false;
+        }
+        return true;
+    }
 
 }
 
@@ -1454,6 +1472,7 @@ void FDigitInputProcessor::EndCurvePropertyScrub(bool bKeepStagedText)
     CurvePropertyAccumulatedSteps = 0;
     CurvePropertyCurrentOffset = 0.0;
     CurvePropertyFinestPlace = 0;
+    bCurvePropertyBeganInNativeText = false;
     bCurvePropertyCtrlUsedForActivation = false;
     bCurvePropertyRowLocked = false;
     bCurvePropertyCtrlWasLocked = false;
@@ -1728,6 +1747,7 @@ bool FDigitInputProcessor::TryBeginCurvePropertyScrub(FSlateApplication& SlateAp
     CurvePropertyAccumulatedSteps = 0;
     CurvePropertyCurrentOffset = 0.0;
     CurvePropertyFinestPlace = FMath::Min(0, Place);
+    bCurvePropertyBeganInNativeText = bFromPendingDirect;
     bCurvePropertyCtrlUsedForActivation = Event.IsAltDown()
         && Event.IsControlDown() && !bFromPendingDirect && !bFromLadderRow;
     bCurvePropertyRowLocked = bFromLadderRow;
@@ -2042,11 +2062,18 @@ void FDigitInputProcessor::FlushCurvePropertyCommit(FSlateApplication& SlateApp)
     }
     Edit->SelectAllText();
     const FString Live = Edit->GetSelectedText().ToString();
-    if (!DigitCurveMultiKeyTextPolicy::CanCommitDeferredValue(
-            Pending.OriginalText, Live, Pending.ExpectedText))
+    const bool bSafeToCommit = Pending.bSynchronizeAfterLive
+        ? (DigitCurveMultiKeyTextPolicy::CanSynchronizeLiveEqualText(
+                Pending.OriginalText, Live, Pending.ExpectedText)
+            && DigitCurveLivePreview::IsExpectedCommittedEqualValue(
+                Path, Pending.ExpectedText))
+        : DigitCurveMultiKeyTextPolicy::CanCommitDeferredValue(
+            Pending.OriginalText, Live, Pending.ExpectedText);
+    if (!bSafeToCommit)
     {
         UE_LOG(LogDigit, Warning,
-            TEXT("CurveEditor multi-key native commit skipped: original host text changed or proposal was empty"));
+            TEXT("CurveEditor multi-key native commit skipped: text or committed key values changed (liveSync=%d)"),
+            Pending.bSynchronizeAfterLive);
         return;
     }
     // Stage the proposed value ONLY NOW, immediately before native Enter. This
@@ -2066,7 +2093,8 @@ void FDigitInputProcessor::FlushCurvePropertyCommit(FSlateApplication& SlateApp)
     if (Settings->bLogWidgetDiagnostics)
     {
         UE_LOG(LogDigit, Display,
-            TEXT("CurveEditor multi-key text scrub: proposed Value staged and native Enter dispatched"));
+            TEXT("CurveEditor multi-key text scrub: proposed Value staged and native Enter dispatched (liveSync=%d)"),
+            Pending.bSynchronizeAfterLive);
     }
 }
 
@@ -3332,6 +3360,26 @@ bool FDigitInputProcessor::HandleMouseButtonUpEvent(FSlateApplication& SlateApp,
                         EPropertyValueSetFlags::DefaultFlags);
                 if (Finished != FPropertyAccess::Fail)
                 {
+                    // Hover-and-drag was preceded by a real SEditableText
+                    // mouse-down. It left the original value in the host's
+                    // editing buffer; merely committing the property handle
+                    // doesn't finish that text edit. On its next focus loss,
+                    // the stale text would overwrite the newly moved keys.
+                    // Reuse the proven deferred native Enter path AFTER the
+                    // outer live transaction has completed. Since the
+                    // property already has the expected value, Unreal's
+                    // OnValueCommitted should see no new numeric change.
+                    if (bCurvePropertyBeganInNativeText && !bCurvePropertyMixed)
+                    {
+                        FCurvePropertyCommit Sync;
+                        Sync.Editable = Edit;
+                        Sync.ExpectedText = CurvePropertyLastStaged;
+                        Sync.OriginalText = CurvePropertyInitialText;
+                        Sync.OriginalHierarchy = CurvePropertyHierarchy;
+                        Sync.UserIndex = CurvePropertyUser;
+                        Sync.bSynchronizeAfterLive = true;
+                        PendingCurvePropertyCommit = MoveTemp(Sync);
+                    }
                     EndCurvePropertyScrub(true);
                     const UDigitSettings* Diagnostics = UDigitSettings::Get();
                     if (Diagnostics && Diagnostics->bLogWidgetDiagnostics)

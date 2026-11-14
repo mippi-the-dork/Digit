@@ -9,12 +9,19 @@ Hover the hundreds place to work in hundreds. Hover the tenths place to make fin
 ![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.8.x-black?logo=unrealengine)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2064--bit-blue)
 ![Type](https://img.shields.io/badge/Plugin-Editor%20Only-green)
-![Version](https://img.shields.io/badge/Version-1.0.55.0-blue)
+![Version](https://img.shields.io/badge/Version-1.0.55.1-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 ![Digit targeting a numeric place value in Unreal Engine](Doc/Images/Digit-Hero.png)
 
 ---
+
+## v1.0.55.1: Direct equal-value persistence and minimum ladder sensitivity
+
+- **Equal selected keys, direct digit-hover drag:** After committing the live key values, Digit now synchronizes the existing native `SEditableText` edit buffer through the proven deferred Enter path. Direct scrubbing starts with an ordinary native mouse-down (so clicking to place the caret still works); without that synchronization, the old text could be committed again on focus loss, reverting the curve. The buffer sync validates that selected keys already contain the final result before dispatching native Enter. Legacy Alt and Ctrl+Alt paths are unaffected.
+- **Mixed selected keys, ladder vertical movement:** Fixes a guard that mistakenly rejected the minimum valid effective magnitude sensitivity. `Ladder Magnitude Sensitivity = 0.1` uses the same `0.5x` native-ladder scale as single-key editing, yielding `0.05`, previously rejected as invalid. Vertical rungs are now accepted at the configured minimum, with their physical sensitivity still matching single-key behavior.
+- Native policy automation: `Digit.CurveEditor.DirectEqualNativeTextSync` and `Digit.CurveEditor.MinimumLadderSensitivity`. Includes a dedicated source-contract test and `Doc/Curve-Editor-Direct-Commit-And-Ladder-Threshold-V1551.md`.
+- **UE 5.8.3 build and actual focus-loss / ladder interactions require manual validation.** The existing multi-key fractional and single-key functionality is unchanged.
 
 ## v1.0.55.0: Unified Curve Editor multi-key scrubbing
 

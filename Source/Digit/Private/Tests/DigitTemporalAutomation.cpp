@@ -1,4 +1,4 @@
-﻿// Copyright Mippithedork 2026, Inc. All Rights Reserved.
+// Copyright Mippithedork 2026, Inc. All Rights Reserved.
 
 #if WITH_DEV_AUTOMATION_TESTS
 
@@ -2231,4 +2231,61 @@ bool FDigitCurveUnifiedGestureTest::RunTest(const FString& Parameters)
         FString(TEXT("22.34")));
     return true;
 }
+#endif // WITH_DEV_AUTOMATION_TESTS
+
+#if WITH_DEV_AUTOMATION_TESTS
+
+// v1.0.55.1: when a shared equal-value field begins as a native click,
+// the property editor has an active text-edit buffer. Once live preview is
+// committed, Digit must synchronize that buffer through native Enter before
+// a later focus loss can re-commit the stale original number.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveDirectEqualNativeTextSyncTest,
+    "Digit.CurveEditor.DirectEqualNativeTextSync",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveDirectEqualNativeTextSyncTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    using namespace DigitCurveMultiKeyTextPolicy;
+    TestTrue(TEXT("Stale native original may synchronize after live commit"),
+        CanSynchronizeLiveEqualText(TEXT("12.34"), TEXT("12.34"), TEXT("12.35")));
+    TestTrue(TEXT("Already refreshed native number is safe"),
+        CanSynchronizeLiveEqualText(TEXT("12.34"), TEXT("12.35"), TEXT("12.35")));
+    TestTrue(TEXT("Unreal may format the live result differently"),
+        CanSynchronizeLiveEqualText(TEXT("12.34"), TEXT("12.4"), TEXT("12.40")));
+    TestFalse(TEXT("Unrelated native edits must never be overwritten"),
+        CanSynchronizeLiveEqualText(TEXT("12.34"), TEXT("99.3"), TEXT("12.35")));
+    TestFalse(TEXT("Unchanged drag should not trigger native Enter"),
+        CanSynchronizeLiveEqualText(TEXT("12.34"), TEXT("12.34"), TEXT("12.34")));
+    TestFalse(TEXT("Invalid result cannot be staged"),
+        CanSynchronizeLiveEqualText(TEXT("12.34"), TEXT("12.34"), TEXT("NaN")));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FDigitCurveMinimumLadderSensitivityTest,
+    "Digit.CurveEditor.MinimumLadderSensitivity",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FDigitCurveMinimumLadderSensitivityTest::RunTest(const FString& Parameters)
+{
+    (void)Parameters;
+    using namespace DigitCurveMultiKeyMagnitudePolicy;
+    // Shared project minimum 0.1 * the single-key ladder's 0.5x scaling
+    // produces 0.05, which was rejected by v1.0.55.0's <0.1 guard.
+    int32 Place = 0;
+    float Travel = 0.0f;
+    TestTrue(TEXT("Vertical movement is accepted at project minimum sensitivity"),
+        ConsumeVerticalRungs(Place, Travel, -171.0f, 0.05f));
+    TestEqual(TEXT("Moving up selects tens"), Place, 1);
+    Travel = 0.0f;
+    TestTrue(TEXT("Moving down selects the original ones"),
+        ConsumeVerticalRungs(Place, Travel, 171.0f, 0.05f));
+    TestEqual(TEXT("Returning down selects ones"), Place, 0);
+    TestFalse(TEXT("Invalid zero sensitivity remains rejected"),
+        ConsumeVerticalRungs(Place, Travel, 12.0f, 0.0f));
+    return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

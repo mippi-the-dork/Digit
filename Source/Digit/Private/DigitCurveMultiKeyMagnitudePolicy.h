@@ -24,12 +24,16 @@ namespace DigitCurveMultiKeyMagnitudePolicy
         const int32 Origin = OriginPlace)
     {
         if (!FMath::IsFinite(DeltaY) || !FMath::IsFinite(Sensitivity)
-            || Sensitivity < 0.1f || Sensitivity > 10.0f)
+            || Sensitivity < 0.049f || Sensitivity > 5.01f)
         {
             return false;
         }
         constexpr float RowHeight = 17.0f;
         constexpr float Threshold = RowHeight * 0.5f;
+        // The shared ladder applies the native 0.5x scale to the public
+        // [0.1, 10] setting, so valid effective values are [0.05, 5].
+        // Rejecting values below 0.1 silently disabled every vertical rung
+        // at the default/project minimum setting of 0.1.
         Travel += DeltaY * Sensitivity;
         bool bChanged = false;
         while (Travel <= -Threshold && SelectedPlace < Origin + Radius)
